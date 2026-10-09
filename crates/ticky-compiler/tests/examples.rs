@@ -102,3 +102,23 @@ fn constants_fold_away() {
     // y = 9 is loaded with a constant: no arithmetic combinators in the block.
     assert_eq!(c.cg.blocks[0].depth, 0);
 }
+
+/// Ports keep their declaration order on the blueprint in every layout mode: inputs top to
+/// bottom on the west edge, outputs top to bottom (east edge, or rows north with
+/// `--outputs=west`), whatever the order inputs and outputs are interleaved in.
+#[test]
+fn ports_keep_declaration_order() {
+    let src = "input a: int @ A\noutput x: int @ X\ninput b: Bundle\noutput y: Bundle\ninput c: int @ C\noutput z: int @ Z\n\
+               every tick:\n    x = a + c\n    y = b * 2\n    z = a - c\n";
+    let anneal = Some(ticky_compiler::place::AnnealOpts { effort: 0.2, ..Default::default() });
+    for (poles, outputs_west, anneal) in [(true, false, None), (false, true, None), (true, false, anneal), (false, true, anneal)] {
+        let c = compile(src, &Options { poles, outputs_west, anneal, ..opts() }).unwrap();
+        let ys = |dir: ticky_syntax::ast::PortDir| -> Vec<f64> {
+            c.program.ports.iter().enumerate().filter(|(_, p)| p.dir == dir).map(|(i, _)| c.cg.netlist.entities[c.cg.port_ents[i]].pos.1).collect()
+        };
+        for dir in [ticky_syntax::ast::PortDir::Input, ticky_syntax::ast::PortDir::Output] {
+            let y = ys(dir);
+            assert!(y.windows(2).all(|w| w[0] < w[1]), "{dir:?} ports out of order (poles {poles}, west {outputs_west}): {y:?}");
+        }
+    }
+}

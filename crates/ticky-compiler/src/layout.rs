@@ -79,6 +79,8 @@ type Placed = (crate::place::Slots, Vec<(usize, usize)>);
 
 pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts) -> Result<LayoutInfo, String> {
     let core: Vec<EntId> = (0..net.entities.len()).filter(|&i| net.entities[i].role == Role::Core).collect();
+    // Ports in entity order, which is declaration order (codegen creates them in
+    // `program.ports` order); the test `ports_keep_declaration_order` holds us to it.
     let inputs: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::InputPort { .. })).collect();
     let outputs: Vec<EntId> =
