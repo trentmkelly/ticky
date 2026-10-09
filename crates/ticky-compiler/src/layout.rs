@@ -74,6 +74,9 @@ pub struct LayoutOpts {
     pub anneal: Option<crate::place::AnnealOpts>,
 }
 
+/// An annealed placement: the slot grid and each entity's slot.
+type Placed = (crate::place::Slots, Vec<(usize, usize)>);
+
 pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts) -> Result<LayoutInfo, String> {
     let core: Vec<EntId> = (0..net.entities.len()).filter(|&i| net.entities[i].role == Role::Core).collect();
     let inputs: Vec<EntId> =
@@ -131,7 +134,28 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                 o => o,
             };
             let a = crate::place::AnnealOpts { objective, ..a };
-            let (slots, placed) = crate::place::anneal(net, &members, &core, opts.poles, a);
+            let frame = crate::place::Frame { extra_w: edge_w, extra_h: edge_h, min_h: (inputs.len() + 1).max(east_col.len()) };
+            // For the smallest footprint, try a few block shapes (the grid layout's width, the
+            // best area within 2:1, a square block) and keep the smallest blueprint.
+            let candidates: Vec<Option<usize>> = match a.objective {
+                Objective::Area => {
+                    let grid_cols = SEG * ((n as f64 / 21.0).sqrt().ceil() as usize).max(1);
+                    vec![Some(grid_cols.min(n)), None, Some(((2.0 * n as f64).sqrt().ceil() as usize).max(1))]
+                }
+                _ => vec![None],
+            };
+            let mut best: Option<(usize, Placed)> = None;
+            for c in candidates {
+                let (slots, placed) = crate::place::anneal(net, &members, &core, opts.poles, a, frame, c);
+                let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
+                let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
+                let w = if opts.poles { 7 * cols.div_ceil(SEG) } else { slots.tile_x(cols - 1) + 1 };
+                let area = (w + edge_w) * ((2 * rows).max(frame.min_h) + edge_h);
+                if best.as_ref().is_none_or(|b| area < b.0) {
+                    best = Some((area, (slots, placed)));
+                }
+            }
+            let (_, (slots, placed)) = best.unwrap();
             let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
             let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
             for (&id, &(c, r)) in core.iter().zip(&placed) {

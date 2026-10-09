@@ -7,7 +7,9 @@
 //! lower the cost and, with a probability that shrinks as the "temperature" falls, some that
 //! raise it. The cost:
 //!
-//! * the footprint of the occupied slots (area, or the free side under a width/height limit);
+//! * the footprint of the whole blueprint around the occupied slots (area, or the free side
+//!   under a width/height limit). The slot grid is tight (5% spare slots): with more slack
+//!   the wire costs win and the entities spread out, growing the footprint;
 //! * for small wire networks: their spread (half-perimeter), plus a heavy penalty for every
 //!   tile a spanning-tree hop exceeds wire reach (each such hop would need relay poles);
 //! * for big networks (the bus, cluster wires): a cheap pull towards their centre.
@@ -41,6 +43,27 @@ pub struct AnnealOpts {
 impl Default for AnnealOpts {
     fn default() -> Self {
         AnnealOpts { objective: Objective::Area, seed: 1, effort: 1.0 }
+    }
+}
+
+/// What surrounds the annealed block in the blueprint: extra width (port and gate columns),
+/// extra height (output lines) and the least height (the port columns').
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Frame {
+    pub extra_w: usize,
+    pub extra_h: usize,
+    pub min_h: usize,
+}
+
+impl Frame {
+    /// Size of the whole blueprint around a `w` × `h` block.
+    fn size(&self, w: usize, h: usize) -> (usize, usize) {
+        (w + self.extra_w, h.max(self.min_h) + self.extra_h)
+    }
+
+    fn area(&self, w: usize, h: usize) -> usize {
+        let (w, h) = self.size(w, h);
+        w * h
     }
 }
 
@@ -116,6 +139,7 @@ struct Net {
 struct State<'a> {
     slots: &'a Slots,
     opts: AnnealOpts,
+    frame: Frame,
     /// Slot of each movable entity, and the entity (if any) in each slot.
     at: Vec<usize>,
     who: Vec<Option<usize>>,
@@ -202,7 +226,7 @@ impl State<'_> {
         let rows = self.row_count.iter().rposition(|&c| c > 0).map_or(0, |r| r + 1);
         let (w, h) = self.slots.tiles(cols, rows);
         match self.opts.objective {
-            Objective::Area => (w * h) as f64,
+            Objective::Area => self.frame.area(w, h) as f64,
             // Under a limit, the other side matters; the area breaks ties.
             Objective::MaxWidth(_) => h as f64 * 40.0 + (w * h) as f64 * 0.1,
             Objective::MaxHeight(_) => w as f64 * 40.0 + (w * h) as f64 * 0.1,
@@ -260,23 +284,45 @@ impl State<'_> {
 
 /// Places `movable` (their current positions are ignored) into a slot grid; returns the grid
 /// and each entity's slot `(col, row)`. `nets` are the wire networks as member lists.
-pub fn anneal(net: &Netlist, members: &[Vec<EntId>], movable: &[EntId], poles: bool, opts: AnnealOpts) -> (Slots, Vec<(usize, usize)>) {
+pub fn anneal(
+    net: &Netlist,
+    members: &[Vec<EntId>],
+    movable: &[EntId],
+    poles: bool,
+    opts: AnnealOpts,
+    frame: Frame,
+    cols: Option<usize>,
+) -> (Slots, Vec<(usize, usize)>) {
     let n = movable.len().max(1);
     // Grid size: room to rearrange, within any limit.
     let tile_cols = |cols: usize| Slots { cols, rows: 1, poles }.tile_x(cols.max(1) - 1) + 1;
-    let (cols, rows) = match opts.objective {
-        Objective::Area => {
-            let c = ((2.0 * n as f64).sqrt() * 1.15).ceil() as usize;
-            (c.max(1), (n.div_ceil(c.max(1)) as f64 * 1.3).ceil() as usize + 1)
+    let slots_needed = (n as f64 * 1.05).ceil() as usize;
+    let (cols, rows) = match (opts.objective, cols) {
+        (Objective::Area, Some(c)) => (c.max(1), n.div_ceil(c.max(1)).max(1)),
+        (Objective::Area, None) => {
+            // A tight grid (with much slack the wire costs win and the entities spread out,
+            // growing the footprint), shaped for the smallest whole blueprint.
+            let rows_for = |c: usize| slots_needed.div_ceil(c).max(1);
+            // Among shapes no more than twice as long as wide (or the squarest).
+            let aspect = |c: usize| {
+                let (w, h) = frame.size(tile_cols(c), 2 * rows_for(c));
+                w.max(h) as f64 / w.min(h).max(1) as f64
+            };
+            let squarest = (1..=n).min_by(|&a, &b| aspect(a).total_cmp(&aspect(b))).unwrap_or(1);
+            let c = (1..=n)
+                .filter(|&c| aspect(c) <= 2.0 || c == squarest)
+                .min_by_key(|&c| (frame.area(tile_cols(c), 2 * rows_for(c)), c.abs_diff(squarest)))
+                .unwrap_or(1);
+            (c, rows_for(c))
         }
-        Objective::MaxWidth(w) => {
+        (Objective::MaxWidth(w), _) => {
             let mut c = 1;
             while tile_cols(c + 1) <= w as usize {
                 c += 1;
             }
             (c, n.div_ceil(c) * 2 + 2)
         }
-        Objective::MaxHeight(h) => {
+        (Objective::MaxHeight(h), _) => {
             let r = (h as usize / 2).max(1);
             (n.div_ceil(r) * 2 + 2, r)
         }
@@ -320,7 +366,7 @@ pub fn anneal(net: &Netlist, members: &[Vec<EntId>], movable: &[EntId], poles: b
         col_count[c] += 1;
         row_count[r] += 1;
     }
-    let mut st = State { slots: &slots, opts, at, who, col_count, row_count, nets, net_cost: Vec::new(), nets_of };
+    let mut st = State { slots: &slots, opts, frame, at, who, col_count, row_count, nets, net_cost: Vec::new(), nets_of };
     st.net_cost = (0..st.nets.len()).map(|j| st.net_cost(j)).collect();
 
     let mut rng = Rng(opts.seed ^ 0x5EED);

@@ -318,3 +318,13 @@ expression but earlier operands were read after them. Now values are frozen into
 when a later operand calls a function that writes module variables (`impure_fns`,
 transitively); `t op= f()` reads `t` first; `xs[f()] = v` evaluates `v` first. Found by
 `fuzz_level2.py` after the array changes, reduced with the new `tools/reduce_level2.py`.
+
+### Annealing fix (2026-10-09, reported on enf: anneal 1435 tiles vs grid 1260)
+The annealer's slot grid had ~40% spare slots; the wire terms (which dropped 10×) outweighed
+the footprint term and the block spread out (histogram's footprint term 266 → 352). Now the
+grid is tight (5% spare), the footprint term is the whole blueprint's (port columns and
+output lines included: `Frame`), and `layout` anneals three block shapes (the grid layout's
+width with exact rows, the best area within 2:1, a square block) and keeps the smallest.
+Annealing is never larger than the grid now: `--no-poles --outputs=west` saves 9–14%
+(enf 1260 → 1120, sorting 1116 → 957); with poles the pole columns fix the width, so it
+ties the grid's footprint and saves relays.
