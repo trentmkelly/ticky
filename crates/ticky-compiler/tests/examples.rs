@@ -39,6 +39,12 @@ fn examples_compile_and_pass() {
         let c3 = compile(&src, &annealed).unwrap_or_else(|d| panic!("{name} (annealed): {}", d[0].message));
         assert!(c3.cg.netlist.validate(true).is_empty(), "{name} (annealed)");
         assert_eq!(compile(&src, &annealed).unwrap().blueprint_string(), c3.blueprint_string(), "{name}: annealing isn't deterministic");
+        // Ports in rows (E-W), outputs south or north; annealed gates with west outputs.
+        for (ports_ew, outputs_west, anneal) in [(true, false, None), (true, true, None), (true, true, Some(a)), (false, true, Some(a))] {
+            let o = Options { ports_ew, outputs_west, anneal, ..opts() };
+            let c4 = compile(&src, &o).unwrap_or_else(|d| panic!("{name} (ew {ports_ew}, west {outputs_west}): {}", d[0].message));
+            assert!(c4.cg.netlist.validate(true).is_empty(), "{name} (ew {ports_ew}, west {outputs_west})");
+        }
         for r in run_tests(&c, &src) {
             if let Some(d) = r.failure {
                 panic!("{name}: test {} failed:\n{}", r.name, d.render(&name, &src));
@@ -157,6 +163,19 @@ fn ports_keep_declaration_order() {
         for dir in [ticky_syntax::ast::PortDir::Input, ticky_syntax::ast::PortDir::Output] {
             let y = ys(dir);
             assert!(y.windows(2).all(|w| w[0] < w[1]), "{dir:?} ports out of order (poles {poles}, west {outputs_west}): {y:?}");
+        }
+    }
+    // E-W: west to east, inputs before outputs in the north row.
+    for (outputs_west, anneal) in [(false, None), (true, None), (true, anneal)] {
+        let c = compile(src, &Options { ports_ew: true, outputs_west, anneal, ..opts() }).unwrap();
+        let pos = |i: usize| c.cg.netlist.entities[c.cg.port_ents[i]].pos;
+        let ins: Vec<usize> = (0..c.program.ports.len()).filter(|&i| c.program.ports[i].dir == ticky_syntax::ast::PortDir::Input).collect();
+        let outs: Vec<usize> = (0..c.program.ports.len()).filter(|&i| c.program.ports[i].dir == ticky_syntax::ast::PortDir::Output).collect();
+        let row: Vec<usize> = if outputs_west { ins.iter().chain(&outs).copied().collect() } else { ins.clone() };
+        assert!(row.windows(2).all(|w| pos(w[0]).0 < pos(w[1]).0 && pos(w[0]).1 == pos(w[1]).1), "north row out of order (west {outputs_west})");
+        if !outputs_west {
+            assert!(outs.windows(2).all(|w| pos(w[0]).0 < pos(w[1]).0), "south row out of order");
+            assert!(outs.iter().all(|&o| pos(o).1 > pos(ins[0]).1));
         }
     }
 }

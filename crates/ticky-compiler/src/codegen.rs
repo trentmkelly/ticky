@@ -94,6 +94,7 @@ pub struct MainStats {
 }
 
 /// A wire network to build: its colour and the connectors on it.
+#[derive(Clone)]
 pub struct NetSpec {
     pub red: bool,
     pub members: Vec<(EntId, Conn)>,

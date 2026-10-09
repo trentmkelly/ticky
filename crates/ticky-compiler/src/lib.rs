@@ -55,9 +55,14 @@ pub struct Options {
     /// Include medium poles for power (off: the player powers it, e.g. with substations).
     /// Poles that relay long circuit wires are always included.
     pub poles: bool,
-    /// Output ports on the west edge, north of the blueprint (the first output northernmost),
-    /// each fed by its own line of poles from a gate where the output port would be.
+    /// Output ports on the inputs' side. With N-S ports: on the west edge, north of the
+    /// blueprint (the first output northernmost), each fed by its own line of poles from a gate
+    /// where the output port would be (annealed: by a gate placed like the rest). With E-W
+    /// ports: in the north row, after the inputs.
     pub outputs_west: bool,
+    /// Ports in rows (E-W): inputs (and `outputs_west` outputs) along the north edge, other
+    /// outputs along the south edge, first port westernmost. Otherwise columns (N-S).
+    pub ports_ew: bool,
     /// Experimental: place combinators by simulated annealing instead of the grid.
     pub anneal: Option<place::AnnealOpts>,
     /// Don't warn about signal names the compiler doesn't know (e.g. from mods).
@@ -72,7 +77,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false }
     }
 }
 
@@ -103,9 +108,11 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
 fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool) -> Result<Compiled, Vec<Diag>> {
     let t = std::time::Instant::now();
     let mut program = program::analyze(module, pipeline)?;
-    let mut cg = codegen::codegen(&program, opts.autostart, opts.outputs_west).map_err(|d| vec![d])?;
+    // Gates and return lines only for N-S ports with the outputs on the west.
+    let gates = opts.outputs_west && !opts.ports_ew;
+    let mut cg = codegen::codegen(&program, opts.autostart, gates).map_err(|d| vec![d])?;
     program::timing("codegen", t);
-    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, anneal: opts.anneal };
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal };
     let layout = layout::layout(&mut cg.netlist, &cg.nets, &lo)
         .map_err(|e| vec![Diag::error(Default::default(), format!("internal layout error: {e}"))])?;
     let problems = cg.netlist.validate(opts.poles);

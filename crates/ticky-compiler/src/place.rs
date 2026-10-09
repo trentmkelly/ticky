@@ -47,18 +47,20 @@ impl Default for AnnealOpts {
 }
 
 /// What surrounds the annealed block in the blueprint: extra width (port and gate columns),
-/// extra height (output lines) and the least height (the port columns').
+/// extra height (output lines, port rows) and the least height and width (of the port
+/// columns or rows).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Frame {
     pub extra_w: usize,
     pub extra_h: usize,
+    pub min_w: usize,
     pub min_h: usize,
 }
 
 impl Frame {
     /// Size of the whole blueprint around a `w` × `h` block.
-    fn size(&self, w: usize, h: usize) -> (usize, usize) {
-        (w + self.extra_w, h.max(self.min_h) + self.extra_h)
+    pub fn size(&self, w: usize, h: usize) -> (usize, usize) {
+        (w.max(self.min_w) + self.extra_w, h.max(self.min_h) + self.extra_h)
     }
 
     fn area(&self, w: usize, h: usize) -> usize {

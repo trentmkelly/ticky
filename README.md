@@ -73,6 +73,8 @@ ticky build prog.ticky --json           # blueprint JSON instead
 ticky build prog.ticky --opt=size       # fewest combinators (default: --opt=speed)
 ticky build prog.ticky --no-poles       # no power poles (bring your own, e.g. substations)
 ticky build prog.ticky --outputs=west   # output ports at the top left, each fed by its own pole line
+ticky build prog.ticky --ports=ew --outputs=north   # all ports in one row along the north edge
+ticky build prog.ticky --ports=ew       # inputs along the north edge, outputs along the south edge
 ticky build prog.ticky --place=anneal   # experimental: smaller footprint by simulated annealing
 ticky build prog.ticky --place=anneal --max-width 30   # ... at most 30 tiles wide (or --max-height)
 ticky build prog.ticky --allow-unknown-signals         # no warnings for modded item/recipe names
@@ -105,8 +107,13 @@ off and on.
 - **Outputs:** combinators down the right edge, in declaration order. With `--outputs=west`, the
   output ports sit at the west edge north of the blueprint, one row each (the first output
   northernmost), facing west; each is fed by its own line of poles (red wire) from a gate on the
-  east edge. This costs one combinator and one tick per output. Wire from a port's output
-  (right) side to whatever should react. Hovering over a port shows its current value.
+  east edge. This costs one combinator and one tick per output; with `--place=anneal` the
+  gates are placed with everything else and the lines become ordinary (relayed) wires. With
+  `--ports=ew` the ports are in rows, first port westernmost: the RUN switch (above the error
+  lamp) and the inputs along the north edge, wired from the north; outputs along the south
+  edge, or with `--outputs=north` continuing the north row and wired from the north (no gates
+  or pole lines). Wire from a port's output side to whatever should react. Hovering over a
+  port shows its current value.
 - **Quality:** by default the circuit carries its internal values on *quality* signals
   (uncommon to legendary), so it needs the Quality mod (part of Space Age), and every normal
   signal is yours: nothing a program reads or writes collides with the internals. Build with

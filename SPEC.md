@@ -479,6 +479,14 @@ in-game description.
 
 - Each `input` is a **port combinator** on the blueprint's left edge and each `output` one on
   the right edge, in declaration order, each with its label as the combinator description.
+  Build options choose other arrangements (always in declaration order):
+  - `--outputs=west`: outputs at the west edge too, north of the blueprint, each fed from a
+    gate on the east edge by a line of poles (with `--place=anneal`, the gates are placed
+    like any other combinator and wired to their ports directly, with relays as needed);
+  - `--ports=ew`: ports in rows instead of columns, first port westernmost: the RUN switch
+    (above the error lamp) and the inputs along the north edge (facing south), the outputs
+    along the south edge (`--outputs=south`, default) or continuing the north row
+    (`--outputs=north`, facing north). For wide, short blueprints.
 - You connect a wire of **either colour** to an input port's input side, or to an output port's
   output side.
 - Scalar inputs filter: an `int @ A` port only passes `signal-A`, so other signals on your

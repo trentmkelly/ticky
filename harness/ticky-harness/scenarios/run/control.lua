@@ -63,10 +63,16 @@ local function setup()
     ents[e.entity_number] = built
   end
 
-  -- Infinite power next to the left-most pole.
+  -- Infinite power next to the left-most power pole (wire relays have no copper wires).
   local left
+  local function powered(e)
+    return e.get_wire_connector(defines.wire_connector_id.pole_copper, true).connection_count > 0
+  end
   for _, e in pairs(ents) do
-    if e.name == "medium-electric-pole" and (not left or e.position.x < left.position.x) then left = e end
+    if e.name == "medium-electric-pole" and (not left or (powered(e) and not powered(left))
+        or (powered(e) == powered(left) and e.position.x < left.position.x)) then
+      left = e
+    end
   end
   local eei = s.create_entity{name = "electric-energy-interface", position = {left.position.x - 2, left.position.y + 0.5}, force = f}
   if not eei then fail("could not place power source") end
@@ -76,7 +82,10 @@ local function setup()
   for i, p in ipairs(job.ports) do
     if p.dir == "in" then
       local port = ents[p.entity]
-      local inj = s.create_entity{name = "constant-combinator", position = {port.position.x - 6.5, port.position.y}, force = f}
+      -- West of the port, or north of it for ports in a row (facing south).
+      local pos = {port.position.x - 6.5, port.position.y}
+      if port.direction == defines.direction.south then pos = {port.position.x, port.position.y - 3.5} end
+      local inj = s.create_entity{name = "constant-combinator", position = pos, force = f}
       if not inj then fail("could not place injector for " .. p.name) end
       inj.get_wire_connector(defines.wire_connector_id.circuit_red, true)
         .connect_to(port.get_wire_connector(defines.wire_connector_id.combinator_input_red, true))

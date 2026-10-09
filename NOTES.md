@@ -422,3 +422,21 @@ ties the grid's footprint and saves relays.
 - `tools/fuzz_signals.py`: random bundles with ties and negatives through loops (both orders,
   break/continue), signal comparisons, runtime-key writes, argmax/argmin and runtime nth,
   against a Python model of the game's order: 150 programs, 0 failures.
+
+## 2026-10-09 — Port rows (`--ports=ew`) and annealed output gates
+
+Reported on enf (56 wide, 20 outputs, `--outputs=west --place=anneal --no-poles`): 56×38
+tiles, 209 output-line poles; the N-S port column and its 20 return lines were most of it.
+- `--ports=ew`: the RUN switch over the lamp, then the inputs (facing south) along the north
+  edge; outputs along the south edge (`--outputs=south`, default) or continuing the north row
+  (`--outputs=north`, facing north, no gates or return lines: ports read the bus and bundle
+  wires directly). Pole rows above/below the port rows. The annealer's `Frame` got `min_w`
+  (the port row); the layout's size is the bounding box of everything in these modes.
+  enf: 56×18, 285 combinators (no gates), 3 relays.
+- `--outputs=west --place=anneal`: the gates go into the annealed block (turned upright) and
+  each gate→port line is an ordinary two-member red network (relays where needed) instead of
+  fixed pole lines, so the annealer pulls gates towards their ports. inventory: 54 carrier
+  poles → 4 relays.
+- Harness: power goes next to the left-most pole *with copper wires* (a relay west of the
+  ports left the build unpowered); input injectors for south-facing ports go north of them.
+- `Dir::South` (blueprint direction 8).

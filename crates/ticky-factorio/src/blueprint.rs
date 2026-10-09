@@ -152,6 +152,9 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                 Dir::East => {
                     m.insert("direction".into(), json!(4));
                 }
+                Dir::South => {
+                    m.insert("direction".into(), json!(8));
+                }
                 Dir::West => {
                     m.insert("direction".into(), json!(12));
                 }

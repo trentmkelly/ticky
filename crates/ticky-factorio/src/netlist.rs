@@ -113,6 +113,7 @@ impl Kind {
 pub enum Dir {
     North,
     East,
+    South,
     West,
 }
 
@@ -208,7 +209,7 @@ impl Netlist {
         let e = &self.entities[id];
         if e.kind.is_combinator() {
             match e.dir {
-                Dir::North => (1, 2),
+                Dir::North | Dir::South => (1, 2),
                 Dir::East | Dir::West => (2, 1),
             }
         } else {

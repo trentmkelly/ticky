@@ -68,8 +68,13 @@ type Line = (EntId, EntId, Vec<(f64, f64)>);
 pub struct LayoutOpts {
     /// Medium poles for power.
     pub poles: bool,
-    /// Output ports at the west edge, fed by return lines.
+    /// Output ports on the inputs' side: with N-S ports, at the west edge, fed by return lines
+    /// (or, annealed, by gates placed like everything else); with E-W ports, in the north row
+    /// after the inputs.
     pub outputs_west: bool,
+    /// Ports in rows (E-W) along the north edge (and the south edge for outputs), instead of
+    /// columns (N-S) down the west and east edges.
+    pub ports_ew: bool,
     /// Experimental placement by simulated annealing instead of the grid.
     pub anneal: Option<crate::place::AnnealOpts>,
 }
@@ -78,31 +83,83 @@ pub struct LayoutOpts {
 type Placed = (crate::place::Slots, Vec<(usize, usize)>);
 
 pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts) -> Result<LayoutInfo, String> {
-    let core: Vec<EntId> = (0..net.entities.len()).filter(|&i| net.entities[i].role == Role::Core).collect();
+    let ew = opts.ports_ew;
     // Ports in entity order, which is declaration order (codegen creates them in
     // `program.ports` order); the test `ports_keep_declaration_order` holds us to it.
     let inputs: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::InputPort { .. })).collect();
     let outputs: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputPort { .. })).collect();
-    // With return lines, the gates take the output ports' places on the east edge.
+    // With return lines, the gates take the output ports' places on the east edge; when
+    // annealing, they are placed like any other combinator and wired to their ports directly.
     let gates: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputGate { .. })).collect();
-    let east_col: &[EntId] = if opts.outputs_west { &gates } else { &outputs };
+    let gates_move = opts.anneal.is_some() && !gates.is_empty();
+    let mut core: Vec<EntId> = (0..net.entities.len()).filter(|&i| net.entities[i].role == Role::Core).collect();
+    let mut nets: Vec<crate::codegen::NetSpec> = nets.to_vec();
+    if gates_move {
+        // Placed in the block's 1×2 slots like the other combinators.
+        for &g in &gates {
+            net.entities[g].dir = Dir::North;
+        }
+        core.extend(gates.iter().copied());
+        for (&g, &p) in gates.iter().zip(&outputs) {
+            nets.push(crate::codegen::NetSpec { red: true, members: vec![(g, Conn::OutRed), (p, Conn::InRed)] });
+        }
+    }
+    let east_col: &[EntId] = match (ew, opts.outputs_west) {
+        (true, _) => &[],
+        (false, true) if gates_move => &[],
+        (false, true) => &gates,
+        (false, false) => &outputs,
+    };
+    let (north_outs, south_outs) = (ew && opts.outputs_west, ew && !opts.outputs_west);
     let run = net.find_role(|r| *r == Role::RunSwitch);
     let lamp = net.find_role(|r| *r == Role::ErrorLamp);
+    let n_out = outputs.len();
+    let pole_row = opts.poles as usize;
 
-    // Left: RUN switch above the input ports, the error lamp beside it (placed first: the
-    // annealer counts their wires).
-    if let Some(r) = run {
-        net.entities[r].pos = (-1.5, 0.5);
+    // Fixed positions (placed first: the annealer counts their wires).
+    if ew {
+        // North row: RUN switch over the lamp, then the inputs facing south (wires come in
+        // from the north), then (`--outputs=north`) the outputs facing north.
+        if let Some(r) = run {
+            net.entities[r].pos = (0.5, -1.5);
+        }
+        if let Some(l) = lamp {
+            net.entities[l].pos = (0.5, -0.5);
+        }
+        for (i, &id) in inputs.iter().enumerate() {
+            net.entities[id].pos = (1.5 + i as f64, -1.0);
+            net.entities[id].dir = Dir::South;
+        }
+        if north_outs {
+            for (i, &id) in outputs.iter().enumerate() {
+                net.entities[id].pos = (1.5 + (inputs.len() + i) as f64, -1.0);
+                net.entities[id].dir = Dir::North;
+            }
+        }
+    } else {
+        // Left: RUN switch above the input ports, the error lamp beside it.
+        if let Some(r) = run {
+            net.entities[r].pos = (-1.5, 0.5);
+        }
+        if let Some(l) = lamp {
+            net.entities[l].pos = (-2.5, 0.5);
+        }
+        for (i, &id) in inputs.iter().enumerate() {
+            net.entities[id].pos = (-2.0, i as f64 + 1.5);
+        }
+        // Output ports on the west edge, one row each north of the blueprint (the first
+        // output northernmost), facing west.
+        if opts.outputs_west {
+            for (i, &id) in outputs.iter().enumerate() {
+                net.entities[id].pos = (-2.0, -((n_out - i) as f64) + 0.5);
+                net.entities[id].dir = Dir::West;
+            }
+        }
     }
-    if let Some(l) = lamp {
-        net.entities[l].pos = (-2.5, 0.5);
-    }
-    for (i, &id) in inputs.iter().enumerate() {
-        net.entities[id].pos = (-2.0, i as f64 + 1.5);
-    }
+    let north_w = 1 + inputs.len() + if north_outs { n_out } else { 0 };
 
     let n = core.len().max(1);
     // `segs` segments of 7 columns (6 slots and a pole column), `rows` rows 2 tiles tall,
@@ -127,21 +184,30 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
         Some(a) => {
             // Wire networks as member lists, counting only entities with a position yet.
-            let known: std::collections::HashSet<EntId> =
+            let mut known: std::collections::HashSet<EntId> =
                 core.iter().copied().chain(run).chain(lamp).chain(inputs.iter().copied()).collect();
+            if north_outs || (opts.outputs_west && !ew) {
+                known.extend(outputs.iter().copied());
+            }
             let members: Vec<Vec<EntId>> =
                 nets.iter().map(|n| n.members.iter().map(|(e, _)| *e).filter(|e| known.contains(e)).collect()).collect();
             // Limits are for the whole blueprint: leave room for the ports at the edges.
             use crate::place::Objective;
-            let edge_w = 4 + if east_col.is_empty() { 0 } else { 3 } + if opts.outputs_west { 1 } else { 0 };
-            let edge_h = if opts.outputs_west { outputs.len() } else { 0 };
+            let (edge_w, edge_h, min_w, min_h) = if ew {
+                let rows_h = (2 + pole_row) * (1 + south_outs as usize);
+                (0, rows_h, north_w.max(if south_outs { n_out } else { 0 }), 0)
+            } else {
+                let edge_w = 4 + if east_col.is_empty() { 0 } else { 3 } + if opts.outputs_west { 1 } else { 0 };
+                let edge_h = if opts.outputs_west { n_out } else { 0 };
+                (edge_w, edge_h, 0, (inputs.len() + 1).max(east_col.len()))
+            };
             let objective = match a.objective {
                 Objective::MaxWidth(w) => Objective::MaxWidth(w.saturating_sub(edge_w as u32).max(1)),
                 Objective::MaxHeight(h) => Objective::MaxHeight(h.saturating_sub(edge_h as u32).max(2)),
                 o => o,
             };
             let a = crate::place::AnnealOpts { objective, ..a };
-            let frame = crate::place::Frame { extra_w: edge_w, extra_h: edge_h, min_h: (inputs.len() + 1).max(east_col.len()) };
+            let frame = crate::place::Frame { extra_w: edge_w, extra_h: edge_h, min_w, min_h };
             // For the smallest footprint, try a few block shapes (the grid layout's width, the
             // best area within 2:1, a square block) and keep the smallest blueprint.
             let candidates: Vec<Option<usize>> = match a.objective {
@@ -157,9 +223,9 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                 let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
                 let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
                 let w = if opts.poles { 7 * cols.div_ceil(SEG) } else { slots.tile_x(cols - 1) + 1 };
-                let area = (w + edge_w) * ((2 * rows).max(frame.min_h) + edge_h);
-                if best.as_ref().is_none_or(|b| area < b.0) {
-                    best = Some((area, (slots, placed)));
+                let (fw, fh) = frame.size(w, 2 * rows);
+                if best.as_ref().is_none_or(|b| fw * fh < b.0) {
+                    best = Some((fw * fh, (slots, placed)));
                 }
             }
             let (_, (slots, placed)) = best.unwrap();
@@ -182,37 +248,47 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             poles.push(((seg * 7 + 3) as f64 + 0.5, 2.0 * r as f64 + 0.5));
         }
     }
-
-    // Poles one column left of the inputs.
-    let left_rows = inputs.len() + 1;
-    // A pole powers 3 rows either side of its own.
-    for k in 0..left_rows.div_ceil(7).max(1) {
-        poles.push((-3.5, 7.0 * k as f64 + 3.5));
-    }
-
-    // Right: output ports just past the last core column.
     let w = w as f64;
     let east = !east_col.is_empty();
-    if east {
-        for (i, &id) in east_col.iter().enumerate() {
-            net.entities[id].pos = (w + 1.0, i as f64 + 0.5);
+    let block_h = 2.0 * rows as f64;
+    if ew {
+        // A row of poles above the north row (in line with the block's pole columns), and
+        // below the south row.
+        let row = |poles: &mut Vec<(f64, f64)>, width: usize, y: f64| {
+            for k in 0..(width.max(w as usize)).div_ceil(7).max(1) {
+                poles.push((7.0 * k as f64 + 3.5, y));
+            }
+        };
+        row(&mut poles, north_w, -2.5);
+        if south_outs {
+            for (i, &id) in outputs.iter().enumerate() {
+                net.entities[id].pos = (0.5 + i as f64, block_h + 1.0);
+                net.entities[id].dir = Dir::South;
+            }
+            row(&mut poles, n_out, block_h + 2.5);
         }
-        // With return lines, the column next to the ports is theirs: power from one further.
-        let px = if opts.outputs_west { w + 3.5 } else { w + 2.5 };
-        for k in 0..east_col.len().div_ceil(7) {
-            poles.push((px, 7.0 * k as f64 + 3.5));
+    } else {
+        // Poles one column left of the inputs.
+        let left_rows = inputs.len() + 1;
+        // A pole powers 3 rows either side of its own.
+        for k in 0..left_rows.div_ceil(7).max(1) {
+            poles.push((-3.5, 7.0 * k as f64 + 3.5));
         }
-    }
-    // Output ports on the west edge, one row each north of the blueprint (the first output
-    // northernmost), facing west; powered by poles further west.
-    let n_out = outputs.len();
-    if opts.outputs_west {
-        for (i, &id) in outputs.iter().enumerate() {
-            net.entities[id].pos = (-2.0, -((n_out - i) as f64) + 0.5);
-            net.entities[id].dir = Dir::West;
+        // Right: output ports (or gates) just past the last core column.
+        if east {
+            for (i, &id) in east_col.iter().enumerate() {
+                net.entities[id].pos = (w + 1.0, i as f64 + 0.5);
+            }
+            // With return lines, the column next to the ports is theirs: power from one further.
+            let px = if opts.outputs_west { w + 3.5 } else { w + 2.5 };
+            for k in 0..east_col.len().div_ceil(7) {
+                poles.push((px, 7.0 * k as f64 + 3.5));
+            }
         }
-        for k in 0..n_out.div_ceil(7) {
-            poles.push((-3.5, -(7.0 * k as f64) - 3.5));
+        if opts.outputs_west {
+            for k in 0..n_out.div_ceil(7) {
+                poles.push((-3.5, -(7.0 * k as f64) - 3.5));
+            }
         }
     }
 
@@ -234,9 +310,10 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
 
     // Return lines: each gate's result runs on its own chain of poles (red wire) north and
     // then west, to its output port. The first output's line is the northernmost, so the
-    // lines nest without crossing.
+    // lines nest without crossing. (Annealed gates are wired to their ports like any other
+    // network instead.)
     let mut lines: Vec<Line> = Vec::new();
-    if opts.outputs_west {
+    if opts.outputs_west && !ew && !gates_move {
         for (i, (&gate, &port)) in gates.iter().zip(&outputs).enumerate() {
             let row = -((n_out - i) as f64) + 0.5;
             let mut pts = vec![(w + 2.5, i as f64 + 0.5), (w + 2.5, row)];
@@ -310,7 +387,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             }
         }
     }
-    for spec in nets {
+    for spec in &nets {
         let points: Vec<(f64, f64)> = spec.members.iter().map(|(e, _)| net.entities[*e].pos).collect();
         for (a, b) in mst(&points) {
             let d = dist(points[a], points[b]);
@@ -349,8 +426,24 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     }
 
-    let height = (2 * rows).max(left_rows).max(east_col.len()) + if opts.outputs_west { n_out } else { 0 };
-    let width = w as usize + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
+    let (width, height) = if ew || gates_move {
+        // The bounding box of everything placed.
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for i in 0..net.entities.len() {
+            let (fw, fh) = net.footprint(i);
+            let (cx, cy) = net.entities[i].pos;
+            x0 = x0.min(cx - fw as f64 / 2.0);
+            x1 = x1.max(cx + fw as f64 / 2.0);
+            y0 = y0.min(cy - fh as f64 / 2.0);
+            y1 = y1.max(cy + fh as f64 / 2.0);
+        }
+        ((x1 - x0).round() as usize, (y1 - y0).round() as usize)
+    } else {
+        let left_rows = inputs.len() + 1;
+        let height = (2 * rows).max(left_rows).max(east_col.len()) + if opts.outputs_west { n_out } else { 0 };
+        let width = w as usize + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
+        (width, height)
+    };
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
 }
 

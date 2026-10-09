@@ -94,11 +94,18 @@ struct Placement {
     /// with substations). Poles that carry long circuit wires stay.
     #[arg(long)]
     no_poles: bool,
-    /// Output ports on the `east` (default) or `west` edge. With `west` the output ports sit
-    /// north of the blueprint at the west edge (the first output northernmost), each fed by
-    /// its own line of poles from a gate on the east edge.
-    #[arg(long, default_value = "east", value_parser = parse_side)]
-    outputs: Side,
+    /// How the ports are lined up: `ns` (default) in columns down the west (inputs) and east
+    /// (outputs) edges, or `ew` in rows along the north (inputs) and south (outputs) edges,
+    /// first port westernmost.
+    #[arg(long, default_value = "ns", value_parser = ["ns", "ew"])]
+    ports: String,
+    /// Which edge the output ports are on. With `--ports=ns`: `east` (default) or `west` (north
+    /// of the blueprint at the west edge, the first output northernmost, each fed by its own
+    /// line of poles from a gate on the east edge; with `--place=anneal`, by a gate placed like
+    /// the other combinators). With `--ports=ew`: `south` (default) or `north` (in the north
+    /// row, after the inputs).
+    #[arg(long, value_parser = parse_side)]
+    outputs: Option<Side>,
     /// How to place the combinators: `grid` (default) or `anneal` (experimental: simulated
     /// annealing for a smaller footprint).
     #[arg(long, default_value = "grid", value_parser = ["grid", "anneal"])]
@@ -148,13 +155,32 @@ impl Placement {
 enum Side {
     East,
     West,
+    North,
+    South,
 }
 
 fn parse_side(s: &str) -> Result<Side, String> {
     match s {
         "east" => Ok(Side::East),
         "west" => Ok(Side::West),
-        _ => Err("expected `east` or `west`".into()),
+        "north" => Ok(Side::North),
+        "south" => Ok(Side::South),
+        _ => Err("expected `east`, `west`, `north` or `south`".into()),
+    }
+}
+
+impl Placement {
+    /// (ports in rows, outputs on the inputs' side), checking that the sides fit the axis.
+    fn port_layout(&self) -> Result<(bool, bool), String> {
+        let ew = self.ports == "ew";
+        match (ew, self.outputs) {
+            (false, None | Some(Side::East)) => Ok((false, false)),
+            (false, Some(Side::West)) => Ok((false, true)),
+            (true, None | Some(Side::South)) => Ok((true, false)),
+            (true, Some(Side::North)) => Ok((true, true)),
+            (false, _) => Err("with `--ports=ns`, outputs go `east` or `west`".into()),
+            (true, _) => Err("with `--ports=ew`, outputs go `south` or `north`".into()),
+        }
     }
 }
 
@@ -185,7 +211,11 @@ fn print_diags(diags: &[Diag], file: &str, src: &str) {
 fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(String, String, Compiled), ExitCode> {
     let (name, src) = load(file)?;
     let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks };
+    let (ports_ew, outputs_west) = place.port_layout().map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::FAILURE
+    })?;
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -344,7 +374,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false }
 }
 
 fn main() -> ExitCode {
