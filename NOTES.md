@@ -440,3 +440,13 @@ tiles, 209 output-line poles; the N-S port column and its 20 return lines were m
 - Harness: power goes next to the left-most pole *with copper wires* (a relay west of the
   ports left the build unpowered); input injectors for south-facing ports go north of them.
 - `Dir::South` (blueprint direction 8).
+
+## 2026-10-09 — Relay routing stays inside the block
+
+Reported on enf (`--ports=ew --outputs=north`): relay poles strung far north of the port row.
+Relays aren't annealed; `route()` placed them afterwards with a breadth-first search that took
+the first fewest-hop path, ties broken by scan order (north-west first). It's now a Dijkstra
+over tiles ranked by (distance outside the block's bounding box, pole cost — reusing a pole's
+free connector is cheaper than a new pole — then distance from the straight line). enf at
+`--max-width 56 --no-poles`: ew/north 56×18 → 56×14 (3 → 4 relays), ew/south 60×24 → 56×22,
+west 59×35 → 54×35.

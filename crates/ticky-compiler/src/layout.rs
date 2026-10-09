@@ -345,6 +345,8 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             used.insert(tile(*p));
         }
     }
+    // The block's tiles, which relays and output lines should keep within.
+    let bbox = used.iter().fold((i64::MAX, i64::MAX, i64::MIN, i64::MIN), |b, t| (b.0.min(t.0), b.1.min(t.1), b.2.max(t.0), b.3.max(t.1)));
     let mut relays = 0;
     let mut carriers = 0;
     for (gate, port, pts) in &lines {
@@ -352,7 +354,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         let mut prev_pos = net.entities[*gate].pos;
         for &p in pts {
             // The climb can be longer than one wire: relay through free tiles on the way.
-            for t in route(&|t| !used.contains(&t), prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
+            for t in route(&|t| (!used.contains(&t)).then_some(1), bbox, prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
                 used.insert(t);
                 let pos = (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
                 let id = net.add(Kind::Pole, Role::Power);
@@ -399,8 +401,13 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             let conn = if spec.red { Conn::Red } else { Conn::Green };
             let mut prev = spec.members[a];
             let ci = (conn == Conn::Green) as usize;
-            let free = |t: (i64, i64)| !used.contains(&t) || pole_at.get(&t).is_some_and(|p| !p.1[ci]);
-            let path = route(&free, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))?;
+            // A pole already there with this colour free is cheaper than a new one.
+            let cost = |t: (i64, i64)| match pole_at.get(&t) {
+                Some(p) if !p.1[ci] => Some(0),
+                _ if !used.contains(&t) => Some(1),
+                _ => None,
+            };
+            let path = route(&cost, bbox, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))?;
             for tile in path {
                 let id = match pole_at.get_mut(&tile) {
                     Some(p) => {
@@ -447,36 +454,52 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
 }
 
-/// Relay tiles for a wire from `from` to `to`: the fewest free tiles such that every hop is
-/// within reach (breadth-first over free tiles, going around occupied areas if needed).
-/// Empty if `to` is already in reach; `None` if there's no way through.
-fn route(free: &dyn Fn((i64, i64)) -> bool, from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
+/// Relay tiles for a wire from `from` to `to`, or empty if `to` is already in reach; `None` if
+/// there's no way through. `cost` prices a tile for a pole (`None`: taken). Paths are ranked by
+/// how far their poles stick out of `bbox` (the block, which they'd otherwise grow), then by
+/// pole cost, then by how far they stray from the straight line.
+fn route(cost: &dyn Fn((i64, i64)) -> Option<i64>, bbox: (i64, i64, i64, i64), from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
+    use std::cmp::Reverse;
     if dist(from, to) <= MAX_WIRE {
         return Some(vec![]);
     }
     let centre = |t: (i64, i64)| (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
+    let outside = |t: (i64, i64)| (bbox.0 - t.0).max(t.0 - bbox.2).max(0) + (bbox.1 - t.1).max(t.1 - bbox.3).max(0);
+    let (sx, sy) = (to.0 - from.0, to.1 - from.1);
+    let len2 = sx * sx + sy * sy;
+    let stray = |p: (f64, f64)| {
+        let k = (((p.0 - from.0) * sx + (p.1 - from.1) * sy) / len2).clamp(0.0, 1.0);
+        dist(p, (from.0 + k * sx, from.1 + k * sy))
+    };
+    let price = |t: (i64, i64)| cost(t).map(|c| outside(t) * 1_000_000 + c * 1000 + (stray(centre(t)) * 10.0) as i64);
     // Search the area around both ends, with room to go around.
     let margin = 2 * MAX_WIRE as i64 + 2;
     let (x0, x1) = (from.0.min(to.0) as i64 - margin, from.0.max(to.0) as i64 + margin);
     let (y0, y1) = (from.1.min(to.1) as i64 - margin, from.1.max(to.1) as i64 + margin);
     let r = MAX_WIRE.floor() as i64;
-    let mut prev: std::collections::HashMap<(i64, i64), Option<(i64, i64)>> = std::collections::HashMap::new();
-    let mut queue = std::collections::VecDeque::new();
     let near = |p: (f64, f64)| {
         let (px, py) = (p.0.floor() as i64, p.1.floor() as i64);
         (-r..=r).flat_map(move |dx| (-r..=r).map(move |dy| (px + dx, py + dy)))
     };
+    let mut best: std::collections::HashMap<(i64, i64), (i64, Option<(i64, i64)>)> = std::collections::HashMap::new();
+    let mut heap = std::collections::BinaryHeap::new();
     for t in near(from) {
-        if free(t) && dist(centre(t), from) <= MAX_WIRE && !prev.contains_key(&t) {
-            prev.insert(t, None);
-            queue.push_back(t);
+        if dist(centre(t), from) <= MAX_WIRE {
+            if let Some(c) = price(t) {
+                best.insert(t, (c, None));
+                heap.push(Reverse((c, t)));
+            }
         }
     }
-    while let Some(t) = queue.pop_front() {
+    let mut done = std::collections::HashSet::new();
+    while let Some(Reverse((c, t))) = heap.pop() {
+        if !done.insert(t) {
+            continue;
+        }
         if dist(centre(t), to) <= MAX_WIRE {
             let mut path = vec![t];
             let mut cur = t;
-            while let Some(Some(p)) = prev.get(&cur) {
+            while let Some((_, Some(p))) = best.get(&cur) {
                 path.push(*p);
                 cur = *p;
             }
@@ -484,12 +507,13 @@ fn route(free: &dyn Fn((i64, i64)) -> bool, from: (f64, f64), to: (f64, f64)) ->
             return Some(path);
         }
         for u in near(centre(t)) {
-            if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || !free(u) || prev.contains_key(&u) {
+            if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || done.contains(&u) || dist(centre(u), centre(t)) > MAX_WIRE {
                 continue;
             }
-            if dist(centre(u), centre(t)) <= MAX_WIRE {
-                prev.insert(u, Some(t));
-                queue.push_back(u);
+            let Some(cu) = price(u) else { continue };
+            if best.get(&u).is_none_or(|b| c + cu < b.0) {
+                best.insert(u, (c + cu, Some(t)));
+                heap.push(Reverse((c + cu, u)));
             }
         }
     }
