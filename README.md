@@ -59,7 +59,10 @@ ticky build prog.ticky -o prog.bp.txt   # blueprint string (+ cost report on std
 ticky build prog.ticky --json           # blueprint JSON instead
 ticky build prog.ticky --opt=size       # fewest combinators (default: --opt=speed)
 ticky build prog.ticky --no-poles       # no power poles (bring your own, e.g. substations)
-ticky build prog.ticky --outputs=west   # also carry every output back west on its own pole line
+ticky build prog.ticky --outputs=west   # output ports at the top left, each fed by its own pole line
+ticky build prog.ticky --place=anneal   # experimental: smaller footprint by simulated annealing
+ticky build prog.ticky --place=anneal --max-width 30   # ... at most 30 tiles wide (or --max-height)
+ticky build prog.ticky --allow-unknown-signals         # no warnings for modded item/recipe names
 ticky check prog.ticky                  # errors, warnings and the cost report
 ticky test  prog.ticky                  # run the program's `test` blocks in the simulator
 ticky sim   prog.ticky --ticks 300 --set charge=10 --set charge=90@100   # print output changes
@@ -82,9 +85,10 @@ off and on.
   red or green wire carrying the input's signal to the port's input (left) side. Each port only
   reads its own signal, so a busy factory wire is fine. A `Bundle` input reads everything on
   the wire.
-- **Outputs:** combinators down the right edge, in declaration order. With `--outputs=west`, each
-  output also runs back on its own chain of medium poles (red wire) north of the blueprint, ending
-  at a pole above the input column; the first output's line is the northernmost. Wire from a port's output
+- **Outputs:** combinators down the right edge, in declaration order. With `--outputs=west`, the
+  output ports sit at the west edge north of the blueprint, one row each (the first output
+  northernmost), facing west; each is fed by its own line of poles (red wire) from a gate on the
+  east edge. This costs one combinator and one tick per output. Wire from a port's output
   (right) side to whatever should react. Hovering over a port shows its current value.
 - Every port's in-game description names it, e.g. *"Ticky output `half` (int): sends signal-H…"*.
 

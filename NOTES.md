@@ -250,3 +250,28 @@ Where the time goes now: a step lasts its logic depth + 1 tick (the register), w
 already the minimum for register-based steps; loop iterations are bounded by the depth of
 their loop-carried calculation. Further: if-conversion of branch targets (merge a branch's
 simple successor into the branching step), register sharing, real placement.
+
+### `--outputs=west` (2026-10-09)
+Output ports sit at the west edge north of the blueprint, one row each (first output
+northernmost), facing west. The combinator that used to be the port becomes a gate
+(`Role::OutputGate`) on the east edge; its result runs on its own line of poles (red) to the
+port, a pass-through (`x + 0` / `each + 0`). +1 combinator and +1 tick per output.
+
+## 2026-10-09 — Experimental placement by simulated annealing (`--place=anneal`)
+
+Opt-in (`place.rs`); the grid stays the default. Internal combinators are assigned to 1×2
+slots (columns skip every 7th tile column when there are power poles); ports, gates and the
+RUN switch stay where the grid layout puts them. Cost: footprint (or the free side under
+`--max-width`/`--max-height`, which apply to the whole blueprint), a gravity pull of every
+entity towards the ports' corner (without it only edge entities feel the footprint, and
+the result was worse than the grid), per-network half-perimeter plus a heavy penalty for
+spanning-tree hops beyond reach (networks ≤ 16 members), and a centre pull for big networks
+(bus, cluster wires). Starts from the serpentine order, fairly cool; moves are swaps within
+a shrinking window; `--seed` and `--effort`. Remaining long hops get relays as usual.
+
+Measured with `--no-poles` (whole blueprint, grid → anneal): calculator 28×14 → 25×14,
+stats 35×26 → 36×22, arrays 28×20 → 29×16, inventory 21×9 → 17×10. The annealed blocks are
+85–95% dense already, so most of the gain is the pole columns the grid leaves empty even
+without poles. Bigger wins now need: rotated (2×1) combinators, filling the return-line
+region north of the blueprint, and packing the return lines themselves. Difftested in-game
+(calculator, inventory with west outputs, stats with --max-width 24): all match.

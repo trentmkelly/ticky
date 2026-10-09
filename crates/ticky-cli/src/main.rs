@@ -45,7 +45,12 @@ enum Cmd {
         place: Placement,
     },
     /// Run the program's `test` blocks in the simulator.
-    Test { file: PathBuf },
+    Test {
+        file: PathBuf,
+        /// Don't warn about signal names Ticky doesn't know (modded names).
+        #[arg(long)]
+        allow_unknown_signals: bool,
+    },
     /// Simulate and print output ports whenever they change.
     Sim {
         file: PathBuf,
@@ -58,6 +63,9 @@ enum Cmd {
         /// Print every tick instead of only changes.
         #[arg(long)]
         all: bool,
+        /// Don't warn about signal names Ticky doesn't know (modded names).
+        #[arg(long)]
+        allow_unknown_signals: bool,
     },
     /// Run the program in the simulator and in headless Factorio, and compare tick by tick.
     Difftest {
@@ -66,26 +74,60 @@ enum Cmd {
         ticks: u64,
         #[arg(long = "set")]
         sets: Vec<String>,
-        /// `west`: also build the output return lines.
-        #[arg(long, default_value = "east", value_parser = parse_side)]
-        outputs: Side,
+        #[command(flatten)]
+        place: Placement,
     },
     /// Decode a blueprint string (from a file or argument) to JSON.
     Decode { input: String },
 }
 
 /// Where the blueprint's pieces go.
-#[derive(clap::Args, Clone, Copy)]
+#[derive(clap::Args, Clone)]
 struct Placement {
     /// Leave out the medium poles that power the combinators (power them yourself, e.g.
     /// with substations). Poles that carry long circuit wires stay.
     #[arg(long)]
     no_poles: bool,
-    /// Where outputs are delivered: `east` (default, the output ports) or `west`: each
-    /// output also runs back on its own chain of poles (red wire), north of the blueprint,
-    /// to a pole above the inputs. The first output's line is the northernmost.
+    /// Output ports on the `east` (default) or `west` edge. With `west` the output ports sit
+    /// north of the blueprint at the west edge (the first output northernmost), each fed by
+    /// its own line of poles from a gate on the east edge.
     #[arg(long, default_value = "east", value_parser = parse_side)]
     outputs: Side,
+    /// How to place the combinators: `grid` (default) or `anneal` (experimental: simulated
+    /// annealing for a smaller footprint).
+    #[arg(long, default_value = "grid", value_parser = ["grid", "anneal"])]
+    place: String,
+    /// With `--place=anneal`: the layout may be at most this many tiles wide (and as short
+    /// as possible).
+    #[arg(long)]
+    max_width: Option<u32>,
+    /// With `--place=anneal`: at most this many tiles tall (and as narrow as possible).
+    #[arg(long)]
+    max_height: Option<u32>,
+    /// With `--place=anneal`: random seed (same seed, same layout).
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// With `--place=anneal`: how hard to try (1 = default; more is slower and usually better).
+    #[arg(long, default_value_t = 1.0)]
+    effort: f64,
+    /// Don't warn about item/recipe/signal names Ticky doesn't know (modded names).
+    #[arg(long)]
+    allow_unknown_signals: bool,
+}
+
+impl Placement {
+    fn anneal(&self) -> Option<ticky_compiler::place::AnnealOpts> {
+        use ticky_compiler::place::{AnnealOpts, Objective};
+        if self.place != "anneal" {
+            return None;
+        }
+        let objective = match (self.max_width, self.max_height) {
+            (Some(w), _) => Objective::MaxWidth(w),
+            (None, Some(h)) => Objective::MaxHeight(h),
+            (None, None) => Objective::Area,
+        };
+        Some(AnnealOpts { objective, seed: self.seed, effort: self.effort })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,10 +168,10 @@ fn print_diags(diags: &[Diag], file: &str, src: &str) {
     }
 }
 
-fn build(file: &Path, autostart: bool, opt: Opt, place: Placement) -> Result<(String, String, Compiled), ExitCode> {
+fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(String, String, Compiled), ExitCode> {
     let (name, src) = load(file)?;
     let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -245,16 +287,13 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
     };
     let mut ports = Vec::new();
     for (i, p) in c.program.ports.iter().enumerate() {
-        // Outputs with a return line are read at the line's far end.
-        let end = c.layout.line_ends.iter().find(|(port, _)| *port == c.cg.port_ents[i]).map(|(_, e)| *e);
         ports.push(format!(
-            "{{name={}, dir={}, entity={}, signal={}, bundle={}, pole={}}}",
+            "{{name={}, dir={}, entity={}, signal={}, bundle={}}}",
             lua_str(&p.name),
             lua_str(if p.dir == PortDir::Input { "in" } else { "out" }),
-            end.unwrap_or(c.cg.port_ents[i]) + 1,
+            c.cg.port_ents[i] + 1,
             sig(p.sig),
-            p.ty == Ty::Bundle,
-            end.is_some()
+            p.ty == Ty::Bundle
         ));
     }
     let sets: Vec<String> = sets
@@ -282,12 +321,14 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
     )
 }
 
-const DEFAULT_PLACE: Placement = Placement { no_poles: false, outputs: Side::East };
+fn default_place() -> Placement {
+    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false }
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.cmd {
-        Cmd::Build { file, output, json, autostart, opt, place } => build(&file, autostart, opt, place).and_then(|(_, src, c)| {
+        Cmd::Build { file, output, json, autostart, opt, place } => build(&file, autostart, opt, &place).and_then(|(_, src, c)| {
             eprint!("{}", c.report(&src));
             let text = if json {
                 serde_json::to_string_pretty(&c.blueprint_json()).unwrap()
@@ -305,8 +346,8 @@ fn main() -> ExitCode {
                 }
             }
         }),
-        Cmd::Check { file, opt, place } => build(&file, false, opt, place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file } => build(&file, false, Opt::Speed, DEFAULT_PLACE).and_then(|(name, src, c)| {
+        Cmd::Check { file, opt, place } => build(&file, false, opt, &place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
+        Cmd::Test { file, allow_unknown_signals } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, ..default_place() }).and_then(|(name, src, c)| {
             let results = run_tests(&c, &src);
             if results.is_empty() {
                 eprintln!("no tests in {name}");
@@ -329,7 +370,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, ticks, sets, all } => build(&file, false, Opt::Speed, DEFAULT_PLACE).and_then(|(_, _, c)| {
+        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, ..default_place() }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
@@ -346,7 +387,7 @@ fn main() -> ExitCode {
             }
             Ok(())
         }),
-        Cmd::Difftest { file, ticks, sets, outputs } => build(&file, false, Opt::Speed, Placement { no_poles: false, outputs }).and_then(|(_, _, c)| {
+        Cmd::Difftest { file, ticks, sets, place } => build(&file, false, Opt::Speed, &Placement { no_poles: false, ..place }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE

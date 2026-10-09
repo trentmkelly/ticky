@@ -116,6 +116,9 @@ pub enum Role {
     Core,
     InputPort { name: String, signal: Sig },
     OutputPort { name: String, signal: Sig },
+    /// With output return lines: the combinator that gates an output; its result runs on a
+    /// line of poles to the output port.
+    OutputGate { name: String },
     RunSwitch,
     Power,
 }

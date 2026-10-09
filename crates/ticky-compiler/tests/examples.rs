@@ -30,6 +30,12 @@ fn examples_compile_and_pass() {
         let c2 = compile(&src, &other).unwrap_or_else(|d| panic!("{name} (no poles, west outputs): {}", d[0].message));
         assert!(c2.cg.netlist.validate(false).is_empty());
         assert_eq!(c2.layout.poles, 0);
+        // So does the experimental annealing placement, deterministically.
+        let a = ticky_compiler::place::AnnealOpts { effort: 0.2, ..Default::default() };
+        let annealed = Options { anneal: Some(a), ..opts() };
+        let c3 = compile(&src, &annealed).unwrap_or_else(|d| panic!("{name} (annealed): {}", d[0].message));
+        assert!(c3.cg.netlist.validate(true).is_empty(), "{name} (annealed)");
+        assert_eq!(compile(&src, &annealed).unwrap().blueprint_string(), c3.blueprint_string(), "{name}: annealing isn't deterministic");
         for r in run_tests(&c, &src) {
             if let Some(d) = r.failure {
                 panic!("{name}: test {} failed:\n{}", r.name, d.render(&name, &src));

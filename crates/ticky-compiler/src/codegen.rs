@@ -890,7 +890,7 @@ fn combinational(p: &Program, live: &[bool]) -> std::collections::HashSet<usize>
     out
 }
 
-pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
+pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codegen, Diag> {
     let t = SignalTable::base();
     let live = live_states(p);
     let comb = combinational(p, &live);
@@ -1106,21 +1106,40 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
             (_, Some(_), _) => unreachable!("output of the wrong kind"),
             (false, None, _) => (arith(Operand::Sig(run), ArOp::Mul, Operand::Const(s.init), port.sig), None),
         };
-        let id = cg.net.add(kind, Role::OutputPort { name: port.name.clone(), signal: port.sig });
         let sends = if s.ty == Ty::Bundle { "its bundle".to_string() } else { t.name(port.sig).to_string() };
+        let label = port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
+        let role = if outputs_west {
+            Role::OutputGate { name: port.name.clone() }
+        } else {
+            Role::OutputPort { name: port.name.clone(), signal: port.sig }
+        };
+        let id = cg.net.add(kind, role);
         let e = &mut cg.net.entities[id];
         e.dir = Dir::East;
-        e.description = Some(format!(
-            "Ticky output `{}` ({}){}: sends {sends} on wires connected to this combinator's output (right) side.",
-            port.name,
-            port.ty.name(),
-            port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default(),
-        ));
+        e.description = Some(if outputs_west {
+            format!("Ticky output `{}` (gate): its result runs on a line of poles to the output port at the west edge.", port.name)
+        } else {
+            format!("Ticky output `{}` ({}){label}: sends {sends} on wires connected to this combinator's output (right) side.", port.name, port.ty.name())
+        });
         cg.nets[0].members.push((id, Conn::InGreen));
         if let Some(x) = reads {
             cg.bread(x, id, false);
         }
         port_ents[pi] = id;
+        if outputs_west {
+            // The output port proper: passes on what arrives on its line (red).
+            let pass = if s.ty == Ty::Bundle { each } else { port.sig };
+            let a = Arith { first: Operand::Sig(pass), first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, op: ArOp::Add, out: pass };
+            let out = cg.net.add(Kind::Arith(a), Role::OutputPort { name: port.name.clone(), signal: port.sig });
+            let e = &mut cg.net.entities[out];
+            e.dir = Dir::West;
+            e.description = Some(format!(
+                "Ticky output `{}` ({}){label}: sends {sends} on wires connected to this combinator's output (left) side.",
+                port.name,
+                port.ty.name(),
+            ));
+            port_ents[pi] = out;
+        }
     }
     cg.bfinish();
 

@@ -60,15 +60,18 @@ pub struct LayoutInfo {
     pub relays: usize,
     /// Medium poles of the output return lines.
     pub carriers: usize,
-    /// For each output port with a return line: (port, the line's last pole).
-    pub line_ends: Vec<(EntId, EntId)>,
 }
+
+/// A return line: gate, output port, and the poles in between.
+type Line = (EntId, EntId, Vec<(f64, f64)>);
 
 pub struct LayoutOpts {
     /// Medium poles for power.
     pub poles: bool,
-    /// Return lines that bring every output back to the west edge, each on its own wires.
+    /// Output ports at the west edge, fed by return lines.
     pub outputs_west: bool,
+    /// Experimental placement by simulated annealing instead of the grid.
+    pub anneal: Option<crate::place::AnnealOpts>,
 }
 
 pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts) -> Result<LayoutInfo, String> {
@@ -77,23 +80,68 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::InputPort { .. })).collect();
     let outputs: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputPort { .. })).collect();
+    // With return lines, the gates take the output ports' places on the east edge.
+    let gates: Vec<EntId> =
+        (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputGate { .. })).collect();
+    let east_col: &[EntId] = if opts.outputs_west { &gates } else { &outputs };
     let run = net.find_role(|r| *r == Role::RunSwitch);
 
-    // Roughly square: S segments of 7 columns, rows 2 tiles tall.
-    let n = core.len().max(1);
-    let segs = ((n as f64 / 21.0).sqrt().ceil() as usize).max(1);
-    let per_row = SEG * segs;
-    let rows = n.div_ceil(per_row);
-    for (k, &id) in core.iter().enumerate() {
-        // Serpentine, so consecutive entities (which share private wires) stay adjacent.
-        let (r, j) = (k / per_row, k % per_row);
-        let j = if r % 2 == 1 { per_row - 1 - j } else { j };
-        let (seg, off) = (j / SEG, j % SEG);
-        let col = seg * 7 + if off < 3 { off } else { off + 1 };
-        // Two-tile combinators fill the slot; one-tile entities sit in its top half.
-        let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
-        net.entities[id].pos = (col as f64 + 0.5, 2.0 * r as f64 + dy);
+    // Left: RUN switch above the input ports (placed first: the annealer counts their wires).
+    if let Some(r) = run {
+        net.entities[r].pos = (-1.5, 0.5);
     }
+    for (i, &id) in inputs.iter().enumerate() {
+        net.entities[id].pos = (-2.0, i as f64 + 1.5);
+    }
+
+    let n = core.len().max(1);
+    // `segs` segments of 7 columns (6 slots and a pole column), `rows` rows 2 tiles tall,
+    // `w` tiles wide.
+    let (segs, rows, w) = match opts.anneal {
+        None => {
+            // Roughly square, serpentine so consecutive entities (which share private wires)
+            // stay adjacent.
+            let segs = ((n as f64 / 21.0).sqrt().ceil() as usize).max(1);
+            let per_row = SEG * segs;
+            let rows = n.div_ceil(per_row);
+            for (k, &id) in core.iter().enumerate() {
+                let (r, j) = (k / per_row, k % per_row);
+                let j = if r % 2 == 1 { per_row - 1 - j } else { j };
+                let (seg, off) = (j / SEG, j % SEG);
+                let col = seg * 7 + if off < 3 { off } else { off + 1 };
+                // Two-tile combinators fill the slot; one-tile entities sit in its top half.
+                let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
+                net.entities[id].pos = (col as f64 + 0.5, 2.0 * r as f64 + dy);
+            }
+            (segs, rows, 7 * segs)
+        }
+        Some(a) => {
+            // Wire networks as member lists, counting only entities with a position yet.
+            let known: std::collections::HashSet<EntId> =
+                core.iter().copied().chain(run).chain(inputs.iter().copied()).collect();
+            let members: Vec<Vec<EntId>> =
+                nets.iter().map(|n| n.members.iter().map(|(e, _)| *e).filter(|e| known.contains(e)).collect()).collect();
+            // Limits are for the whole blueprint: leave room for the ports at the edges.
+            use crate::place::Objective;
+            let edge_w = 4 + if east_col.is_empty() { 0 } else { 3 } + if opts.outputs_west { 1 } else { 0 };
+            let edge_h = if opts.outputs_west { outputs.len() } else { 0 };
+            let objective = match a.objective {
+                Objective::MaxWidth(w) => Objective::MaxWidth(w.saturating_sub(edge_w as u32).max(1)),
+                Objective::MaxHeight(h) => Objective::MaxHeight(h.saturating_sub(edge_h as u32).max(2)),
+                o => o,
+            };
+            let a = crate::place::AnnealOpts { objective, ..a };
+            let (slots, placed) = crate::place::anneal(net, &members, &core, opts.poles, a);
+            let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
+            let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
+            for (&id, &(c, r)) in core.iter().zip(&placed) {
+                let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
+                net.entities[id].pos = (slots.tile_x(c) as f64 + 0.5, 2.0 * r as f64 + dy);
+            }
+            let segs = cols.div_ceil(SEG);
+            (segs, rows, if opts.poles { 7 * segs } else { slots.tile_x(cols - 1) + 1 })
+        }
+    };
     let mut poles: Vec<(f64, f64)> = Vec::new();
     // A pole in row r powers rows r-2..=r+1.
     let mut pole_rows: Vec<usize> = (0..rows.div_ceil(4)).map(|b| (4 * b + 2).min(rows - 1)).collect();
@@ -104,13 +152,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     }
 
-    // Left: RUN switch above the input ports; poles one column further left.
-    if let Some(r) = run {
-        net.entities[r].pos = (-1.5, 0.5);
-    }
-    for (i, &id) in inputs.iter().enumerate() {
-        net.entities[id].pos = (-2.0, i as f64 + 1.5);
-    }
+    // Poles one column left of the inputs.
     let left_rows = inputs.len() + 1;
     // A pole powers 3 rows either side of its own.
     for k in 0..left_rows.div_ceil(7).max(1) {
@@ -118,16 +160,28 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     }
 
     // Right: output ports just past the last core column.
-    let w = (7 * segs) as f64;
-    let east = !outputs.is_empty();
+    let w = w as f64;
+    let east = !east_col.is_empty();
     if east {
-        for (i, &id) in outputs.iter().enumerate() {
+        for (i, &id) in east_col.iter().enumerate() {
             net.entities[id].pos = (w + 1.0, i as f64 + 0.5);
         }
         // With return lines, the column next to the ports is theirs: power from one further.
         let px = if opts.outputs_west { w + 3.5 } else { w + 2.5 };
-        for k in 0..outputs.len().div_ceil(7) {
+        for k in 0..east_col.len().div_ceil(7) {
             poles.push((px, 7.0 * k as f64 + 3.5));
+        }
+    }
+    // Output ports on the west edge, one row each north of the blueprint (the first output
+    // northernmost), facing west; powered by poles further west.
+    let n_out = outputs.len();
+    if opts.outputs_west {
+        for (i, &id) in outputs.iter().enumerate() {
+            net.entities[id].pos = (-2.0, -((n_out - i) as f64) + 0.5);
+            net.entities[id].dir = Dir::West;
+        }
+        for k in 0..n_out.div_ceil(7) {
+            poles.push((-3.5, -(7.0 * k as f64) - 3.5));
         }
     }
 
@@ -147,22 +201,21 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         net.wire((pole_ids[a], Conn::Copper), (pole_ids[b], Conn::Copper));
     }
 
-    // Return lines: each output's signal runs on its own chain of poles (red wire) north of
-    // the blueprint and back west to a pole above the inputs. The first output's line is
-    // the northernmost, so the lines nest without crossing.
-    let mut lines: Vec<(EntId, Vec<(f64, f64)>)> = Vec::new();
+    // Return lines: each gate's result runs on its own chain of poles (red wire) north and
+    // then west, to its output port. The first output's line is the northernmost, so the
+    // lines nest without crossing.
+    let mut lines: Vec<Line> = Vec::new();
     if opts.outputs_west {
-        let n = outputs.len();
-        for (i, &id) in outputs.iter().enumerate() {
-            let row = -((n - i) as f64) + 0.5;
+        for (i, (&gate, &port)) in gates.iter().zip(&outputs).enumerate() {
+            let row = -((n_out - i) as f64) + 0.5;
             let mut pts = vec![(w + 2.5, i as f64 + 0.5), (w + 2.5, row)];
             let mut x = w + 2.5;
-            while x - 8.0 > -2.5 {
+            while x - 8.0 > -0.5 {
                 x -= 8.0;
                 pts.push((x, row));
             }
-            pts.push((-2.5, row));
-            lines.push((id, pts));
+            pts.push((-0.5, row));
+            lines.push((gate, port, pts));
         }
     }
 
@@ -179,28 +232,25 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     }
     let tile = |p: (f64, f64)| (p.0.floor() as i64, p.1.floor() as i64);
-    for (_, pts) in &lines {
+    for (_, _, pts) in &lines {
         for p in pts {
             used.insert(tile(*p));
         }
     }
     let mut relays = 0;
     let mut carriers = 0;
-    let mut line_ends = Vec::new();
-    for (port, pts) in &lines {
-        let mut prev = (*port, Conn::OutRed);
-        let mut prev_pos = net.entities[*port].pos;
+    for (gate, port, pts) in &lines {
+        let mut prev = (*gate, Conn::OutRed);
+        let mut prev_pos = net.entities[*gate].pos;
         for &p in pts {
             // The climb can be longer than one wire: relay through free tiles on the way.
-            while dist(prev_pos, p) > MAX_WIRE {
-                let t = free_tile(&used, prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))?;
+            for t in route(&used, prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
                 used.insert(t);
                 let pos = (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
                 let id = net.add(Kind::Pole, Role::Power);
                 net.entities[id].pos = pos;
                 net.wire(prev, (id, Conn::Red));
                 prev = (id, Conn::Red);
-                prev_pos = pos;
                 carriers += 1;
             }
             let id = net.add(Kind::Pole, Role::Power);
@@ -210,7 +260,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             prev_pos = p;
             carriers += 1;
         }
-        line_ends.push((*port, prev.0));
+        net.wire(prev, (*port, Conn::InRed));
     }
     for spec in nets {
         let points: Vec<(f64, f64)> = spec.members.iter().map(|(e, _)| net.entities[*e].pos).collect();
@@ -220,13 +270,10 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                 net.wire(spec.members[a], spec.members[b]);
                 continue;
             }
-            // Too far for one wire: relay through medium poles on free tiles, each the free
-            // tile within reach that gets closest to the far end.
+            // Too far for one wire: relay through the fewest medium poles on free tiles.
             let conn = if spec.red { Conn::Red } else { Conn::Green };
             let mut prev = spec.members[a];
-            let mut prev_pos = points[a];
-            while dist(prev_pos, points[b]) > MAX_WIRE {
-                let tile = free_tile(&used, prev_pos, points[b]).ok_or_else(|| format!("no room for a wire relay near {prev_pos:?}"))?;
+            for tile in route(&used, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))? {
                 used.insert(tile);
                 let pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
                 let id = net.add(Kind::Pole, Role::Power);
@@ -234,35 +281,62 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                 net.entities[id].description = Some("Ticky wire relay".into());
                 net.wire(prev, (id, conn));
                 prev = (id, conn);
-                prev_pos = pos;
                 relays += 1;
             }
             net.wire(prev, spec.members[b]);
         }
     }
 
-    let height = (2 * rows).max(left_rows).max(outputs.len()) + if opts.outputs_west { outputs.len() } else { 0 };
-    let width = 7 * segs + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
-    Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers, line_ends })
+    let height = (2 * rows).max(left_rows).max(east_col.len()) + if opts.outputs_west { n_out } else { 0 };
+    let width = w as usize + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
+    Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
 }
 
-/// The free tile within wire reach of `from` that is closest to `to` (and makes progress).
-fn free_tile(used: &std::collections::HashSet<(i64, i64)>, from: (f64, f64), to: (f64, f64)) -> Option<(i64, i64)> {
+/// Relay tiles for a wire from `from` to `to`: the fewest free tiles such that every hop is
+/// within reach (breadth-first over free tiles, going around occupied areas if needed).
+/// Empty if `to` is already in reach; `None` if there's no way through.
+fn route(used: &std::collections::HashSet<(i64, i64)>, from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
+    if dist(from, to) <= MAX_WIRE {
+        return Some(vec![]);
+    }
+    let centre = |t: (i64, i64)| (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
+    // Search the area around both ends, with room to go around.
+    let margin = 2 * MAX_WIRE as i64 + 2;
+    let (x0, x1) = (from.0.min(to.0) as i64 - margin, from.0.max(to.0) as i64 + margin);
+    let (y0, y1) = (from.1.min(to.1) as i64 - margin, from.1.max(to.1) as i64 + margin);
     let r = MAX_WIRE.floor() as i64;
-    let (fx, fy) = (from.0.floor() as i64, from.1.floor() as i64);
-    let mut best: Option<((i64, i64), f64)> = None;
-    for dx in -r..=r {
-        for dy in -r..=r {
-            let t = (fx + dx, fy + dy);
-            let c = (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
-            if used.contains(&t) || dist(c, from) > MAX_WIRE {
+    let mut prev: std::collections::HashMap<(i64, i64), Option<(i64, i64)>> = std::collections::HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let near = |p: (f64, f64)| {
+        let (px, py) = (p.0.floor() as i64, p.1.floor() as i64);
+        (-r..=r).flat_map(move |dx| (-r..=r).map(move |dy| (px + dx, py + dy)))
+    };
+    for t in near(from) {
+        if !used.contains(&t) && dist(centre(t), from) <= MAX_WIRE && !prev.contains_key(&t) {
+            prev.insert(t, None);
+            queue.push_back(t);
+        }
+    }
+    while let Some(t) = queue.pop_front() {
+        if dist(centre(t), to) <= MAX_WIRE {
+            let mut path = vec![t];
+            let mut cur = t;
+            while let Some(Some(p)) = prev.get(&cur) {
+                path.push(*p);
+                cur = *p;
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for u in near(centre(t)) {
+            if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || used.contains(&u) || prev.contains_key(&u) {
                 continue;
             }
-            let d = dist(c, to);
-            if best.is_none_or(|(_, bd)| d < bd) {
-                best = Some((t, d));
+            if dist(centre(u), centre(t)) <= MAX_WIRE {
+                prev.insert(u, Some(t));
+                queue.push_back(u);
             }
         }
     }
-    best.filter(|(_, d)| *d + 1.0 < dist(from, to)).map(|(t, _)| t)
+    None
 }

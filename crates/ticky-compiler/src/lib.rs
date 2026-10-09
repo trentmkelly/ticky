@@ -10,6 +10,7 @@ pub mod ir;
 pub mod layout;
 pub mod lower;
 pub mod pipeline;
+pub mod place;
 pub mod program;
 pub mod testrun;
 
@@ -40,14 +41,18 @@ pub struct Options {
     /// Include medium poles for power (off: the player powers it, e.g. with substations).
     /// Poles that relay long circuit wires are always included.
     pub poles: bool,
-    /// Return lines: carry each output back to the west edge (north of the blueprint) on its
-    /// own chain of poles.
+    /// Output ports on the west edge, north of the blueprint (the first output northernmost),
+    /// each fed by its own line of poles from a gate where the output port would be.
     pub outputs_west: bool,
+    /// Experimental: place combinators by simulated annealing instead of the grid.
+    pub anneal: Option<place::AnnealOpts>,
+    /// Don't warn about signal names the compiler doesn't know (e.g. from mods).
+    pub allow_unknown_signals: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false }
     }
 }
 
@@ -74,9 +79,9 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
 fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool) -> Result<Compiled, Vec<Diag>> {
     let t = std::time::Instant::now();
     let mut program = program::analyze(module, pipeline)?;
-    let mut cg = codegen::codegen(&program, opts.autostart).map_err(|d| vec![d])?;
+    let mut cg = codegen::codegen(&program, opts.autostart, opts.outputs_west).map_err(|d| vec![d])?;
     program::timing("codegen", t);
-    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west };
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, anneal: opts.anneal };
     let layout = layout::layout(&mut cg.netlist, &cg.nets, &lo)
         .map_err(|e| vec![Diag::error(Default::default(), format!("internal layout error: {e}"))])?;
     let problems = cg.netlist.validate(opts.poles);
@@ -95,7 +100,10 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
         }
     }
     cg.netlist.description = desc;
-    let warnings = std::mem::take(&mut program.warnings);
+    let mut warnings = std::mem::take(&mut program.warnings);
+    if opts.allow_unknown_signals {
+        warnings.retain(|w| !w.message.starts_with("unknown signal"));
+    }
     Ok(Compiled { program, cg, layout, warnings })
 }
 
