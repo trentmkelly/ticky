@@ -1,0 +1,36 @@
+# Delivery tracker: press the button to snapshot the network; `arrived` shows what has
+# come in since (and `gone` what has left). `busy` lights while more than 3 kinds changed.
+input  stock: Bundle = port("Logistic network contents")
+input  mark: bool @ M = port("Press to take a snapshot")
+output arrived: Bundle = port("Gained since the snapshot")
+output gone: Bundle = port("Lost since the snapshot")
+output snapshots: int @ S
+output busy: bool @ B
+
+before = Bundle()
+snapshots = 0
+
+every tick:
+    change = stock - before
+    arrived = {s: v for s, v in change.items() if v > 0}
+    gone = {s: -v for s, v in change.items() if v < 0}
+    busy = len(change) > 3
+
+while True:
+    wait until mark
+    before = stock
+    snapshots += 1
+    wait until not mark
+
+test "tracks changes since the snapshot":
+    set stock = Bundle(iron_plate=100, coal=50)
+    run 10 ticks
+    assert arrived == Bundle(iron_plate=100, coal=50)
+    set mark = True
+    run until snapshots == 1, max 20 ticks
+    set mark = False
+    set stock = Bundle(iron_plate=130, coal=20, stone=5)
+    run 20 ticks
+    assert arrived == Bundle(iron_plate=30, stone=5)
+    assert gone == Bundle(coal=30)
+    assert not busy

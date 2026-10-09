@@ -1,5 +1,6 @@
 //! The Ticky compiler: source → analysis → IR → combinators → layout → blueprint.
 
+pub mod bundle;
 pub mod cfg;
 pub mod codegen;
 pub mod consteval;
@@ -36,6 +37,18 @@ pub struct Options {
     pub opt: Opt,
     /// Blueprint label.
     pub label: String,
+    /// Include medium poles for power (off: the player powers it, e.g. with substations).
+    /// Poles that relay long circuit wires are always included.
+    pub poles: bool,
+    /// Return lines: carry each output back to the west edge (north of the blueprint) on its
+    /// own chain of poles.
+    pub outputs_west: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false }
+    }
 }
 
 pub struct Compiled {
@@ -63,9 +76,10 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     let mut program = program::analyze(module, pipeline)?;
     let mut cg = codegen::codegen(&program, opts.autostart).map_err(|d| vec![d])?;
     program::timing("codegen", t);
-    let layout = layout::layout(&mut cg.netlist, &cg.nets)
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west };
+    let layout = layout::layout(&mut cg.netlist, &cg.nets, &lo)
         .map_err(|e| vec![Diag::error(Default::default(), format!("internal layout error: {e}"))])?;
-    let problems = cg.netlist.validate();
+    let problems = cg.netlist.validate(opts.poles);
     if !problems.is_empty() {
         return Err(vec![Diag::error(Default::default(), format!("internal layout error: {}", problems.join("; ")))]);
     }
@@ -74,7 +88,11 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     let mut desc = String::from("Compiled by Ticky. Turn ON the RUN switch (the constant combinator at the top left) to start.\n");
     for p in &program.ports {
         let dir = if p.dir == PortDir::Input { "input " } else { "output" };
-        desc.push_str(&format!("\n{dir} {}: {} on {}", p.name, p.ty.name(), t.name(p.sig)));
+        if p.ty == program::Ty::Bundle {
+            desc.push_str(&format!("\n{dir} {}: Bundle (every signal)", p.name));
+        } else {
+            desc.push_str(&format!("\n{dir} {}: {} on {}", p.name, p.ty.name(), t.name(p.sig)));
+        }
     }
     cg.netlist.description = desc;
     let warnings = std::mem::take(&mut program.warnings);
@@ -135,15 +153,23 @@ impl Compiled {
             .entities
             .iter()
             .filter_map(|e| match &e.role {
-                Role::InputPort { name, signal } => Some(format!("in {name} ({})", t.name(*signal))),
-                Role::OutputPort { name, signal } => Some(format!("out {name} ({})", t.name(*signal))),
+                Role::InputPort { name, signal } | Role::OutputPort { name, signal } => {
+                    let dir = if matches!(e.role, Role::InputPort { .. }) { "in" } else { "out" };
+                    let what = if t.name(*signal) == "signal-each" { "bundle" } else { t.name(*signal) };
+                    Some(format!("{dir} {name} ({what})"))
+                }
                 _ => None,
             })
             .collect();
         out.push_str(&format!("  ports: {}\n", if ports.is_empty() { "none".into() } else { ports.join(", ") }));
         out.push_str(&format!(
-            "  total: {combs} combinators, {} poles, {}×{} tiles, {} signals\n",
-            self.layout.poles, self.layout.width, self.layout.height, self.cg.signals_used
+            "  total: {combs} combinators, {} power poles, {} wire relays{}, {}×{} tiles, {} signals\n",
+            self.layout.poles,
+            self.layout.relays,
+            if self.layout.carriers > 0 { format!(", {} output-line poles", self.layout.carriers) } else { String::new() },
+            self.layout.width,
+            self.layout.height,
+            self.cg.signals_used
         ));
         out
     }

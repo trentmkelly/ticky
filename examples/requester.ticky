@@ -1,0 +1,23 @@
+# Smart requester: request whatever the logistic network is short of.
+# Wire a roboport (reading logistic network contents) into `stock`, and `request` into a
+# requester chest set to "Set requests".
+input  stock: Bundle = port("Logistic network contents")
+output request: Bundle = port("Requests")
+
+WANT = Bundle(iron_plate=400, copper_plate=400, steel_plate=100, plastic_bar=200)
+
+every tick:
+    short = WANT - stock
+    request = {s: v for s, v in short.items() if v > 0}
+
+test "requests only what's missing":
+    set stock = Bundle(iron_plate=150, copper_plate=500, plastic_bar=200, coal=1000)
+    run 10 ticks
+    assert request == Bundle(iron_plate=250, steel_plate=100)
+    assert request.iron_plate == 250
+    assert S("copper-plate") not in request
+
+test "nothing when stocked":
+    set stock = WANT + Bundle(coal=5)
+    run 10 ticks
+    assert len(request) == 0

@@ -95,6 +95,13 @@ script.on_event(defines.events.on_tick, function(e)
   for _, st in ipairs(job.sets) do
     if st.t == i and st.port == 0 then
       storage.ents[job.run].get_control_behavior().enabled = st.value ~= 0
+    elseif st.t == i and st.values then
+      -- A bundle input: replace every slot.
+      local section = storage.injectors[st.port].get_control_behavior().get_section(1)
+      for k = 1, section.filters_count do section.clear_slot(k) end
+      for k, v in ipairs(st.values) do
+        section.set_slot(k, {value = {type = v.type, name = v.name, quality = "normal"}, min = v.value})
+      end
     elseif st.t == i then
       local p = job.ports[st.port]
       local section = storage.injectors[st.port].get_control_behavior().get_section(1)
@@ -103,7 +110,31 @@ script.on_event(defines.events.on_tick, function(e)
   end
   local row = {tostring(i)}
   for _, p in ipairs(job.ports) do
-    if p.dir == "out" then
+    -- An output read at the end of its return line: the red network there.
+    local signals
+    if p.dir == "out" and p.pole then
+      local n = storage.ents[p.entity].get_circuit_network(defines.wire_connector_id.circuit_red)
+      signals = n and n.signals or {}
+    elseif p.dir == "out" and p.bundle then
+      signals = storage.ents[p.entity].get_control_behavior().signals_last_tick or {}
+    end
+    if p.dir == "out" and p.pole and not p.bundle then
+      local v = 0
+      for _, sg in pairs(signals) do
+        if sg.signal.name == p.signal.name then v = v + sg.count end
+      end
+      row[#row + 1] = tostring(v)
+    elseif p.dir == "out" and p.bundle then
+      -- Every signal the port outputs, as {name=value,...} sorted by name.
+      local parts = {}
+      for _, sg in pairs(signals) do
+        if sg.count ~= 0 then parts[#parts + 1] = {n = sg.signal.name, v = sg.count} end
+      end
+      table.sort(parts, function(a, b) return a.n < b.n end)
+      local strs = {}
+      for _, x in ipairs(parts) do strs[#strs + 1] = x.n .. "=" .. x.v end
+      row[#row + 1] = "{" .. table.concat(strs, ",") .. "}"
+    elseif p.dir == "out" and not p.pole then
       local v = storage.ents[p.entity].get_control_behavior().get_signal_last_tick(p.signal)
       row[#row + 1] = tostring(v or 0)
     end

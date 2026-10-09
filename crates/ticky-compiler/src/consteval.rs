@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use ticky_syntax::ast::{Expr, ExprKind, Stmt, StmtKind};
 use ticky_syntax::{Diag, Span};
 
+use crate::ir::Cv;
 use crate::program::{eval_const, Port};
 
 /// Why compile-time execution stopped.
@@ -27,7 +28,7 @@ enum Flow {
 pub fn exec(
     body: &[Stmt],
     subs: &[crate::cfg::SubDef],
-    env: &mut HashMap<String, i32>,
+    env: &mut HashMap<String, Cv>,
     exprs: &mut HashMap<String, (Option<Expr>, Expr, Span)>,
     ports: &[Port],
     budget: &mut usize,
@@ -43,18 +44,31 @@ struct Ctx<'a> {
     ports: &'a [Port],
 }
 
-fn value(e: &Expr, env: &HashMap<String, i32>, ports: &[Port]) -> Result<i32, Stop> {
+fn value(e: &Expr, env: &HashMap<String, Cv>, ports: &[Port]) -> Result<Cv, Stop> {
     eval_const(e, env, ports).map_err(|_| Stop::Runtime)
+}
+
+fn int(e: &Expr, env: &HashMap<String, Cv>, ports: &[Port]) -> Result<i32, Stop> {
+    value(e, env, ports)?.int().ok_or(Stop::Runtime)
+}
+
+/// Python truthiness of a constant.
+fn truthy(c: &Cv) -> bool {
+    match c {
+        Cv::Int(k) => *k != 0,
+        Cv::Bun(b) => !b.is_empty(),
+        Cv::Sig(_) => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn set(
     name: &str,
-    v: i32,
+    v: Cv,
     ann: Option<&Expr>,
     e: &Expr,
     span: Span,
-    env: &mut HashMap<String, i32>,
+    env: &mut HashMap<String, Cv>,
     exprs: &mut HashMap<String, (Option<Expr>, Expr, Span)>,
     ports: &[Port],
 ) -> Result<(), Stop> {
@@ -70,7 +84,7 @@ fn set(
 fn run(
     body: &[Stmt],
     cx: &Ctx,
-    env: &mut HashMap<String, i32>,
+    env: &mut HashMap<String, Cv>,
     exprs: &mut HashMap<String, (Option<Expr>, Expr, Span)>,
     budget: &mut usize,
 ) -> Result<Flow, Stop> {
@@ -84,7 +98,7 @@ fn run(
             StmtKind::Pass => {}
             StmtKind::Expr(Expr { kind: ExprKind::Str(_), .. }) => {}
             StmtKind::Assign { targets, value: v } => {
-                let (names, values): (Vec<&str>, Vec<(i32, &Expr)>) = match (&targets[..], &v.kind) {
+                let (names, values): (Vec<&str>, Vec<(Cv, &Expr)>) = match (&targets[..], &v.kind) {
                     ([Expr { kind: ExprKind::Name(n), .. }], _) => (vec![n.as_str()], vec![(value(v, env, ports)?, v)]),
                     ([Expr { kind: ExprKind::Tuple(ts), .. }], ExprKind::Tuple(vs)) if ts.len() == vs.len() => {
                         let mut names = Vec::new();
@@ -114,14 +128,14 @@ fn run(
                 set(n, k, None, &e, s.span, env, exprs, ports)?;
             }
             StmtKind::If { cond, body, orelse } => {
-                let f = if value(cond, env, ports)? != 0 { body } else { orelse };
+                let f = if truthy(&value(cond, env, ports)?) { body } else { orelse };
                 match run(f, cx, env, exprs, budget)? {
                     Flow::Normal => {}
                     other => return Ok(other),
                 }
             }
             StmtKind::While { cond, body } => {
-                while value(cond, env, ports)? != 0 {
+                while truthy(&value(cond, env, ports)?) {
                     if *budget == 0 {
                         return Err(Stop::Runtime);
                     }
@@ -139,7 +153,7 @@ fn run(
                 }
                 let mut a = Vec::new();
                 for x in args {
-                    a.push(value(x, env, ports)? as i64);
+                    a.push(int(x, env, ports)? as i64);
                 }
                 let (mut k, end, step) = match a.as_slice() {
                     [e] => (0, *e, 1),
@@ -152,7 +166,7 @@ fn run(
                         return Err(Stop::Runtime);
                     }
                     let lit = Expr { kind: ExprKind::Int(k), span: s.span };
-                    set(n, k as i32, None, &lit, s.span, env, exprs, ports)?;
+                    set(n, Cv::Int(k as i32), None, &lit, s.span, env, exprs, ports)?;
                     match run(body, cx, env, exprs, budget)? {
                         Flow::Break => break,
                         Flow::Normal | Flow::Continue => {}

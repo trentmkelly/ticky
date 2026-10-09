@@ -6,7 +6,7 @@ use ticky_compiler::testrun::run_tests;
 use ticky_compiler::{compile, Options};
 
 fn opts() -> Options {
-    Options { autostart: false, label: "test".into(), opt: Default::default() }
+    Options { label: "test".into(), ..Default::default() }
 }
 
 #[test]
@@ -24,7 +24,12 @@ fn examples_compile_and_pass() {
         let c = compile(&src, &opts()).unwrap_or_else(|d| {
             panic!("{}", d.iter().map(|d| d.render(&name, &src)).collect::<String>())
         });
-        assert!(c.cg.netlist.validate().is_empty());
+        assert!(c.cg.netlist.validate(true).is_empty());
+        // The placement options give valid layouts too.
+        let other = Options { poles: false, outputs_west: true, ..opts() };
+        let c2 = compile(&src, &other).unwrap_or_else(|d| panic!("{name} (no poles, west outputs): {}", d[0].message));
+        assert!(c2.cg.netlist.validate(false).is_empty());
+        assert_eq!(c2.layout.poles, 0);
         for r in run_tests(&c, &src) {
             if let Some(d) = r.failure {
                 panic!("{name}: test {} failed:\n{}", r.name, d.render(&name, &src));
@@ -53,7 +58,14 @@ fn helpful_errors() {
     assert!(error_of("input c: int\noutput y: int\nevery tick:\n    if c:\n        t = 1\n    y = t\n").contains("might not be assigned"));
     assert!(error_of("output y: int\nevery tick:\n    y = 7 / 2\n").contains("no floats"));
     assert!(error_of("output y: int\nevery 1 ticks:\n    y = (y + 1) % 7 * 3\n").contains("at least"));
-    assert!(error_of("output y: int @ nonsense_signal\n").contains("unknown signal"));
+    // Modded signals by exact name and type: warnings only, and the right signal type.
+    let c = compile("output o: Bundle\nevery tick:\n    o = {S(\"nt-tbu-fuel\"): 1, S(\"nt-reprocess-x\", type=\"recipe\"): 2}\n", &opts()).unwrap();
+    assert_eq!(c.warnings.len(), 2);
+    let json = c.blueprint_json().to_string();
+    assert!(json.contains(r#"{"name":"nt-tbu-fuel","index"#) && json.contains(r#"{"type":"recipe","name":"nt-reprocess-x","index"#), "{json}");
+    // Unknown signals (e.g. from mods) are warnings, not errors.
+    let c = compile("output y: int @ nonsense_signal\n", &opts()).unwrap();
+    assert!(c.warnings.iter().any(|w| w.message.contains("unknown signal")));
     assert!(error_of("output y: int\ndef f(n):\n    return f(n - 1)\ny = f(3)\n").contains("recursion"));
     assert!(error_of("output y: int\ndef f(a, b):\n    return a\ny = f(1)\n").contains("needs an argument for `b`"));
     assert!(error_of("output y: int\ndef f():\n    pass\ny = f()\n").contains("doesn't return a value"));
@@ -65,6 +77,14 @@ fn helpful_errors() {
     assert!(error_of("output y: int\nevery tick:\n    y = z\nwait 5\nz = 1\n").contains("might not have run yet"));
     assert!(error_of("output y: int\nevery tick:\n    y = 1\nwait 1\ny = 2\n").contains("more than one"));
     assert!(error_of("break\n").contains("outside a loop"));
+    // Bundles.
+    let b = "input b: Bundle\noutput o: Bundle\noutput y: int\n";
+    assert!(error_of(&format!("{b}every tick:\n    y = b\n")).contains("is a number, but this value is a bundle"));
+    assert!(error_of(&format!("{b}every tick:\n    y = b < 5\n")).contains("only be compared with `==`"));
+    assert!(error_of(&format!("{b}every tick:\n    o = {{s: v for s, v in b.items() if s > 3}}\n")).contains("can only be used as the key"));
+    assert!(error_of(&format!("{b}def f(x):\n    return x\nevery tick:\n    o = {{s: f(v) for s, v in b.items()}}\n")).contains("can't be called inside"));
+    assert!(error_of("input b: Bundle @ A\n").contains("no `@ signal`"));
+    assert!(error_of(&format!("{b}every tick:\n    o = b + 1 if y else 0\n")).contains("the other side is a bundle"));
     assert!(error_of("for i in range(0, 10, 0):\n    pass\n").contains("can't be 0"));
 }
 
@@ -72,7 +92,7 @@ fn helpful_errors() {
 fn constants_fold_away() {
     let src = "K = 6 * 7\nW = K // 4 - -3 % 2\noutput y: int @ Y\nevery tick:\n    y = W + 0\n";
     let c = compile(src, &opts()).unwrap();
-    assert_eq!(c.program.consts["W"], 9);
+    assert_eq!(c.program.consts["W"], ticky_compiler::ir::Cv::Int(9));
     // y = 9 is loaded with a constant: no arithmetic combinators in the block.
     assert_eq!(c.cg.blocks[0].depth, 0);
 }

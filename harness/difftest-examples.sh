@@ -18,3 +18,7 @@ run examples/calculator.ticky --ticks 2000 --set n=27 --set start=1@5 --set star
 run examples/functions.ticky --ticks 400 --set a=84 --set b=-36 --set a=5@120 --set b=7@121 --set a=150@250 --set b=0@300 --set RUN=0@350 --set RUN=1@360
 run examples/arrays.ticky --ticks 500 --set pick=3 --set value=10 --set store=1@5 --set store=0@40 --set pick=9@80 --set pick=5@120 --set value=-7@120 --set store=1@125 --set store=0@160 --set pick=-1@200 --set pick=5@240
 run examples/stats.ticky --ticks 1500 --set reading=100 --set reading=180@250 --set reading=-40@700 --set reading=55@1000 --set RUN=0@1300 --set RUN=1@1310
+run examples/requester.ticky --ticks 60 --set 'stock=iron-plate:150,copper-plate:500,plastic-bar:200,coal:1000@5' --set 'stock=iron-plate:400,steel-plate:30@30'
+run examples/inventory.ticky --ticks 80 --set limit=100 --set 'stock=iron-plate:40,copper-plate:250,coal:-5,stone:100@3' --set 'stock=copper-plate:5,stone:1000@40' --set limit=7@60
+run examples/deliveries.ticky --ticks 120 --set 'stock=iron-plate:100,coal:50@2' --set mark=1@20 --set mark=0@30 --set 'stock=iron-plate:130,coal:20,stone:5,wood:1,copper-ore:3@50' --set 'stock=iron-plate:100@90'
+run examples/bundles.ticky --ticks 200 --set 'stock=iron-plate:5,copper-plate:2@1' --set reset=1@45 --set reset=0@70 --set mode=1@80 --set mode=0@100 --set mode=2@110 --set 'stock=copper-plate:1,coal:3@130' --set mode=0@150 --set mode=3@160

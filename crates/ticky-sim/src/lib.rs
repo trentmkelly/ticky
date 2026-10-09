@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use ticky_factorio::{Conn, EntId, Kind, Netlist, Nets, Operand, Sig, SignalTable};
+use ticky_factorio::{Conn, Cond, EntId, Kind, Netlist, Nets, Operand, Selector, Sig, SignalTable};
 
 /// Values on one wire network, stored densely with a list of touched signals.
 #[derive(Clone)]
@@ -20,11 +20,19 @@ impl NetValues {
     }
 
     fn add(&mut self, s: Sig, v: i32) {
+        if s.0 as usize >= self.dense.len() {
+            // A signal interned after the simulator was built (e.g. named by a test).
+            self.dense.resize(s.0 as usize + 1, 0);
+        }
         let slot = &mut self.dense[s.0 as usize];
         if *slot == 0 && v != 0 {
             self.touched.push(s.0);
         }
         *slot = slot.wrapping_add(v);
+    }
+
+    fn get(&self, s: Sig) -> i32 {
+        self.dense.get(s.0 as usize).copied().unwrap_or(0)
     }
 
     fn clear(&mut self) {
@@ -52,6 +60,10 @@ pub struct Sim<'a> {
     external: HashMap<EntId, Vec<(Sig, i32)>>,
     /// Constant combinator on/off switches.
     const_on: Vec<bool>,
+    /// The wildcard signals: each, everything, anything.
+    each: Sig,
+    everything: Sig,
+    anything: Sig,
     pub tick: u64,
 }
 
@@ -84,7 +96,8 @@ impl<'a> Sim<'a> {
                 slots[ci] = *ids.entry(root).or_insert(next);
             }
         }
-        let nsig = SignalTable::base().len();
+        let t = SignalTable::base();
+        let nsig = t.len();
         let const_on = netlist
             .entities
             .iter()
@@ -97,6 +110,9 @@ impl<'a> Sim<'a> {
             outputs: vec![Vec::new(); n],
             external: HashMap::new(),
             const_on,
+            each: t.special("signal-each"),
+            everything: t.special("signal-everything"),
+            anything: t.special("signal-anything"),
             tick: 0,
         }
     }
@@ -119,20 +135,86 @@ impl<'a> Sim<'a> {
         self.outputs[e].iter().filter(|(x, _)| *x == s).map(|(_, v)| *v).sum()
     }
 
+    /// Everything in entity `e`'s own output (nonzero signals).
+    pub fn outputs_of(&self, e: EntId) -> &[(Sig, i32)] {
+        &self.outputs[e]
+    }
+
     /// The value of `s` on the network attached to `e`'s connector `c` (as of the last tick).
     pub fn net_value(&self, e: EntId, c: Conn, s: Sig) -> i32 {
-        self.nets[self.net(e, c)].dense[s.0 as usize]
+        self.nets[self.net(e, c)].get(s)
     }
 
     fn read(&self, e: EntId, s: Sig, nets: Nets) -> i32 {
         let mut v = 0i32;
         if nets.red {
-            v = v.wrapping_add(self.nets[self.net(e, Conn::InRed)].dense[s.0 as usize]);
+            v = v.wrapping_add(self.nets[self.net(e, Conn::InRed)].get(s));
         }
         if nets.green {
-            v = v.wrapping_add(self.nets[self.net(e, Conn::InGreen)].dense[s.0 as usize]);
+            v = v.wrapping_add(self.nets[self.net(e, Conn::InGreen)].get(s));
         }
         v
+    }
+
+    /// Nonzero signals on the selected input networks of `e`, in signal order.
+    fn signals(&self, e: EntId, nets: Nets) -> Vec<(Sig, i32)> {
+        let mut ids: Vec<u16> = Vec::new();
+        if nets.red {
+            ids.extend(&self.nets[self.net(e, Conn::InRed)].touched);
+        }
+        if nets.green {
+            ids.extend(&self.nets[self.net(e, Conn::InGreen)].touched);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().map(|i| (Sig(i), self.read(e, Sig(i), nets))).filter(|(_, v)| *v != 0).collect()
+    }
+
+    fn is_each(&self, o: Operand) -> bool {
+        o == Operand::Sig(self.each)
+    }
+
+    /// Signals an `each` decider iterates: those on the networks of every `each` operand.
+    fn each_domain(&self, e: EntId, conds: &[Cond]) -> Vec<Sig> {
+        let mut out: Vec<Sig> = Vec::new();
+        for c in conds {
+            if c.first == self.each {
+                out.extend(self.signals(e, c.first_nets).into_iter().map(|(s, _)| s));
+            }
+            if self.is_each(c.second) {
+                out.extend(self.signals(e, c.second_nets).into_iter().map(|(s, _)| s));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Evaluates decider conditions (OR of AND-groups), with `each` standing for `cur`.
+    fn conds_hold(&self, e: EntId, conds: &[Cond], cur: Option<Sig>) -> bool {
+        let mut any = false;
+        let mut group = true;
+        for (i, c) in conds.iter().enumerate() {
+            if i > 0 && !c.and {
+                any |= group;
+                group = true;
+            }
+            let y = match c.second {
+                Operand::Sig(s) if s == self.each => self.read(e, cur.expect("each outside an each decider"), c.second_nets),
+                o => self.operand(e, o, c.second_nets),
+            };
+            let ok = if c.first == self.everything {
+                self.signals(e, c.first_nets).iter().all(|(_, x)| c.cmp.apply(*x, y))
+            } else if c.first == self.anything {
+                self.signals(e, c.first_nets).iter().any(|(_, x)| c.cmp.apply(*x, y))
+            } else if c.first == self.each {
+                c.cmp.apply(self.read(e, cur.expect("each outside an each decider"), c.first_nets), y)
+            } else {
+                c.cmp.apply(self.read(e, c.first, c.first_nets), y)
+            };
+            group &= ok;
+        }
+        any || (group && !conds.is_empty())
     }
 
     fn operand(&self, e: EntId, o: Operand, nets: Nets) -> i32 {
@@ -149,7 +231,7 @@ impl<'a> Sim<'a> {
         }
         for (e, ent) in self.netlist.entities.iter().enumerate() {
             match &ent.kind {
-                Kind::Arith(_) | Kind::Decider(_) => {
+                Kind::Arith(_) | Kind::Decider(_) | Kind::Selector(_) => {
                     let (r, g) = (self.net(e, Conn::OutRed), self.net(e, Conn::OutGreen));
                     for &(s, v) in &self.outputs[e] {
                         self.nets[r].add(s, v);
@@ -177,37 +259,110 @@ impl<'a> Sim<'a> {
         for (e, ent) in self.netlist.entities.iter().enumerate() {
             let out = match &ent.kind {
                 Kind::Arith(a) => {
-                    let x = self.operand(e, a.first, a.first_nets);
-                    let y = self.operand(e, a.second, a.second_nets);
-                    let v = a.op.apply(x, y);
-                    if v == 0 {
-                        vec![]
+                    let (fe, se) = (self.is_each(a.first), self.is_each(a.second));
+                    if fe || se {
+                        // Each: the operation applies to every signal on the `each` operands'
+                        // networks; the result is per signal, or summed into one output.
+                        let mut dom: Vec<Sig> = Vec::new();
+                        if fe {
+                            dom.extend(self.signals(e, a.first_nets).into_iter().map(|(s, _)| s));
+                        }
+                        if se {
+                            dom.extend(self.signals(e, a.second_nets).into_iter().map(|(s, _)| s));
+                        }
+                        dom.sort_unstable();
+                        dom.dedup();
+                        let mut per = Vec::new();
+                        let mut total = 0i32;
+                        for s in dom {
+                            let x = if fe { self.read(e, s, a.first_nets) } else { self.operand(e, a.first, a.first_nets) };
+                            let y = if se { self.read(e, s, a.second_nets) } else { self.operand(e, a.second, a.second_nets) };
+                            let v = a.op.apply(x, y);
+                            if a.out == self.each {
+                                if v != 0 {
+                                    per.push((s, v));
+                                }
+                            } else {
+                                total = total.wrapping_add(v);
+                            }
+                        }
+                        if a.out != self.each && total != 0 {
+                            per.push((a.out, total));
+                        }
+                        per
                     } else {
-                        vec![(a.out, v)]
+                        let x = self.operand(e, a.first, a.first_nets);
+                        let y = self.operand(e, a.second, a.second_nets);
+                        let v = a.op.apply(x, y);
+                        if v == 0 {
+                            vec![]
+                        } else {
+                            vec![(a.out, v)]
+                        }
                     }
                 }
                 Kind::Decider(d) => {
-                    // OR of AND-groups.
-                    let mut any = false;
-                    let mut group = true;
-                    for (i, c) in d.conds.iter().enumerate() {
-                        if i > 0 && !c.and {
-                            any |= group;
-                            group = true;
+                    let uses_each = d.conds.iter().any(|c| c.first == self.each || self.is_each(c.second));
+                    let mut out: Vec<(Sig, i32)> = Vec::new();
+                    if uses_each {
+                        let passing: Vec<Sig> =
+                            self.each_domain(e, &d.conds).into_iter().filter(|s| self.conds_hold(e, &d.conds, Some(*s))).collect();
+                        for o in &d.outputs {
+                            if o.sig == self.each {
+                                for &s in &passing {
+                                    out.push((s, if o.copy { self.read(e, s, o.nets) } else { o.constant }));
+                                }
+                            } else {
+                                // A single output sums over the passing signals.
+                                let mut v = 0i32;
+                                for &s in &passing {
+                                    v = v.wrapping_add(if o.copy { self.read(e, s, o.nets) } else { o.constant });
+                                }
+                                out.push((o.sig, v));
+                            }
                         }
-                        let x = self.read(e, c.first, c.first_nets);
-                        let y = self.operand(e, c.second, c.second_nets);
-                        group &= c.cmp.apply(x, y);
+                    } else if self.conds_hold(e, &d.conds, None) {
+                        for o in &d.outputs {
+                            if o.sig == self.everything {
+                                for (s, v) in self.signals(e, o.nets) {
+                                    out.push((s, if o.copy { v } else { o.constant }));
+                                }
+                            } else {
+                                out.push((o.sig, if o.copy { self.read(e, o.sig, o.nets) } else { o.constant }));
+                            }
+                        }
                     }
-                    any |= group && !d.conds.is_empty();
-                    if !any {
-                        vec![]
-                    } else {
-                        d.outputs
-                            .iter()
-                            .map(|o| (o.sig, if o.copy { self.read(e, o.sig, o.nets) } else { o.constant }))
-                            .filter(|(_, v)| *v != 0)
-                            .collect()
+                    // Several outputs may write the same signal: sum them.
+                    out.sort_by_key(|(s, _)| *s);
+                    let mut merged: Vec<(Sig, i32)> = Vec::new();
+                    for (s, v) in out {
+                        match merged.last_mut() {
+                            Some((ls, lv)) if *ls == s => *lv = lv.wrapping_add(v),
+                            _ => merged.push((s, v)),
+                        }
+                    }
+                    merged.retain(|(_, v)| *v != 0);
+                    merged
+                }
+                Kind::Selector(sel) => {
+                    let mut ins = self.signals(e, Nets::BOTH);
+                    match sel {
+                        Selector::Select { max, index } => {
+                            // Ties: lower signal index first (the game's order is unspecified).
+                            if *max {
+                                ins.sort_by_key(|(s, v)| (std::cmp::Reverse(*v), *s));
+                            } else {
+                                ins.sort_by_key(|(s, v)| (*v, *s));
+                            }
+                            usize::try_from(*index).ok().and_then(|i| ins.get(i).copied()).into_iter().collect()
+                        }
+                        Selector::Count { out } => {
+                            if ins.is_empty() {
+                                vec![]
+                            } else {
+                                vec![(*out, ins.len() as i32)]
+                            }
+                        }
                     }
                 }
                 _ => continue,
@@ -253,5 +408,135 @@ mod tests {
             seen.push(sim.output_of(d, x));
         }
         assert_eq!(seen, vec![1, 2, 3, 0, 1, 2, 3, 0, 1]);
+    }
+}
+
+/// The wildcard semantics, checked against the in-game probe (harness/ticky-harness/scenarios/probe).
+#[cfg(test)]
+mod wildcard_tests {
+    use super::*;
+    use ticky_factorio::*;
+
+    fn sig(n: &str) -> Sig {
+        let t = SignalTable::base();
+        t.lookup(n).unwrap_or_else(|| t.special(n))
+    }
+
+    /// Runs one combinator fed with `red` and `green`; returns its sorted output by name.
+    fn probe(kind: Kind, red: &[(&str, i32)], green: &[(&str, i32)]) -> Vec<(String, i32)> {
+        let mut n = Netlist::default();
+        let c = n.add(kind, Role::Core);
+        for (vals, conn) in [(red, Conn::InRed), (green, Conn::InGreen)] {
+            if vals.is_empty() {
+                continue;
+            }
+            let k = n.add(
+                Kind::Constant(ConstComb { values: vals.iter().map(|(s, v)| (sig(s), *v)).collect(), on: true }),
+                Role::Core,
+            );
+            n.wire((k, if conn == Conn::InRed { Conn::Red } else { Conn::Green }), (c, conn));
+        }
+        let mut sim = Sim::new(&n);
+        sim.step();
+        sim.step();
+        let t = SignalTable::base();
+        let mut out: Vec<(String, i32)> = sim.outputs_of(c).iter().map(|(s, v)| (t.name(*s).to_string(), *v)).collect();
+        out.sort();
+        out
+    }
+
+    const BUNDLE: &[(&str, i32)] = &[("iron-plate", 5), ("copper-plate", -3), ("signal-check", 7), ("signal-A", 100)];
+    const SCAL: &[(&str, i32)] = &[("signal-A", 2), ("signal-check", 1)];
+
+    fn s(o: &str) -> Operand {
+        Operand::Sig(sig(o))
+    }
+
+    fn ar(first: Operand, fnets: Nets, op: ArOp, second: Operand, snets: Nets, out: &str) -> Kind {
+        Kind::Arith(Arith { first, first_nets: fnets, second, second_nets: snets, op, out: sig(out) })
+    }
+
+    fn cond(first: &str, fnets: Nets, cmp: CmpOp, second: Operand, snets: Nets, and: bool) -> Cond {
+        Cond { first: sig(first), first_nets: fnets, second, second_nets: snets, cmp, and }
+    }
+
+    fn out(o: &str, copy: bool, constant: i32, nets: Nets) -> DOut {
+        DOut { sig: sig(o), copy, constant, nets }
+    }
+
+    fn v(pairs: &[(&str, i32)]) -> Vec<(String, i32)> {
+        let mut x: Vec<(String, i32)> = pairs.iter().map(|(s, v)| (s.to_string(), *v)).collect();
+        x.sort();
+        x
+    }
+
+    #[test]
+    fn matches_the_game() {
+        let (r, g, b) = (Nets::RED, Nets::GREEN, Nets::BOTH);
+        let k = Operand::Const;
+        // P1 each(red) * A(green) -> each
+        assert_eq!(
+            probe(ar(s("signal-each"), r, ArOp::Mul, s("signal-A"), g, "signal-each"), BUNDLE, SCAL),
+            v(&[("copper-plate", -6), ("iron-plate", 10), ("signal-A", 200), ("signal-check", 14)])
+        );
+        // P2 each(red) > 0 and each(red) < 50 and A(green) = 2 -> each copied from red
+        let d = Decider {
+            conds: vec![
+                cond("signal-each", r, CmpOp::Gt, k(0), b, true),
+                cond("signal-each", r, CmpOp::Lt, k(50), b, true),
+                cond("signal-A", g, CmpOp::Eq, k(2), b, true),
+            ],
+            outputs: vec![out("signal-each", true, 1, r)],
+        };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("iron-plate", 5), ("signal-check", 7)]));
+        // P3a count, P3b sum of passing values
+        let d = Decider { conds: vec![cond("signal-each", r, CmpOp::Ne, k(0), b, true)], outputs: vec![out("signal-X", false, 1, b)] };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("signal-X", 4)]));
+        let d = Decider { conds: vec![cond("signal-each", r, CmpOp::Gt, k(0), b, true)], outputs: vec![out("signal-X", true, 1, r)] };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("signal-X", 112)]));
+        // P4 check(green) != 0 -> everything copied from red
+        let d = Decider {
+            conds: vec![cond("signal-check", g, CmpOp::Ne, k(0), b, true)],
+            outputs: vec![out("signal-everything", true, 1, r)],
+        };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(BUNDLE));
+        // P5 each(red) + 0 -> X
+        assert_eq!(probe(ar(s("signal-each"), r, ArOp::Add, k(0), b, "signal-X"), BUNDLE, SCAL), v(&[("signal-X", 109)]));
+        // P6 selector
+        assert_eq!(probe(Kind::Selector(Selector::Select { max: true, index: 0 }), BUNDLE, &[]), v(&[("signal-A", 100)]));
+        assert_eq!(probe(Kind::Selector(Selector::Select { max: false, index: 0 }), BUNDLE, &[]), v(&[("copper-plate", -3)]));
+        assert_eq!(probe(Kind::Selector(Selector::Count { out: sig("signal-X") }), BUNDLE, &[]), v(&[("signal-X", 4)]));
+        // P7 each(red) * each(green)
+        assert_eq!(
+            probe(ar(s("signal-each"), r, ArOp::Mul, s("signal-each"), g, "signal-each"), BUNDLE, &[("iron-plate", 3), ("signal-A", 2)]),
+            v(&[("iron-plate", 15), ("signal-A", 200)])
+        );
+        // P8 each(red) > 0 -> each = 5
+        let d = Decider { conds: vec![cond("signal-each", r, CmpOp::Gt, k(0), b, true)], outputs: vec![out("signal-each", false, 5, b)] };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("iron-plate", 5), ("signal-A", 5), ("signal-check", 5)]));
+        // P9 10 - each(red)
+        assert_eq!(
+            probe(ar(k(10), b, ArOp::Sub, s("signal-each"), r, "signal-each"), BUNDLE, SCAL),
+            v(&[("copper-plate", 13), ("iron-plate", 5), ("signal-A", -90), ("signal-check", 3)])
+        );
+        // P10 each(red) < A(green)
+        let d = Decider {
+            conds: vec![cond("signal-each", r, CmpOp::Lt, s("signal-A"), g, true)],
+            outputs: vec![out("signal-each", true, 1, r)],
+        };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("copper-plate", -3)]));
+        // P12 each(red) + each(green): union
+        assert_eq!(
+            probe(ar(s("signal-each"), r, ArOp::Add, s("signal-each"), g, "signal-each"), BUNDLE, &[("iron-plate", 3), ("signal-B", 2)]),
+            v(&[("copper-plate", -3), ("iron-plate", 8), ("signal-A", 100), ("signal-B", 2), ("signal-check", 7)])
+        );
+        // P13 each(red) / each(green): 0 where the divisor is missing
+        assert_eq!(
+            probe(ar(s("signal-each"), r, ArOp::Div, s("signal-each"), g, "signal-each"), BUNDLE, &[("iron-plate", 2), ("signal-B", 2)]),
+            v(&[("iron-plate", 2)])
+        );
+        // P15 everything(red) > -10 -> X = 1
+        let d = Decider { conds: vec![cond("signal-everything", r, CmpOp::Gt, k(-10), b, true)], outputs: vec![out("signal-X", false, 1, b)] };
+        assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("signal-X", 1)]));
     }
 }

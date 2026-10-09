@@ -92,6 +92,10 @@ pub enum ExprKind {
     List(Vec<Expr>),
     /// `[elt for target in iter if cond…]`
     ListComp { elt: Box<Expr>, target: Box<Expr>, iter: Box<Expr>, conds: Vec<Expr> },
+    /// `{key: value, …}`
+    Dict(Vec<(Expr, Expr)>),
+    /// `{key: value for target in iter if cond…}`
+    DictComp { key: Box<Expr>, value: Box<Expr>, target: Box<Expr>, iter: Box<Expr>, conds: Vec<Expr> },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -106,6 +110,8 @@ pub enum SignalSpec {
     Ident(String),
     /// `@ "iron-plate"` — exact prototype name.
     Exact(String),
+    /// `@ S("nt-fuel", type="recipe")` — any signal expression.
+    Expr(Expr),
 }
 
 #[derive(Clone, Debug)]

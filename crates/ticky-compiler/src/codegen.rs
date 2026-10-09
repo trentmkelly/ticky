@@ -22,8 +22,51 @@ use ticky_syntax::ast::PortDir;
 use ticky_syntax::{Diag, Span};
 
 use crate::fuse::{is_true, LoadVal, WriterPlan};
-use crate::ir::{Dnf, Graph, Lit, Op, V};
-use crate::program::{Next, Program, SrcKind, StepKind, WaitN, MAIN};
+use crate::ir::{BOp, BTerm, Dnf, FOut, Graph, Lit, Op, V};
+use crate::program::{Next, Program, SrcKind, StepKind, Ty, WaitN, MAIN};
+
+/// A bundle value: everything its producers output, on its own wires (never the bus).
+type BRef = usize;
+
+/// Where a value is: a scalar signal on the bus (or a constant), or a bundle.
+#[derive(Copy, Clone, Debug)]
+enum Ref {
+    Op(Operand),
+    Bun(BRef),
+}
+
+impl Ref {
+    fn op(self) -> Operand {
+        match self {
+            Ref::Op(o) => o,
+            Ref::Bun(_) => unreachable!("a bundle where a number is expected"),
+        }
+    }
+
+    fn sig(self) -> Sig {
+        match self.op() {
+            Operand::Sig(s) => s,
+            Operand::Const(_) => unreachable!("a constant where a signal is required"),
+        }
+    }
+
+    fn bun(self) -> BRef {
+        match self {
+            Ref::Bun(b) => b,
+            Ref::Op(_) => unreachable!("a number where a bundle is expected"),
+        }
+    }
+}
+
+/// The wires of one bundle value. Consumers read it on red (or green, for the second
+/// bundle of an element-wise operation); the wire of each colour is made when first needed.
+#[derive(Default)]
+struct BVal {
+    /// Producing entities; `true` for constant combinators (single-sided).
+    prods: Vec<(EntId, bool)>,
+    red: Option<usize>,
+    green: Option<usize>,
+}
 
 pub struct BlockStats {
     pub span: Span,
@@ -68,6 +111,11 @@ pub struct Codegen {
 
 fn c(sig: Sig, cmp: CmpOp, k: i32) -> Cond {
     Cond { first: sig, first_nets: Nets::BOTH, second: Operand::Const(k), second_nets: Nets::BOTH, cmp, and: true }
+}
+
+/// `sig op 0`.
+fn cnd(sig: Sig, op: CmpOp) -> Cond {
+    c(sig, op, 0)
 }
 
 fn or(mut cond: Cond) -> Cond {
@@ -135,9 +183,250 @@ struct Cg {
     st: Sig,
     /// `warm[i]` is 1 from `i + 1` ticks after RP: taps of a shared start-up delay line.
     warm: Vec<Sig>,
+    bvals: Vec<BVal>,
+    each: Sig,
+    everything: Sig,
+}
+
+/// A condition read from the bus only (for combinators whose red input carries a bundle).
+fn green(mut c: Cond) -> Cond {
+    c.first_nets = Nets::GREEN;
+    if let Operand::Sig(_) = c.second {
+        c.second_nets = Nets::GREEN;
+    }
+    c
 }
 
 impl Cg {
+    fn bnew(&mut self) -> BRef {
+        self.bvals.push(BVal::default());
+        self.bvals.len() - 1
+    }
+
+    fn bprod(&mut self, r: BRef, e: EntId) {
+        let konst = matches!(self.net.entities[e].kind, Kind::Constant(_));
+        self.bvals[r].prods.push((e, konst));
+    }
+
+    /// Connects `e`'s red (or green) input to bundle `r`.
+    fn bread(&mut self, r: BRef, e: EntId, on_green: bool) {
+        let slot = if on_green { self.bvals[r].green } else { self.bvals[r].red };
+        let ni = match slot {
+            Some(n) => n,
+            None => {
+                self.nets.push(NetSpec { red: !on_green, members: Vec::new() });
+                let n = self.nets.len() - 1;
+                if on_green {
+                    self.bvals[r].green = Some(n);
+                } else {
+                    self.bvals[r].red = Some(n);
+                }
+                n
+            }
+        };
+        self.nets[ni].members.push((e, if on_green { Conn::InGreen } else { Conn::InRed }));
+    }
+
+    /// Wires every bundle's producers to the bundle's wires.
+    fn bfinish(&mut self) {
+        for b in std::mem::take(&mut self.bvals) {
+            for (net, red) in [(b.red, true), (b.green, false)] {
+                let Some(ni) = net else { continue };
+                for &(e, konst) in &b.prods {
+                    let conn = match (konst, red) {
+                        (true, true) => Conn::Red,
+                        (true, false) => Conn::Green,
+                        (false, true) => Conn::OutRed,
+                        (false, false) => Conn::OutGreen,
+                    };
+                    self.nets[ni].members.push((e, conn));
+                }
+            }
+        }
+    }
+
+    /// A combinator that isn't on the bus at all.
+    fn loose(&mut self, kind: Kind, desc: impl Into<String>) -> EntId {
+        let id = self.net.add(kind, Role::Core);
+        self.net.entities[id].description = Some(desc.into());
+        id
+    }
+
+    fn on_bus_in(&mut self, e: EntId) {
+        self.nets[0].members.push((e, Conn::InGreen));
+    }
+
+    /// Combinators for a bundle-valued node, producing bundle `out`. `r` locates operands.
+    fn emit_bundle(&mut self, g: &Graph, v: V, out: BRef, r: &dyn Fn(V) -> Ref, what: &str) {
+        let each = self.each;
+        // A scalar operand of a combinator that reads a bundle on red: from the bus (green).
+        let scal = |u: V| -> (Operand, Nets) {
+            match r(u).op() {
+                Operand::Const(k) => (Operand::Const(k), Nets::BOTH),
+                o => (o, Nets::GREEN),
+            }
+        };
+        match g.op(v).clone() {
+            Op::BConst(vals) => {
+                if !vals.is_empty() {
+                    let k = self.loose(Kind::Constant(ConstComb { values: vals, on: true }), format!("{what}: bundle constant"));
+                    self.bprod(out, k);
+                }
+            }
+            Op::Bun(terms) => {
+                for t in terms {
+                    let (kind, reads, bus, label): (Kind, Vec<(V, bool)>, bool, &str) = match t {
+                        BTerm::Map(op, b, k) => {
+                            let (o, n) = scal(k);
+                            let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: o, second_nets: n, op, out: each };
+                            (Kind::Arith(a), vec![(b, false)], matches!(o, Operand::Sig(_)), "each with a number")
+                        }
+                        BTerm::RMap(op, k, b) => {
+                            let (o, n) = scal(k);
+                            let a = Arith { first: o, first_nets: n, second: Operand::Sig(each), second_nets: Nets::RED, op, out: each };
+                            (Kind::Arith(a), vec![(b, false)], matches!(o, Operand::Sig(_)), "number with each")
+                        }
+                        BTerm::Zip(op, a, b) => {
+                            let ar = Arith {
+                                first: Operand::Sig(each),
+                                first_nets: Nets::RED,
+                                second: Operand::Sig(each),
+                                second_nets: Nets::GREEN,
+                                op,
+                                out: each,
+                            };
+                            (Kind::Arith(ar), vec![(a, false), (b, true)], false, "signal by signal")
+                        }
+                        BTerm::Pick(b, sig, m) => {
+                            let a = arith(Operand::Sig(sig), ArOp::Mul, Operand::Const(m), sig);
+                            (a, vec![(b, false)], false, "one signal")
+                        }
+                        BTerm::One(sig, x) => {
+                            let a = arith(r(x).op(), ArOp::Add, Operand::Const(0), sig);
+                            (a, vec![], true, "one signal")
+                        }
+                        BTerm::Filter(b, d, fout) => {
+                            let mut conds = Vec::new();
+                            for (i, term) in d.iter().enumerate() {
+                                let mut lits: Vec<Cond> = Vec::new();
+                                for l in term {
+                                    let (first, first_nets) = match l.a {
+                                        BOp::Each => (each, Nets::RED),
+                                        BOp::Val(x) => (r(x).sig(), Nets::GREEN),
+                                    };
+                                    let (second, second_nets) = match l.b {
+                                        BOp::Each => (Operand::Sig(each), Nets::RED),
+                                        BOp::Val(x) => scal(x),
+                                    };
+                                    lits.push(Cond { first, first_nets, second, second_nets, cmp: l.op, and: true });
+                                }
+                                // Outputting `each` needs `each` in every term's conditions.
+                                if !term.iter().any(|l| l.a == BOp::Each || l.b == BOp::Each) {
+                                    lits.push(Cond { first: each, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: true });
+                                }
+                                lits[0].and = i == 0;
+                                conds.extend(lits);
+                            }
+                            let o = match fout {
+                                FOut::Copy => DOut { sig: each, copy: true, constant: 1, nets: Nets::RED },
+                                FOut::Const(k) => out_const(each, k),
+                            };
+                            let bus = conds.iter().any(|c| c.first_nets == Nets::GREEN || c.second_nets == Nets::GREEN);
+                            (dec(conds, vec![o]), vec![(b, false)], bus, "filter")
+                        }
+                        BTerm::DFilter(dom, b, d, fout) => {
+                            // `each` iterates over the domain (green) and `b` (red): signals
+                            // missing from `b` are tested as 0.
+                            let mut conds = Vec::new();
+                            for (i, term) in d.iter().enumerate() {
+                                let mut lits = vec![Cond {
+                                    first: each,
+                                    first_nets: Nets::GREEN,
+                                    second: Operand::Const(0),
+                                    second_nets: Nets::BOTH,
+                                    cmp: CmpOp::Ne,
+                                    and: i == 0,
+                                }];
+                                for l in term {
+                                    let second = match l.b {
+                                        BOp::Val(x) => r(x).op(),
+                                        BOp::Each => unreachable!("each on both sides"),
+                                    };
+                                    assert!(matches!(second, Operand::Const(_)), "domain filters compare with constants");
+                                    lits.push(Cond { first: each, first_nets: Nets::RED, second, second_nets: Nets::BOTH, cmp: l.op, and: true });
+                                }
+                                conds.extend(lits);
+                            }
+                            let o = match fout {
+                                FOut::Copy => DOut { sig: each, copy: true, constant: 1, nets: Nets::GREEN },
+                                FOut::Const(k) => out_const(each, k),
+                            };
+                            (dec(conds, vec![o]), vec![(b, false), (dom, true)], false, "filter")
+                        }
+                        BTerm::K(vals) => {
+                            let k = self.loose(Kind::Constant(ConstComb { values: vals, on: true }), format!("{what}: bundle constant"));
+                            self.bprod(out, k);
+                            continue;
+                        }
+                    };
+                    let id = self.loose(kind, format!("{what}: {label}"));
+                    for (b, on_green) in reads {
+                        let rb = r(b).bun();
+                        self.bread(rb, id, on_green);
+                    }
+                    if bus {
+                        self.on_bus_in(id);
+                    }
+                    self.bprod(out, id);
+                }
+            }
+            Op::BMux { t, f, a, b } => {
+                for (c, x) in [(t, a), (f, b)] {
+                    let cond = green(Cond { second: Operand::Const(0), ..cnd(r(c).sig(), CmpOp::Ne) });
+                    let id = match g.as_bconst(x) {
+                        Some(vals) if vals.is_empty() => continue,
+                        Some(vals) => {
+                            let outs = vals.iter().map(|(s, k)| out_const(*s, *k)).collect();
+                            self.loose(dec(vec![cond], outs), format!("{what}: select"))
+                        }
+                        None => {
+                            let o = DOut { sig: self.everything, copy: true, constant: 1, nets: Nets::RED };
+                            let id = self.loose(dec(vec![cond], vec![o]), format!("{what}: select"));
+                            let rb = r(x).bun();
+                            self.bread(rb, id, false);
+                            id
+                        }
+                    };
+                    self.on_bus_in(id);
+                    self.bprod(out, id);
+                }
+            }
+            Op::BSelect(b, max) => {
+                let id = self.loose(Kind::Selector(Selector::Select { max, index: 0 }), format!("{what}: {}", if max { "largest" } else { "smallest" }));
+                let rb = r(b).bun();
+                self.bread(rb, id, false);
+                self.bprod(out, id);
+            }
+            _ => unreachable!("not a bundle node"),
+        }
+    }
+
+    /// Combinators for a scalar read from a bundle (`b[s]`, totals, counts), onto the bus.
+    fn emit_from_bundle(&mut self, g: &Graph, v: V, out: Sig, r: &dyn Fn(V) -> Ref, what: &str) {
+        let each = self.each;
+        let (kind, b, label) = match *g.op(v) {
+            Op::BGet(b, s) => (arith(Operand::Sig(s), ArOp::Add, Operand::Const(0), out), b, "read one signal"),
+            Op::BTotal(b) => (arith(Operand::Sig(each), ArOp::Add, Operand::Const(0), out), b, "total"),
+            Op::BCount(b) => (dec_const(vec![cnd(each, CmpOp::Ne)], out, 1), b, "count"),
+            _ => unreachable!("not a bundle read"),
+        };
+        // Only the bundle is wired to the input, so reading both colours is fine.
+        let id = self.loose(kind, format!("{what}: {label}"));
+        let rb = r(b).bun();
+        self.bread(rb, id, false);
+        self.nets[0].members.push((id, Conn::OutGreen));
+    }
+
     fn alloc(&mut self) -> Result<Sig, Diag> {
         self.used += 1;
         self.pool.pop_front().ok_or_else(|| {
@@ -164,16 +453,19 @@ impl Cg {
         self.nets.push(NetSpec { red: true, members: vec![(d, Conn::InRed), (d, Conn::OutRed), (k, Conn::Red)] });
     }
 
-    /// Emits combinators for every non-trivial node reachable from `roots`. `src` gives the
-    /// signal of each source.
-    fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Sig, what: &str) -> Result<HashMap<V, Sig>, Diag> {
+    /// Emits combinators for every non-trivial node reachable from `roots`. `src` locates
+    /// each source. Returns where each emitted node's value is.
+    fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Ref, what: &str) -> Result<HashMap<V, Ref>, Diag> {
         let live: Vec<V> = g.reachable(roots);
-        let producers: Vec<V> =
-            live.iter().copied().filter(|v| matches!(g.op(*v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_))).collect();
+        let is_scalar_op = |v: V| matches!(g.op(v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_));
+        let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_));
+        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..));
+        let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
 
         // Split the logic into clusters of consecutive combinators. A value whose consumers
         // are all in its own cluster lives on that cluster's private red wire, where signal
-        // names can be reused; everything else goes on the shared green bus.
+        // names can be reused; everything else goes on the shared green bus. Values that
+        // bundle combinators read must be on the bus (their red input carries the bundle).
         let cluster: HashMap<V, usize> = producers.iter().enumerate().map(|(i, v)| (*v, i / CLUSTER)).collect();
         let is_root: std::collections::HashSet<V> = roots.iter().copied().collect();
         let mut consumers: HashMap<V, Vec<V>> = HashMap::new();
@@ -183,25 +475,49 @@ impl Cg {
             }
         }
         let local = |v: V| -> bool {
-            cluster.contains_key(&v)
+            is_scalar_op(v)
                 && !is_root.contains(&v)
-                && consumers.get(&v).is_some_and(|cs| cs.iter().all(|c| cluster[c] == cluster[&v]))
+                && consumers.get(&v).is_some_and(|cs| cs.iter().all(|c| is_scalar_op(*c) && cluster[c] == cluster[&v]))
         };
-        let mut node_sig: HashMap<V, Sig> = HashMap::new();
+        let mut node_ref: HashMap<V, Ref> = HashMap::new();
+        let mut local_sig: HashMap<V, Sig> = HashMap::new();
         let mut local_pools: HashMap<usize, VecDeque<Sig>> = HashMap::new();
         for &v in &producers {
-            let s = if local(v) {
+            if is_bun_op(v) {
+                node_ref.insert(v, Ref::Bun(self.bnew()));
+            } else if local(v) {
                 let pool = local_pools.entry(cluster[&v]).or_insert_with(|| SignalTable::base().internal_pool().into());
-                pool.pop_front().ok_or_else(|| Diag::error(Span::default(), "program too large: a logic cluster ran out of signals"))?
+                let s = pool.pop_front().ok_or_else(|| Diag::error(Span::default(), "program too large: a logic cluster ran out of signals"))?;
+                local_sig.insert(v, s);
             } else {
-                self.alloc()?
-            };
-            node_sig.insert(v, s);
+                node_ref.insert(v, Ref::Op(Operand::Sig(self.alloc()?)));
+            }
         }
+        // Where a value is, for combinators that read bundles (never cluster-local values).
+        let locate = |u: V| -> Ref {
+            match *g.op(u) {
+                Op::Const(k) => Ref::Op(Operand::Const(k)),
+                Op::Src(s) => src(s),
+                _ => node_ref[&u],
+            }
+        };
         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
 
         for v in producers {
-            let out = node_sig[&v];
+            if is_bun_op(v) {
+                let out = node_ref[&v].bun();
+                self.emit_bundle(g, v, out, &locate, what);
+                continue;
+            }
+            if is_read(v) {
+                let out = node_ref[&v].sig();
+                self.emit_from_bundle(g, v, out, &locate, what);
+                continue;
+            }
+            let out = match local_sig.get(&v) {
+                Some(s) => *s,
+                None => node_ref[&v].sig(),
+            };
             let ops = g.operands(v);
             let reads_local = ops.iter().any(|o| local(*o));
             let out_local = local(v);
@@ -209,9 +525,9 @@ impl Cg {
             let pick = |u: V| -> (Operand, Nets) {
                 match *g.op(u) {
                     Op::Const(k) => (Operand::Const(k), Nets::BOTH),
-                    Op::Src(s) => (Operand::Sig(src(s)), if reads_local { Nets::GREEN } else { Nets::BOTH }),
-                    _ if local(u) => (Operand::Sig(node_sig[&u]), Nets::RED),
-                    _ => (Operand::Sig(node_sig[&u]), if reads_local { Nets::GREEN } else { Nets::BOTH }),
+                    Op::Src(s) => (src(s).op(), if reads_local { Nets::GREEN } else { Nets::BOTH }),
+                    _ if local(u) => (Operand::Sig(local_sig[&u]), Nets::RED),
+                    _ => (node_ref[&u].op(), if reads_local { Nets::GREEN } else { Nets::BOTH }),
                 }
             };
             let sig = |u: V| match pick(u) {
@@ -254,7 +570,7 @@ impl Cg {
                         kinds.push((dec_const(distribute(&[], &terms), out, *k), "condition"));
                     }
                 }
-                Op::Const(_) | Op::Src(_) => {}
+                _ => unreachable!("not a scalar operation"),
             }
             for (kind, label) in kinds {
                 let id = self.net.add(kind, Role::Core);
@@ -278,8 +594,7 @@ impl Cg {
                 }
             }
         }
-        node_sig.retain(|v, _| !local(*v));
-        Ok(node_sig)
+        Ok(node_ref)
     }
 
     /// A register on signal `x`, updated by `writers`. Each writer has a commit pulse `en`
@@ -302,7 +617,7 @@ impl Cg {
                             self.core(dec_const(vec![c(w.en, CmpOp::Ne, 0)], x, k), format!("{name} (load)"));
                         }
                         LoadVal::Node(v) => {
-                            let s = (w.sig)(v);
+                            let s = (w.val)(v).sig();
                             self.core(arith(Operand::Sig(s), ArOp::Mul, Operand::Sig(w.en), x), format!("{name} (load)"));
                         }
                     }
@@ -329,7 +644,7 @@ impl Cg {
                         self.core(dec_const(vec![c(eg, CmpOp::Ne, 0)], x, k), format!("{name} (conditional load)"));
                     }
                     LoadVal::Node(v) => {
-                        let s = (w.sig)(v);
+                        let s = (w.val)(v).sig();
                         self.core(arith(Operand::Sig(s), ArOp::Mul, Operand::Sig(eg), x), format!("{name} (conditional load)"));
                     }
                 }
@@ -364,6 +679,91 @@ impl Cg {
         Ok(smp)
     }
 
+    /// A bundle register: like [`Cg::register`], but the value is a whole bundle on its own
+    /// wire. The hold decider copies everything from that wire while no load fires; loads
+    /// multiply the new bundle by their enable pulse.
+    fn bregister(&mut self, x: BRef, init: &[(Sig, i32)], writers: &[Writer], name: &str) -> Result<(), Diag> {
+        let mut hold: CDnf = vec![vec![c(self.st, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)]];
+        let each = self.each;
+        for w in writers {
+            let unconditional = w.plan.loads.len() == 1 && is_true(&w.plan.loads[0].guard);
+            let mut factor: CDnf = vec![vec![]];
+            for l in &w.plan.loads {
+                let LoadVal::Node(v) = l.val else { unreachable!("bundle loads are nodes") };
+                let en = if unconditional {
+                    factor = vec![vec![c(w.en, CmpOp::Eq, 0)]];
+                    w.en
+                } else {
+                    let eg = self.alloc()?;
+                    let early = lits(&l.guard, w.lit_eg);
+                    self.core(dec_const(distribute(&w.prefix, &early), eg, 1), format!("{name} (load condition)"));
+                    factor = cand(&factor, &vec![vec![c(eg, CmpOp::Eq, 0)]]);
+                    eg
+                };
+                let load = Kind::Arith(Arith {
+                    first: Operand::Sig(each),
+                    first_nets: Nets::RED,
+                    second: Operand::Sig(en),
+                    second_nets: Nets::GREEN,
+                    op: ArOp::Mul,
+                    out: each,
+                });
+                let id = self.loose(load, format!("{name} (load)"));
+                let src = (w.val)(v).bun();
+                self.bread(src, id, false);
+                self.on_bus_in(id);
+                self.bprod(x, id);
+            }
+            hold = cand(&hold, &factor);
+        }
+        let conds: Vec<Cond> = distribute(&[], &hold).into_iter().map(green).collect();
+        let keep = DOut { sig: self.everything, copy: true, constant: 1, nets: Nets::RED };
+        let id = self.loose(dec(conds, vec![keep]), format!("{name} (hold)"));
+        self.bread(x, id, false);
+        self.on_bus_in(id);
+        self.bprod(x, id);
+        if !init.is_empty() {
+            let outs = init.iter().map(|(s, k)| out_const(*s, *k)).collect();
+            let id = self.loose(dec(vec![green(c(self.st, CmpOp::Ne, 0))], outs), format!("{name} (initial value)"));
+            self.on_bus_in(id);
+            self.bprod(x, id);
+        }
+        Ok(())
+    }
+
+    /// A bundle sample register: copies bundle `raw` whenever `en` fires.
+    fn bsample(&mut self, raw: BRef, en: Sig, what: &str) -> BRef {
+        let x = self.bnew();
+        let each = self.each;
+        let keep = DOut { sig: self.everything, copy: true, constant: 1, nets: Nets::RED };
+        let hold = self.loose(dec(vec![green(c(en, CmpOp::Eq, 0)), green(c(self.run, CmpOp::Ne, 0))], vec![keep]), format!("sample of {what} (hold)"));
+        self.bread(x, hold, false);
+        self.on_bus_in(hold);
+        self.bprod(x, hold);
+        let load = Kind::Arith(Arith {
+            first: Operand::Sig(each),
+            first_nets: Nets::RED,
+            second: Operand::Sig(en),
+            second_nets: Nets::GREEN,
+            op: ArOp::Mul,
+            out: each,
+        });
+        let id = self.loose(load, format!("sample of {what} (load)"));
+        self.bread(raw, id, false);
+        self.on_bus_in(id);
+        self.bprod(x, id);
+        x
+    }
+
+    /// Samples a source: scalar or bundle.
+    fn sample_ref(&mut self, raw: Ref, en: Sig, what: &str) -> Result<Ref, Diag> {
+        Ok(match raw {
+            Ref::Op(Operand::Sig(s)) => Ref::Op(Operand::Sig(self.sample(s, en, what)?)),
+            Ref::Bun(b) => Ref::Bun(self.bsample(b, en, what)),
+            Ref::Op(Operand::Const(_)) => unreachable!("sampling a constant"),
+        })
+    }
+
     /// A signal that turns on `n` ticks (n ≥ 1) after RP does, and off with it.
     fn warm(&mut self, n: usize) -> Result<Sig, Diag> {
         while self.warm.len() < n {
@@ -385,43 +785,52 @@ struct Writer<'a> {
     en: Sig,
     prefix: Vec<Cond>,
     plan: &'a WriterPlan,
-    sig: &'a dyn Fn(V) -> Sig,
+    /// Where a load's value is.
+    val: &'a dyn Fn(V) -> Ref,
     /// Conditions read on the commit tick.
     lit: &'a dyn Fn(&Lit) -> Cond,
     /// Conditions read one tick earlier, by enable deciders.
     lit_eg: &'a dyn Fn(&Lit) -> Cond,
 }
 
-fn lit_cond(g: &Graph, l: &Lit, src: &dyn Fn(u32) -> Sig, node_sig: &HashMap<V, Sig>) -> Cond {
-    let Operand::Sig(a) = operand(g, l.a, src, node_sig) else { unreachable!("literal with a constant first operand") };
-    Cond { second: operand(g, l.b, src, node_sig), ..c(a, l.op, 0) }
+fn lit_cond(l: &Lit, loc: &dyn Fn(V) -> Ref) -> Cond {
+    Cond { second: loc(l.b).op(), ..c(loc(l.a).sig(), l.op, 0) }
 }
 
 fn lits(d: &Dnf, f: &dyn Fn(&Lit) -> Cond) -> CDnf {
     d.iter().map(|t| t.iter().map(f).collect()).collect()
 }
 
-fn operand(g: &Graph, v: V, src: &dyn Fn(u32) -> Sig, node_sig: &HashMap<V, Sig>) -> Operand {
+/// Where any node is, given the sources and the emitted nodes.
+fn locate(g: &Graph, v: V, src: &dyn Fn(u32) -> Ref, nodes: &HashMap<V, Ref>) -> Ref {
     match *g.op(v) {
-        Op::Const(k) => Operand::Const(k),
-        Op::Src(s) => Operand::Sig(src(s)),
-        _ => Operand::Sig(node_sig[&v]),
+        Op::Const(k) => Ref::Op(Operand::Const(k)),
+        Op::Src(s) => src(s),
+        _ => nodes[&v],
     }
 }
 
 /// Signals that every process can read: state registers, raw input ports and `ticks()`.
 struct Shared {
     state_sig: HashMap<usize, Sig>,
-    input_raw: HashMap<usize, Sig>,
+    state_bun: HashMap<usize, BRef>,
+    input_raw: HashMap<usize, Ref>,
     ticks: Option<Sig>,
 }
 
 impl Shared {
-    fn raw(&self, p: &Program, k: SrcKind) -> (Sig, String) {
+    fn state(&self, s: usize) -> Ref {
+        match self.state_bun.get(&s) {
+            Some(b) => Ref::Bun(*b),
+            None => Ref::Op(Operand::Sig(self.state_sig[&s])),
+        }
+    }
+
+    fn raw(&self, p: &Program, k: SrcKind) -> (Ref, String) {
         match k {
             SrcKind::Input(pi) | SrcKind::LiveInput(pi) => (self.input_raw[&pi], format!("input `{}`", p.ports[pi].name)),
-            SrcKind::Foreign(s) | SrcKind::LiveForeign(s) | SrcKind::Own(s) => (self.state_sig[&s], p.states[s].display_name()),
-            SrcKind::Ticks | SrcKind::LiveTicks => (self.ticks.unwrap(), "ticks()".into()),
+            SrcKind::Foreign(s) | SrcKind::LiveForeign(s) | SrcKind::Own(s) => (self.state(s), p.states[s].display_name()),
+            SrcKind::Ticks | SrcKind::LiveTicks => (Ref::Op(Operand::Sig(self.ticks.unwrap())), "ticks()".into()),
         }
     }
 }
@@ -445,16 +854,53 @@ fn live_states(p: &Program) -> Vec<bool> {
     live
 }
 
+/// Output states of `every tick` blocks that are simply recomputed every tick (one
+/// unconditional assignment) and read by no process. They need no register: the output port
+/// reads the pipeline directly.
+fn combinational(p: &Program, live: &[bool]) -> std::collections::HashSet<usize> {
+    let mut read = vec![false; p.states.len()];
+    let mut mark = |srcs: &[SrcKind]| {
+        for k in srcs {
+            if let SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) = *k {
+                read[s] = true;
+            }
+        }
+    };
+    for b in &p.blocks {
+        mark(&b.srcs);
+    }
+    if let Some(m) = &p.main {
+        mark(&m.srcs);
+    }
+    let mut out = std::collections::HashSet::new();
+    for b in &p.blocks {
+        if b.pipe.is_none() {
+            continue;
+        }
+        for (si, plan) in &b.plans {
+            // One unconditional load, or constants under conditions (which, for a state nobody
+            // reads, always cover every case: keeping the old value would read it).
+            let simple = plan.loads.len() == 1 && is_true(&plan.loads[0].guard) && plan.keep.is_none();
+            let consts = plan.loads.iter().all(|l| matches!(l.val, LoadVal::Const(_)));
+            if live[*si] && (simple || consts) && p.states[*si].port.is_some() && !read[*si] {
+                out.insert(*si);
+            }
+        }
+    }
+    out
+}
+
 pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
     let t = SignalTable::base();
     let live = live_states(p);
+    let comb = combinational(p, &live);
     let run = t.lookup("signal-check").unwrap();
     let mut pool: VecDeque<Sig> = t.internal_pool().into_iter().filter(|s| *s != run).collect();
     let mut first = || pool.pop_front().unwrap();
     // State signals first, so they get the most readable names (letters).
     let mut state_sig: HashMap<usize, Sig> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {
-        if s.owner.is_some() && live[si] {
+        if s.owner.is_some() && live[si] && s.ty != Ty::Bundle && !comb.contains(&si) {
             state_sig.insert(si, first());
         }
     }
@@ -468,7 +914,16 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
         rp,
         st,
         warm: Vec::new(),
+        bvals: Vec::new(),
+        each: t.special("signal-each"),
+        everything: t.special("signal-everything"),
     };
+    let mut state_bun: HashMap<usize, BRef> = HashMap::new();
+    for (si, s) in p.states.iter().enumerate() {
+        if s.owner.is_some() && live[si] && s.ty == Ty::Bundle && !comb.contains(&si) {
+            state_bun.insert(si, cg.bnew());
+        }
+    }
 
     // RUN switch: RUN=1 plus each block clock's +1.
     let mut clocks: Vec<Option<Sig>> = Vec::new();
@@ -499,44 +954,54 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
 
     // Input ports.
     let mut port_ents = vec![usize::MAX; p.ports.len()];
-    let mut input_raw: HashMap<usize, Sig> = HashMap::new();
+    let mut input_raw: HashMap<usize, Ref> = HashMap::new();
     for (pi, port) in p.ports.iter().enumerate() {
         if port.dir != PortDir::Input {
             continue;
         }
-        let raw = cg.alloc()?;
+        let bundle = port.ty == Ty::Bundle;
+        let (kind, raw) = if bundle {
+            // Copies everything on the player's wires onto the program's own bundle wire.
+            (arith(Operand::Sig(cg.each), ArOp::Add, Operand::Const(0), cg.each), Ref::Bun(cg.bnew()))
+        } else {
+            let raw = cg.alloc()?;
+            (arith(Operand::Sig(port.sig), ArOp::Add, Operand::Const(0), raw), Ref::Op(Operand::Sig(raw)))
+        };
         input_raw.insert(pi, raw);
-        let id = cg.net.add(
-            arith(Operand::Sig(port.sig), ArOp::Add, Operand::Const(0), raw),
-            Role::InputPort { name: port.name.clone(), signal: port.sig },
-        );
+        let id = cg.net.add(kind, Role::InputPort { name: port.name.clone(), signal: port.sig });
+        let reads = if bundle { "every signal".to_string() } else { t.name(port.sig).to_string() };
         let e = &mut cg.net.entities[id];
         e.dir = Dir::East;
         e.description = Some(format!(
-            "Ticky input `{}` ({}){}: reads {} from wires connected to this combinator's input (left) side.",
+            "Ticky input `{}` ({}){}: reads {reads} from wires connected to this combinator's input (left) side.",
             port.name,
             port.ty.name(),
             port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default(),
-            t.name(port.sig)
         ));
-        cg.nets[0].members.push((id, Conn::OutGreen));
+        match raw {
+            Ref::Bun(b) => cg.bprod(b, id),
+            _ => cg.nets[0].members.push((id, Conn::OutGreen)),
+        }
         port_ents[pi] = id;
     }
-    let shared = Shared { state_sig, input_raw, ticks };
+    let shared = Shared { state_sig, state_bun, input_raw, ticks };
+    // Where combinational outputs are read from.
+    let mut comb_ref: HashMap<usize, Ref> = HashMap::new();
 
     let mut blocks = Vec::new();
     for (bi, b) in p.blocks.iter().enumerate() {
         let first_ent = cg.net.entities.len();
         if let Some(pipe) = &b.pipe {
-            pipelined_block(&mut cg, p, bi, b, pipe, &shared, &live)?;
+            let (direct, extra) = pipelined_block(&mut cg, p, bi, b, pipe, &shared, &live, &comb)?;
+            comb_ref.extend(direct);
             blocks.push(BlockStats {
                 span: b.span,
                 requested: b.requested,
                 period: 1,
                 depth: b.depth,
                 combinators: cg.combinators_since(first_ent),
-                // Input port, then the pipeline, the register and the output port.
-                latency: Some(pipe.latency + 3),
+                // Input port, the pipeline, a register (or the alignment delay) and the output port.
+                latency: Some(pipe.latency + 2 + extra),
             });
             continue;
         }
@@ -571,20 +1036,17 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
         cg.core(dec_const(es_conds, es, 1), format!("{what}: commit pulse"));
 
         // Sources: own state is read directly; everything else is sampled at EI.
-        let mut src_sig: Vec<Sig> = Vec::new();
+        let mut src_ref: Vec<Ref> = Vec::new();
         for &kind in &b.srcs {
             let (raw, name) = shared.raw(p, kind);
-            src_sig.push(if let SrcKind::Own(_) = kind { raw } else { cg.sample(raw, ei, &format!("{what}: {name}"))? });
+            src_ref.push(if let SrcKind::Own(_) = kind { raw } else { cg.sample_ref(raw, ei, &format!("{what}: {name}"))? });
         }
         let plans: Vec<&(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).collect();
         let roots: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
-        let src = |s: u32| src_sig[s as usize];
-        let node_sig = cg.logic(&b.graph, &roots, &src, &what)?;
-        let sig = |v: V| match operand(&b.graph, v, &src, &node_sig) {
-            Operand::Sig(s) => s,
-            Operand::Const(_) => unreachable!(),
-        };
-        let lit = |l: &Lit| lit_cond(&b.graph, l, &src, &node_sig);
+        let src = |s: u32| src_ref[s as usize];
+        let nodes = cg.logic(&b.graph, &roots, &src, &what)?;
+        let loc = |v: V| locate(&b.graph, v, &src, &nodes);
+        let lit = |l: &Lit| lit_cond(l, &loc);
         for (si, s) in p.states.iter().enumerate() {
             if s.owner != Some(bi) || !live[si] {
                 continue;
@@ -592,9 +1054,13 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
             let ws: Vec<Writer> = plans
                 .iter()
                 .filter(|(w, _)| *w == si)
-                .map(|(_, plan)| Writer { en: es, prefix: es_prefix.clone(), plan, sig: &sig, lit: &lit, lit_eg: &lit })
+                .map(|(_, plan)| Writer { en: es, prefix: es_prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit })
                 .collect();
-            cg.register(shared.state_sig[&si], s.init, &ws, &format!("state {}", s.display_name()))?;
+            let name = format!("state {}", s.display_name());
+            match shared.state(si) {
+                Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,
+                r => cg.register(r.sig(), s.init, &ws, &name)?,
+            }
         }
         blocks.push(BlockStats {
             span: b.span,
@@ -618,28 +1084,52 @@ pub fn codegen(p: &Program, autostart: bool) -> Result<Codegen, Diag> {
         }
         let si = p.output_state(pi).unwrap();
         let s = &p.states[si];
-        let kind = match shared.state_sig.get(&si) {
-            Some(&x) => arith(Operand::Sig(x), ArOp::Mul, Operand::Sig(run), port.sig),
-            None => arith(Operand::Sig(run), ArOp::Mul, Operand::Const(s.init), port.sig),
+        let each = cg.each;
+        // Bundles: everything on the state's wire while running. Constant bundles: a
+        // decider outputting the constants while running.
+        let direct = comb_ref.get(&si).copied();
+        let (kind, reads) = match (s.ty == Ty::Bundle, direct.or(shared.state_sig.get(&si).map(|x| Ref::Op(Operand::Sig(*x)))), shared.state_bun.get(&si)) {
+            (true, Some(Ref::Bun(x)), _) => {
+                let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Sig(run), second_nets: Nets::GREEN, op: ArOp::Mul, out: each };
+                (Kind::Arith(a), Some(x))
+            }
+            (false, Some(Ref::Op(Operand::Const(k))), _) => (arith(Operand::Sig(run), ArOp::Mul, Operand::Const(k), port.sig), None),
+            (true, _, Some(&x)) => {
+                let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Sig(run), second_nets: Nets::GREEN, op: ArOp::Mul, out: each };
+                (Kind::Arith(a), Some(x))
+            }
+            (true, _, None) => {
+                let outs = s.binit.iter().map(|(sg, k)| out_const(*sg, *k)).collect();
+                (dec(vec![green(c(run, CmpOp::Ne, 0))], outs), None)
+            }
+            (false, Some(Ref::Op(Operand::Sig(x))), _) => (arith(Operand::Sig(x), ArOp::Mul, Operand::Sig(run), port.sig), None),
+            (_, Some(_), _) => unreachable!("output of the wrong kind"),
+            (false, None, _) => (arith(Operand::Sig(run), ArOp::Mul, Operand::Const(s.init), port.sig), None),
         };
         let id = cg.net.add(kind, Role::OutputPort { name: port.name.clone(), signal: port.sig });
+        let sends = if s.ty == Ty::Bundle { "its bundle".to_string() } else { t.name(port.sig).to_string() };
         let e = &mut cg.net.entities[id];
         e.dir = Dir::East;
         e.description = Some(format!(
-            "Ticky output `{}` ({}){}: sends {} on wires connected to this combinator's output (right) side.",
+            "Ticky output `{}` ({}){}: sends {sends} on wires connected to this combinator's output (right) side.",
             port.name,
             port.ty.name(),
             port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default(),
-            t.name(port.sig)
         ));
         cg.nets[0].members.push((id, Conn::InGreen));
+        if let Some(x) = reads {
+            cg.bread(x, id, false);
+        }
         port_ents[pi] = id;
     }
+    cg.bfinish();
 
     Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, main, signals_used: cg.used })
 }
 
 /// A block that runs every tick: logic is a balanced pipeline reading inputs directly.
+/// Returns where each combinational output (`comb`) of the block can be read.
+#[allow(clippy::too_many_arguments)]
 fn pipelined_block(
     cg: &mut Cg,
     p: &Program,
@@ -648,14 +1138,21 @@ fn pipelined_block(
     pipe: &crate::pipeline::Pipe,
     shared: &Shared,
     live: &[bool],
-) -> Result<(), Diag> {
+    comb: &std::collections::HashSet<usize>,
+) -> Result<(HashMap<usize, Ref>, u32), Diag> {
     let what = format!("block {}", bi + 1);
     let g = &b.graph;
     let tau = |v: V| pipe.tau[v as usize];
+    let owned: Vec<usize> = (0..p.states.len()).filter(|&si| p.states[si].owner == Some(bi) && live[si]).collect();
+    let registers = owned.iter().any(|si| !comb.contains(si));
     // Commit only once the pipeline holds values computed from inputs read after the start.
-    let en = cg.warm(pipe.latency as usize + 1)?;
-    let en_prefix = if pipe.latency == 0 { cg.rp } else { cg.warm(pipe.latency as usize)? };
-    let src_sig: Vec<Sig> = b.srcs.iter().map(|k| shared.raw(p, *k).0).collect();
+    let (en, en_prefix) = if registers {
+        let en = cg.warm(pipe.latency as usize + 1)?;
+        (en, if pipe.latency == 0 { cg.rp } else { cg.warm(pipe.latency as usize)? })
+    } else {
+        (cg.rp, cg.rp)
+    };
+    let src_ref: Vec<Ref> = b.srcs.iter().map(|k| shared.raw(p, *k).0).collect();
 
     // Node signals, then combinators with operands delayed to their consumer's iteration.
     let plans: Vec<&(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).collect();
@@ -669,50 +1166,89 @@ fn pipelined_block(
         roots.extend(acc_conds(a));
     }
     let nodes = g.reachable(&roots);
-    let mut node_sig: HashMap<V, Sig> = HashMap::new();
+    let mut node_ref: HashMap<V, Ref> = HashMap::new();
     for &v in &nodes {
-        if let Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) = g.op(v) {
-            node_sig.insert(v, cg.alloc()?);
+        match g.op(v) {
+            Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) => {
+                node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
+            }
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) => {
+                node_ref.insert(v, Ref::Bun(cg.bnew()));
+            }
+            _ => {}
         }
     }
-    let mut delayed: HashMap<(V, i32), Sig> = HashMap::new();
+    let mut delayed: HashMap<(V, i32), Ref> = HashMap::new();
     // The value of `u` for the current iteration, on the wire at offset `at`.
-    let mut at = |cg: &mut Cg, u: V, at: i32| -> Result<Operand, Diag> {
+    let mut at_ref = |cg: &mut Cg, u: V, at: i32| -> Result<Ref, Diag> {
         let base = match *g.op(u) {
-            Op::Const(k) => return Ok(Operand::Const(k)),
-            Op::Src(s) => src_sig[s as usize],
-            _ => node_sig[&u],
+            Op::Const(k) => return Ok(Ref::Op(Operand::Const(k))),
+            Op::BConst(_) => return Ok(node_ref[&u]), // constant: no timing
+            Op::Src(s) => src_ref[s as usize],
+            _ => node_ref[&u],
         };
         let t = tau(u).expect("timed node");
         assert!(t <= at, "pipeline schedule: value needed before it exists");
         let mut cur = base;
         for d in 1..=(at - t) {
             cur = match delayed.get(&(u, t + d)) {
-                Some(s) => *s,
+                Some(r) => *r,
                 None => {
-                    let s = cg.alloc()?;
-                    cg.core(arith(Operand::Sig(cur), ArOp::Add, Operand::Const(0), s), format!("{what}: delay"));
-                    delayed.insert((u, t + d), s);
-                    s
+                    let r = match cur {
+                        Ref::Bun(prev) => {
+                            let next = cg.bnew();
+                            let each = cg.each;
+                            let id = cg.loose(arith(Operand::Sig(each), ArOp::Add, Operand::Const(0), each), format!("{what}: delay"));
+                            cg.bread(prev, id, false);
+                            cg.bprod(next, id);
+                            Ref::Bun(next)
+                        }
+                        r => {
+                            let s = cg.alloc()?;
+                            cg.core(arith(r.op(), ArOp::Add, Operand::Const(0), s), format!("{what}: delay"));
+                            Ref::Op(Operand::Sig(s))
+                        }
+                    };
+                    delayed.insert((u, t + d), r);
+                    r
                 }
             };
         }
-        Ok(Operand::Sig(cur))
+        Ok(cur)
     };
     let as_sig = |o: Operand| match o {
         Operand::Sig(s) => s,
         Operand::Const(_) => unreachable!("constant where a signal is required"),
     };
     for &v in &nodes {
-        let Some(&out) = node_sig.get(&v) else { continue };
+        let Some(&out_ref) = node_ref.get(&v) else { continue };
+        if matches!(g.op(v), Op::BConst(_)) {
+            cg.emit_bundle(g, v, out_ref.bun(), &|_| unreachable!(), &what);
+            continue;
+        }
         let t = tau(v).unwrap() - 1;
+        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) = g.op(v) {
+            // Operands as of this node's input tick, then the combinators.
+            let mut ops: HashMap<V, Ref> = HashMap::new();
+            for u in g.operands(v) {
+                let r = at_ref(cg, u, t)?;
+                ops.insert(u, r);
+            }
+            let look = |u: V| ops[&u];
+            match out_ref {
+                Ref::Bun(o) => cg.emit_bundle(g, v, o, &look, &what),
+                r => cg.emit_from_bundle(g, v, r.sig(), &look, &what),
+            }
+            continue;
+        }
+        let out = out_ref.sig();
         match g.op(v).clone() {
             Op::Ar(op, a, bb) => {
-                let (x, y) = (at(cg, a, t)?, at(cg, bb, t)?);
+                let (x, y) = (at_ref(cg, a, t)?.op(), at_ref(cg, bb, t)?.op());
                 cg.core(arith(x, op, y, out), format!("{what}: arithmetic"));
             }
             Op::Cmp(op, a, bb) => {
-                let (x, y) = (as_sig(at(cg, a, t)?), at(cg, bb, t)?);
+                let (x, y) = (as_sig(at_ref(cg, a, t)?.op()), at_ref(cg, bb, t)?.op());
                 cg.core(dec_const(vec![Cond { second: y, ..c(x, op, 0) }], out, 1), format!("{what}: comparison"));
             }
             Op::Mux { .. } | Op::Sel(_) => {
@@ -722,8 +1258,8 @@ fn pipelined_block(
                     _ => unreachable!(),
                 };
                 for (cond, val) in arms {
-                    let cs = as_sig(at(cg, cond, t)?);
-                    match at(cg, val, t)? {
+                    let cs = as_sig(at_ref(cg, cond, t)?.op());
+                    match at_ref(cg, val, t)?.op() {
                         Operand::Const(0) => {}
                         Operand::Const(k) => {
                             cg.core(dec_const(vec![c(cs, CmpOp::Ne, 0)], out, k), format!("{what}: select"));
@@ -740,7 +1276,7 @@ fn pipelined_block(
                     for term in &d {
                         let mut conds = Vec::new();
                         for l in term {
-                            let (x, y) = (as_sig(at(cg, l.a, t)?), at(cg, l.b, t)?);
+                            let (x, y) = (as_sig(at_ref(cg, l.a, t)?.op()), at_ref(cg, l.b, t)?.op());
                             conds.push(Cond { second: y, ..c(x, l.op, 0) });
                         }
                         terms.push(conds);
@@ -748,58 +1284,103 @@ fn pipelined_block(
                     cg.core(dec_const(distribute(&[], &terms), out, k), format!("{what}: condition"));
                 }
             }
-            Op::Const(_) | Op::Src(_) => {}
+            _ => unreachable!("not a scalar operation"),
         }
     }
 
     // Loads read values at offset 0; enable deciders read their conditions one tick early.
-    let mut ready: HashMap<(V, i32), Operand> = HashMap::new();
+    let mut ready: HashMap<(V, i32), Ref> = HashMap::new();
     for (_, plan) in &plans {
         for l in &plan.loads {
             let guard_at = if l.direct || is_true(&l.guard) { 0 } else { -1 };
             for v in crate::ir::dnf_operands(&l.guard) {
-                ready.insert((v, guard_at), at(cg, v, guard_at)?);
+                ready.insert((v, guard_at), Ref::Op(at_ref(cg, v, guard_at)?.op()));
             }
             if let LoadVal::Node(v) = l.val {
-                ready.insert((v, 0), at(cg, v, 0)?);
+                ready.insert((v, 0), at_ref(cg, v, 0)?);
             }
         }
         if let Some(k) = &plan.keep {
             for v in crate::ir::dnf_operands(k) {
-                ready.insert((v, 0), at(cg, v, 0)?);
+                ready.insert((v, 0), Ref::Op(at_ref(cg, v, 0)?.op()));
             }
         }
     }
     let mut acc_w: Vec<(usize, Operand)> = Vec::new();
     for (si, a) in &accs {
-        acc_w.push((*si, at(cg, a.w, -1)?));
+        acc_w.push((*si, at_ref(cg, a.w, -1)?.op()));
         for v in acc_conds(a) {
-            ready.insert((v, 0), at(cg, v, 0)?);
+            ready.insert((v, 0), Ref::Op(at_ref(cg, v, 0)?.op()));
         }
     }
-    let sig = |v: V| as_sig(ready[&(v, 0)]);
-    let lit_at = |l: &Lit, when: i32| Cond { second: ready[&(l.b, when)], ..c(as_sig(ready[&(l.a, when)]), l.op, 0) };
+    // Combinational outputs: the value at offset 0, or one tick later when other states of
+    // the block go through registers (whose outputs show values a tick later), so that all
+    // outputs of an iteration change together.
+    // Conditions checked on the commit tick (direct loads) also push outputs a tick later.
+    let late = registers || plans.iter().any(|(si, p)| comb.contains(si) && p.loads.iter().any(|l| l.direct));
+    let o = if late { 1 } else { 0 };
+    let mut direct: HashMap<usize, Ref> = HashMap::new();
+    for (si, plan) in &plans {
+        if !comb.contains(si) {
+            continue;
+        }
+        let r = match (plan.loads.as_slice(), plan.loads.first().map(|l| is_true(&l.guard))) {
+            ([l], Some(true)) => match l.val {
+                LoadVal::Const(k) => Ref::Op(Operand::Const(k)),
+                LoadVal::Node(v) => at_ref(cg, v, o)?,
+            },
+            _ => {
+                // Constants under (mutually exclusive) conditions: one decider each.
+                let out = cg.alloc()?;
+                for l in &plan.loads {
+                    let LoadVal::Const(k) = l.val else { unreachable!("checked by combinational()") };
+                    if k == 0 {
+                        continue;
+                    }
+                    let mut terms: CDnf = Vec::new();
+                    for term in &l.guard {
+                        let mut conds = Vec::new();
+                        for lit in term {
+                            let (x, y) = (at_ref(cg, lit.a, o - 1)?.sig(), at_ref(cg, lit.b, o - 1)?.op());
+                            conds.push(Cond { second: y, ..c(x, lit.op, 0) });
+                        }
+                        terms.push(conds);
+                    }
+                    cg.core(dec_const(distribute(&[], &terms), out, k), format!("{what}: {}", p.states[*si].display_name()));
+                }
+                Ref::Op(Operand::Sig(out))
+            }
+        };
+        direct.insert(*si, r);
+    }
+    let val = |v: V| ready[&(v, 0)];
+    let lit_at = |l: &Lit, when: i32| Cond { second: ready[&(l.b, when)].op(), ..c(ready[&(l.a, when)].sig(), l.op, 0) };
     let lit = |l: &Lit| lit_at(l, 0);
     let lit_eg = |l: &Lit| lit_at(l, -1);
     for (si, s) in p.states.iter().enumerate() {
         if s.owner != Some(bi) || !live[si] {
             continue;
         }
-        let x = shared.state_sig[&si];
+        if comb.contains(&si) {
+            continue;
+        }
         let name = format!("state {}", s.display_name());
         if let Some((_, w)) = acc_w.iter().find(|(a, _)| *a == si) {
             let acc = &accs.iter().find(|(a, _)| *a == si).unwrap().1;
-            accumulator(cg, x, s.init, *w, acc, en, &lit, &name);
+            accumulator(cg, shared.state_sig[&si], s.init, *w, acc, en, &lit, &name);
             continue;
         }
         let ws: Vec<Writer> = plans
             .iter()
             .filter(|(w, _)| *w == si)
-            .map(|(_, plan)| Writer { en, prefix: vec![c(en_prefix, CmpOp::Ne, 0)], plan, sig: &sig, lit: &lit, lit_eg: &lit_eg })
+            .map(|(_, plan)| Writer { en, prefix: vec![c(en_prefix, CmpOp::Ne, 0)], plan, val: &val, lit: &lit, lit_eg: &lit_eg })
             .collect();
-        cg.register(x, s.init, &ws, &name)?;
+        match shared.state(si) {
+            Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,
+            r => cg.register(r.sig(), s.init, &ws, &name)?,
+        }
     }
-    Ok(())
+    Ok((direct, if registers { 1 } else { o as u32 }))
 }
 
 /// `x += w` every tick: the hold decider copies x from a private red loop on which `w`
@@ -874,27 +1455,25 @@ fn main_proc(
 
     // Sources: own variables directly, inputs and other processes' state sampled at each
     // step start, and live (unsampled) versions for `wait until`.
-    let mut src_sig: Vec<Sig> = Vec::new();
+    let mut src_ref: Vec<Ref> = Vec::new();
     for &kind in &m.srcs {
         let (raw, name) = shared.raw(p, kind);
-        src_sig.push(match kind {
-            SrcKind::Input(_) | SrcKind::Foreign(_) | SrcKind::Ticks => cg.sample(raw, any, &format!("main: {name}"))?,
+        src_ref.push(match kind {
+            SrcKind::Input(_) | SrcKind::Foreign(_) | SrcKind::Ticks => cg.sample_ref(raw, any, &format!("main: {name}"))?,
             _ => raw,
         });
     }
-    let src = |s: u32| src_sig[s as usize];
+    let src = |s: u32| src_ref[s as usize];
     let mut steps = m.steps.clone();
     for s in &mut steps {
         s.plans.retain(|(si, _)| live[*si]);
     }
     let roots: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
-    let node_sig = cg.logic(g, &roots, &src, "main")?;
-    let opnd = |v: V| operand(g, v, &src, &node_sig);
-    let sig_of = |v: V| match opnd(v) {
-        Operand::Sig(s) => s,
-        Operand::Const(_) => unreachable!(),
-    };
-    let lit = |l: &Lit| lit_cond(g, l, &src, &node_sig);
+    let nodes = cg.logic(g, &roots, &src, "main")?;
+    let loc = |v: V| locate(g, v, &src, &nodes);
+    let opnd = |v: V| loc(v).op();
+    let sig_of = |v: V| loc(v).sig();
+    let lit = |l: &Lit| lit_cond(l, &loc);
     // A condition as decider terms: its condition lists if fused, else `node != 0` / `== 0`.
     let cond_terms = |plan: &crate::fuse::CondPlan, neg: bool| -> CDnf {
         match (if neg { &plan.neg } else { &plan.pos }, &plan.pos, &plan.neg) {
@@ -1007,11 +1586,15 @@ fn main_proc(
             let Some((cms, prefix)) = &cm[i] else { continue };
             for (w, plan) in &step.plans {
                 if *w == si {
-                    ws.push(Writer { en: *cms, prefix: prefix.clone(), plan, sig: &sig_of, lit: &lit, lit_eg: &lit });
+                    ws.push(Writer { en: *cms, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit });
                 }
             }
         }
-        cg.register(shared.state_sig[&si], s.init, &ws, &format!("variable {}", s.display_name()))?;
+        let name = format!("variable {}", s.display_name());
+        match shared.state(si) {
+            Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,
+            r => cg.register(r.sig(), s.init, &ws, &name)?,
+        }
     }
     for (func, &r) in &ret_sig {
         let plans: Vec<(Sig, Vec<Cond>, WriterPlan)> = steps
@@ -1026,7 +1609,7 @@ fn main_proc(
             })
             .collect();
         let ws: Vec<Writer> =
-            plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, sig: &sig_of, lit: &lit, lit_eg: &lit }).collect();
+            plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit }).collect();
         cg.register(r, 0, &ws, &format!("main: return address of `{func}`"))?;
     }
     Ok(MainStats { steps: stats, combinators: cg.combinators_since(first_ent) })

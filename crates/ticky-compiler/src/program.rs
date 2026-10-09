@@ -13,7 +13,7 @@ use ticky_syntax::{Diag, Span};
 
 use crate::cfg::{self, Term};
 use crate::fuse::{CondPlan, Fuser, WriterPlan};
-use crate::ir::{Graph, Iv, SrcId, V};
+use crate::ir::{BVals, Cv, Graph, Iv, SrcId, V};
 use crate::lower::{self, Names};
 use ticky_factorio::ArOp;
 
@@ -24,6 +24,7 @@ pub const MAIN: usize = usize::MAX;
 pub enum Ty {
     Int,
     Bool,
+    Bundle,
 }
 
 impl Ty {
@@ -31,6 +32,7 @@ impl Ty {
         match self {
             Ty::Int => "int",
             Ty::Bool => "bool",
+            Ty::Bundle => "Bundle",
         }
     }
 }
@@ -40,6 +42,7 @@ pub struct Port {
     pub name: String,
     pub dir: PortDir,
     pub ty: Ty,
+    /// The port's signal (`signal-each` for bundle ports, which carry every signal).
     pub sig: Sig,
     pub label: Option<String>,
     pub span: Span,
@@ -50,6 +53,8 @@ pub struct State {
     pub name: String,
     pub ty: Ty,
     pub init: i32,
+    /// Initial value of a bundle state.
+    pub binit: BVals,
     /// Has an initial value from the prologue (or is an output, which starts at 0).
     pub has_init: bool,
     /// The process that assigns it (`MAIN` or an every-block index); `None` = never changes.
@@ -197,7 +202,7 @@ pub struct Program {
     pub subroutines: std::collections::BTreeSet<String>,
     pub ports: Vec<Port>,
     pub states: Vec<State>,
-    pub consts: HashMap<String, i32>,
+    pub consts: HashMap<String, Cv>,
     pub blocks: Vec<Block>,
     pub main: Option<MainProc>,
     pub tests: Vec<TestDef>,
@@ -282,8 +287,124 @@ fn parse_type(e: &Expr) -> Result<Ty, Diag> {
     match &e.kind {
         ExprKind::Name(n) if n == "int" => Ok(Ty::Int),
         ExprKind::Name(n) if n == "bool" => Ok(Ty::Bool),
-        ExprKind::Name(n) if n == "Bundle" || n == "Signal" => Err(not_yet(e.span, &format!("`{n}`"), 3)),
-        _ => Err(Diag::error(e.span, "expected a type: `int` or `bool`")),
+        ExprKind::Name(n) if n == "Bundle" => Ok(Ty::Bundle),
+        ExprKind::Name(n) if n == "Signal" => Err(not_yet(e.span, "`Signal`", 6)),
+        _ => Err(Diag::error(e.span, "expected a type: `int`, `bool` or `Bundle`")),
+    }
+}
+
+/// Whether an expression is (syntactically) a bundle, given the names known to be bundles.
+fn is_bundle_expr(e: &Expr, bundles: &HashSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Dict(_) | ExprKind::DictComp { .. } => true,
+        ExprKind::Name(n) => bundles.contains(n),
+        ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n) if n == "Bundle" || n == "#bset"),
+        ExprKind::Binary(_, a, b) => is_bundle_expr(a, bundles) || is_bundle_expr(b, bundles),
+        ExprKind::Unary(_, a) => is_bundle_expr(a, bundles),
+        ExprKind::IfExp { then, orelse, .. } => is_bundle_expr(then, bundles) || is_bundle_expr(orelse, bundles),
+        ExprKind::BoolOp(_, items) => items.iter().any(|i| is_bundle_expr(i, bundles)),
+        _ => false,
+    }
+}
+
+/// Names assigned something that isn't syntactically a bool somewhere.
+fn nonbool_names(body: &[Stmt], out: &mut HashSet<String>) {
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { targets, value } => {
+                for t in targets {
+                    match (&t.kind, &value.kind) {
+                        (ExprKind::Name(n), _) if !is_bool_expr(value) => {
+                            out.insert(n.clone());
+                        }
+                        (ExprKind::Tuple(ts), ExprKind::Tuple(vs)) if ts.len() == vs.len() => {
+                            for (t, v) in ts.iter().zip(vs) {
+                                if let (ExprKind::Name(n), false) = (&t.kind, is_bool_expr(v)) {
+                                    out.insert(n.clone());
+                                }
+                            }
+                        }
+                        (ExprKind::Tuple(ts), _) => {
+                            for t in ts {
+                                if let ExprKind::Name(n) = &t.kind {
+                                    out.insert(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            StmtKind::AugAssign { target: Expr { kind: ExprKind::Name(n), .. }, .. } => {
+                out.insert(n.clone());
+            }
+            StmtKind::If { body, orelse, .. } => {
+                nonbool_names(body, out);
+                nonbool_names(orelse, out);
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Block { body, .. } | StmtKind::Sub { body, .. } => {
+                nonbool_names(body, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names that hold bundles: assigned a bundle anywhere (to a fixpoint, through copies).
+fn bundle_names(bodies: &[&[Stmt]], mut known: HashSet<String>) -> HashSet<String> {
+    fn scan(body: &[Stmt], known: &mut HashSet<String>) -> bool {
+        fn mark(t: &Expr, v: &Expr, known: &mut HashSet<String>) -> bool {
+            match (&t.kind, is_bundle_expr(v, known)) {
+                (ExprKind::Name(n), true) => known.insert(n.clone()),
+                _ => false,
+            }
+        }
+        let mut changed = false;
+        for s in body {
+            match &s.kind {
+                StmtKind::Assign { targets, value } => {
+                    for t in targets {
+                        match (&t.kind, &value.kind) {
+                            (ExprKind::Tuple(ts), ExprKind::Tuple(vs)) if ts.len() == vs.len() => {
+                                for (t, v) in ts.iter().zip(vs) {
+                                    changed |= mark(t, v, known);
+                                }
+                            }
+                            _ => changed |= mark(t, value, known),
+                        }
+                    }
+                }
+                StmtKind::AugAssign { target, value, .. } => changed |= mark(target, value, known),
+                StmtKind::AnnAssign { target, ann, value } => {
+                    if matches!(&ann.kind, ExprKind::Name(n) if n == "Bundle") {
+                        if let ExprKind::Name(n) = &target.kind {
+                            changed |= known.insert(n.clone());
+                        }
+                    } else if let Some(v) = value {
+                        changed |= mark(target, v, known);
+                    }
+                }
+                StmtKind::If { body, orelse, .. } => {
+                    changed |= scan(body, known);
+                    changed |= scan(orelse, known);
+                }
+                StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Block { body, .. } | StmtKind::Every { body, .. } => {
+                    changed |= scan(body, known)
+                }
+                StmtKind::Sub { body, .. } => changed |= scan(body, known),
+                _ => {}
+            }
+        }
+        changed
+    }
+    loop {
+        let mut changed = false;
+        for b in bodies {
+            changed |= scan(b, &mut known);
+        }
+        if !changed {
+            return known;
+        }
     }
 }
 
@@ -300,14 +421,14 @@ fn is_bool_expr(e: &Expr) -> bool {
 
 /// Names for constant expressions: only previously defined constants.
 struct ConstNames<'a> {
-    consts: &'a HashMap<String, i32>,
+    consts: &'a HashMap<String, Cv>,
     ports: &'a [Port],
 }
 
 impl Names for ConstNames<'_> {
     fn lookup(&mut self, g: &mut Graph, name: &str, span: Span) -> Result<V, Diag> {
-        if let Some(&k) = self.consts.get(name) {
-            return Ok(g.konst(k));
+        if let Some(k) = self.consts.get(name) {
+            return Ok(g.cv(k));
         }
         if self.ports.iter().any(|p| p.name == name) {
             return Err(Diag::error(span, format!("`{name}` is a port, so its value isn't known when compiling")));
@@ -316,23 +437,34 @@ impl Names for ConstNames<'_> {
     }
 }
 
-pub fn eval_const(e: &Expr, consts: &HashMap<String, i32>, ports: &[Port]) -> Result<i32, Diag> {
+/// The constant value of an expression (a number, bundle or signal).
+pub fn eval_const(e: &Expr, consts: &HashMap<String, Cv>, ports: &[Port]) -> Result<Cv, Diag> {
     let mut g = Graph::default();
     let v = lower::expr(&mut g, &mut ConstNames { consts, ports }, e)?;
-    g.as_const(v).ok_or_else(|| Diag::error(e.span, "expected a constant expression"))
+    g.as_cv(v).ok_or_else(|| Diag::error(e.span, "expected a constant expression"))
 }
 
-fn parse_port(table: &SignalTable, s: &Stmt) -> Result<Port, Diag> {
+/// A constant integer expression.
+pub fn eval_int(e: &Expr, consts: &HashMap<String, Cv>, ports: &[Port]) -> Result<i32, Diag> {
+    eval_const(e, consts, ports)?.int().ok_or_else(|| Diag::error(e.span, "expected a number"))
+}
+
+fn parse_port(table: &SignalTable, s: &Stmt, consts: &HashMap<String, Cv>) -> Result<Port, Diag> {
     let StmtKind::Port { dir, name, ty, signal, label } = &s.kind else { unreachable!() };
     let ty = parse_type(ty)?;
-    let sig = match signal {
-        Some((SignalSpec::Ident(n), sp)) => table.resolve_ident(n).ok_or_else(|| {
-            Diag::error(*sp, format!("unknown signal `{n}`"))
-                .with_help("use a prototype name like `iron_plate`, a virtual signal like `A` or `red`, or an exact name in quotes")
-        })?,
-        Some((SignalSpec::Exact(n), sp)) => {
-            table.lookup(n).ok_or_else(|| Diag::error(*sp, format!("unknown signal \"{n}\"")))?
+    if ty == Ty::Bundle {
+        if let Some((_, sp)) = signal {
+            return Err(Diag::error(*sp, "a bundle port carries every signal, so it has no `@ signal`"));
         }
+    }
+    let sig = match signal {
+        _ if ty == Ty::Bundle => table.special("signal-each"),
+        Some((SignalSpec::Ident(n), sp)) => crate::bundle::ident(n, *sp),
+        Some((SignalSpec::Exact(n), sp)) => crate::bundle::exact(n, None, *sp),
+        Some((SignalSpec::Expr(e), sp)) => match eval_const(e, consts, &[])? {
+            Cv::Sig(s) => s,
+            _ => return Err(Diag::error(*sp, "expected a signal after `@`, e.g. S(\"nt-fuel\", type=\"recipe\")")),
+        },
         None => {
             // Default: the name's first letter, e.g. `total` → signal-T.
             let letter = name.chars().find(|c| c.is_ascii_alphabetic()).unwrap_or('A').to_ascii_uppercase();
@@ -388,7 +520,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                     errs.push(Diag::error(s.span, format!("port `{name}` is declared twice")));
                     continue;
                 }
-                match parse_port(table, s) {
+                match parse_port(table, s, &HashMap::new()) {
                     Ok(p) => ports.push(p),
                     Err(d) => errs.push(d),
                 }
@@ -405,7 +537,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     // Prologue: the leading top-level statements that can run entirely at compile time (no
     // ports, no waits) are executed now; the names they assign become constants, or initial
     // values if something assigns them again later.
-    let mut pro: HashMap<String, i32> = HashMap::new();
+    let mut pro: HashMap<String, Cv> = HashMap::new();
     let mut pro_exprs: HashMap<String, (Option<Expr>, Expr, Span)> = HashMap::new();
     let mut split = 0;
     for s in &top {
@@ -443,7 +575,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         assigned_names(body, &mut main_assigns, &mut errs);
     }
 
-    let mut consts: HashMap<String, i32> = HashMap::new();
+    let mut consts: HashMap<String, Cv> = HashMap::new();
     for (n, _, _, span) in &pro_order {
         if let Some(p) = ports.iter().find(|p| &p.name == n) {
             if p.dir == PortDir::Input {
@@ -452,11 +584,11 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             continue;
         }
         if !main_assigns.contains_key(n) && !block_assigns.iter().any(|b| b.contains_key(n)) {
-            consts.insert(n.clone(), pro[n]);
+            consts.insert(n.clone(), pro[n].clone());
         }
     }
 
-    let konst = |e: &Expr| eval_const(e, &consts, &ports).ok();
+    let konst = |e: &Expr| eval_int(e, &consts, &ports).ok();
     let main_cfg = if main_stmts.is_empty() {
         None
     } else {
@@ -473,6 +605,18 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             }
         }
     };
+
+    // Which names hold bundles.
+    let mut seed: HashSet<String> = ports.iter().filter(|p| p.ty == Ty::Bundle).map(|p| p.name.clone()).collect();
+    seed.extend(pro.iter().filter(|(_, v)| matches!(v, Cv::Bun(_))).map(|(n, _)| n.clone()));
+    let mut bodies: Vec<&[Stmt]> = vec![&main_stmts];
+    bodies.extend(every.iter().map(|(_, _, b)| *b));
+    bodies.extend(subs.iter().map(|(_, _, b)| b.as_slice()));
+    let bundles = bundle_names(&bodies, seed);
+    let mut nonbool = HashSet::new();
+    for b in &bodies {
+        nonbool_names(b, &mut nonbool);
+    }
 
     // States: anything assigned by a process, plus outputs.
     let mut states: Vec<State> = Vec::new();
@@ -527,19 +671,32 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                     Ty::Int
                 }
             },
-            (None, Some((_, None, value, _))) if is_bool_expr(value) => Ty::Bool,
+            _ if bundles.contains(&n) => Ty::Bundle,
+            // A bool only if every assignment is one (`a = x > 0` once doesn't make `a = 5` an error).
+            (None, Some((_, None, value, _))) if is_bool_expr(value) && !nonbool.contains(&n) => Ty::Bool,
             _ => Ty::Int,
         };
-        let init = pro.get(&n).copied().unwrap_or(0);
-        if ty == Ty::Bool && !(0..=1).contains(&init) {
-            errs.push(Diag::error(pro_entry.map(|p| p.3).unwrap_or_default(), format!("`{n}` is a bool, but its initial value is {init}")));
-        }
         let span = pro_entry.map(|p| p.3).or(writers.first().map(|w| w.1)).unwrap_or_default();
+        let (mut init, mut binit) = (0, Vec::new());
+        match (pro.get(&n), ty) {
+            (None, _) => {}
+            (Some(Cv::Int(k)), Ty::Int | Ty::Bool) => init = *k,
+            (Some(Cv::Bun(b)), Ty::Bundle) => binit = b.clone(),
+            (Some(Cv::Sig(_)), _) => {
+                errs.push(Diag::error(span, format!("{} holds a signal, so it can't be changed while running", crate::expand::quoted(&n)))
+                    .with_help("signals that change at runtime come in a later level; use a constant or a bundle"));
+            }
+            (Some(_), _) => errs.push(Diag::error(span, format!("{} is a {}, but its initial value isn't", crate::expand::quoted(&n), ty.name()))),
+        }
+        if ty == Ty::Bool && !(0..=1).contains(&init) {
+            errs.push(Diag::error(span, format!("`{n}` is a bool, but its initial value is {init}")));
+        }
         states.push(State {
             has_init: pro.contains_key(&n) || port.is_some(),
             name: n,
             ty,
             init,
+            binit,
             owner: writers.first().map(|w| w.0),
             port,
             span,
@@ -554,7 +711,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     for (bi, (stmt, period, body)) in every.iter().enumerate() {
         let requested = match period {
             None => None,
-            Some(e) => match eval_const(e, &consts, &ports) {
+            Some(e) => match eval_int(e, &consts, &ports) {
                 Ok(n) if n >= 1 => Some(n as u32),
                 Ok(n) => {
                     errs.push(Diag::error(e.span, format!("the period must be at least 1 tick, not {n}")));
@@ -624,6 +781,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     if !errs.is_empty() {
         return Err(errs);
     }
+    warnings.extend(crate::bundle::take_warnings());
     Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, main, tests, warnings })
 }
 
@@ -632,7 +790,7 @@ struct Ctx<'a> {
     owner: usize,
     ports: &'a [Port],
     states: &'a [State],
-    consts: &'a HashMap<String, i32>,
+    consts: &'a HashMap<String, Cv>,
 }
 
 #[derive(Clone)]
@@ -660,7 +818,13 @@ impl ProcNames<'_> {
             Some(i) => i as SrcId,
             None => {
                 let states = self.ctx.states;
+                let bun = match kind {
+                    SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) => states[s].ty == Ty::Bundle,
+                    SrcKind::Input(p) | SrcKind::LiveInput(p) => self.ctx.ports[p].ty == Ty::Bundle,
+                    SrcKind::Ticks | SrcKind::LiveTicks => false,
+                };
                 let iv = match kind {
+                    _ if bun => Iv::FULL,
                     SrcKind::Own(s) => self.own_iv[&s],
                     SrcKind::Foreign(s) | SrcKind::LiveForeign(s) if states[s].ty == Ty::Bool => Iv::BOOL,
                     SrcKind::Ticks | SrcKind::LiveTicks => Iv { lo: 0, hi: i32::MAX as i64 },
@@ -668,6 +832,7 @@ impl ProcNames<'_> {
                 };
                 self.srcs.push(kind);
                 g.src_iv.push(iv);
+                g.src_bun.push(bun);
                 (self.srcs.len() - 1) as SrcId
             }
         };
@@ -685,8 +850,8 @@ impl Names for ProcNames<'_> {
             }
             None => {}
         }
-        if let Some(&k) = self.ctx.consts.get(name) {
-            return Ok(g.konst(k));
+        if let Some(k) = self.ctx.consts.get(name) {
+            return Ok(g.cv(k));
         }
         if let Some(si) = self.ctx.states.iter().position(|s| s.name == name) {
             let s = &self.ctx.states[si];
@@ -703,6 +868,7 @@ impl Names for ProcNames<'_> {
                 Some(o) if o == self.ctx.owner => self.src_for(g, SrcKind::Own(si)),
                 Some(_) if self.live => self.src_for(g, SrcKind::LiveForeign(si)),
                 Some(_) => self.src_for(g, SrcKind::Foreign(si)),
+                None if s.ty == Ty::Bundle => g.bconst(s.binit.iter().copied()),
                 None => g.konst(s.init),
             });
         }
@@ -737,6 +903,9 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 if ty == Ty::Bool && !g.is_bool(v) {
                     return Err(Diag::error(value.span, "expected a bool value"));
                 }
+                if (ty == Ty::Bundle) != g.is_bundle(v) {
+                    return Err(Diag::error(value.span, format!("expected {}", if ty == Ty::Bundle { "a bundle" } else { "a number" })));
+                }
                 assign(g, n, target, &[v], value.span)?;
             }
             StmtKind::AugAssign { target, op, value } => {
@@ -748,7 +917,13 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 }
                 let cur = n.lookup(g, name, target.span)?;
                 let rhs = lower::expr(g, n, value)?;
-                let v = lower::binop(g, *op, cur, rhs);
+                let v = if g.is_bundle(cur) || g.is_bundle(rhs) {
+                    crate::bundle::binop(g, *op, cur, rhs, s.span)?
+                } else {
+                    let cur = crate::bundle::int(g, cur, target.span)?;
+                    let rhs = crate::bundle::int(g, rhs, value.span)?;
+                    lower::binop(g, *op, cur, rhs)
+                };
                 assign(g, n, target, &[v], s.span)?;
             }
             StmtKind::If { cond, body, orelse } => {
@@ -775,7 +950,12 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                     };
                     let (a, b) = (side(&then_env, g, n)?, side(&else_env, g, n)?);
                     let m = match (a, b) {
-                        (Binding::Val(x), Binding::Val(y)) => Binding::Val(g.mux(c, x, y)),
+                        (Binding::Val(x), Binding::Val(y)) => {
+                            if crate::bundle::kind(g, x) != crate::bundle::kind(g, y) {
+                                return Err(Diag::error(s.span, format!("{} is a bundle on one side of this `if` but not the other", crate::expand::quoted(k))));
+                            }
+                            Binding::Val(g.mux(c, x, y))
+                        }
                         (Binding::Maybe(sp), _) | (_, Binding::Maybe(sp)) => Binding::Maybe(sp),
                     };
                     merged.insert(k.clone(), m);
@@ -828,6 +1008,18 @@ fn assign(g: &mut Graph, n: &mut ProcNames, target: &Expr, vals: &[V], vspan: Sp
     }
     for (name, &v) in names.into_iter().zip(vals) {
         if let Some(s) = n.ctx.states.iter().find(|s| s.name == name) {
+            match (s.ty == Ty::Bundle, crate::bundle::kind(g, v)) {
+                (true, crate::bundle::Kind::Bundle) | (false, crate::bundle::Kind::Int) => {}
+                (true, _) => return Err(Diag::error(vspan, format!("{} is a bundle, but this value isn't", crate::expand::quoted(name)))),
+                (false, crate::bundle::Kind::Bundle) => {
+                    return Err(Diag::error(vspan, format!("{} is a number, but this value is a bundle", crate::expand::quoted(name)))
+                        .with_help("bundle variables are assigned bundles everywhere; check the other assignments"))
+                }
+                (false, crate::bundle::Kind::Signal) => {
+                    return Err(Diag::error(vspan, format!("{} can't hold a signal while running", crate::expand::quoted(name)))
+                        .with_help("signals that change at runtime come in a later level; use a constant"))
+                }
+            }
             if s.ty == Ty::Bool && !g.is_bool(v) {
                 return Err(Diag::error(vspan, format!("{} is a bool, but this value can be any int", crate::expand::quoted(name)))
                     .with_help("compare it, e.g. `x != 0`, or use `bool(x)`"));
@@ -846,7 +1038,7 @@ fn initial_ivs(ctx: &Ctx) -> HashMap<usize, Iv> {
         .iter()
         .enumerate()
         .filter(|(_, s)| s.owner == Some(ctx.owner))
-        .map(|(si, s)| (si, Iv::k(s.init)))
+        .map(|(si, s)| (si, if s.ty == Ty::Bundle { Iv::FULL } else { Iv::k(s.init) }))
         .collect()
 }
 

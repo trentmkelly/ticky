@@ -331,6 +331,49 @@ fn retarget(t: &mut Term, f: impl Fn(Target) -> Target) {
     }
 }
 
+/// Largest step (in statements) copied into a predecessor that jumps to it.
+const MAX_COPY: usize = 6;
+
+/// Merges steps joined by a plain jump: each step costs at least two ticks and a few
+/// combinators, so `A; goto B` becomes one step running A's code and then B's. When B has
+/// other predecessors too, it is copied, if small. B must not wait: what A writes has to
+/// be visible during the wait. Entry steps (`protected`) keep their identity.
+fn fuse(steps: &mut [Draft], protected: &[usize]) {
+    let preds = |steps: &[Draft], b: usize| -> usize {
+        steps.iter().map(|d| targets(&d.term).into_iter().filter(|t| *t == Some(b)).count()).sum::<usize>()
+            + if protected.contains(&b) { 1 } else { 0 }
+    };
+    let mut budget = 4 * steps.len();
+    loop {
+        let mut changed = false;
+        for a in 0..steps.len() {
+            let Term::Goto(Some(b)) = steps[a].term else { continue };
+            if b == a || matches!(steps[b].term, Term::WaitUntil(..) | Term::WaitTicks(..) | Term::Open) {
+                continue;
+            }
+            let only = preds(steps, b) == 1;
+            if !only && (steps[b].stmts.len() > MAX_COPY || budget == 0) {
+                continue;
+            }
+            if !only {
+                budget -= 1;
+            }
+            let (stmts, term) = (steps[b].stmts.clone(), steps[b].term.clone());
+            steps[a].stmts.extend(stmts);
+            steps[a].term = term;
+            if only {
+                // `b` is now unreachable (dropped below).
+                steps[b].stmts.clear();
+                steps[b].term = Term::Goto(None);
+            }
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
 /// A subroutine: name, return label and body.
 pub type SubDef = (String, usize, Vec<Stmt>);
 
@@ -384,6 +427,8 @@ pub fn build(stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) -> Option<i3
             *e = t;
         }
     }
+    let protected: Vec<usize> = entry.into_iter().chain(sub_entry.values().copied()).collect();
+    fuse(&mut steps, &protected);
 
     // Keep reachable steps only, renumbered in order.
     let mut keep = vec![false; steps.len()];

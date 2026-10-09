@@ -1,0 +1,74 @@
+# A tour of bundle features (SPEC §4.3): bundle state, comprehensions inside functions,
+# element-wise arithmetic, recipe signals and bundle comparisons.
+input  stock: Bundle = port("Items to look at")
+input  reset: bool @ R
+input  mode: int @ M = port("1 = gears, 2 = cables, other = nothing")
+output totals: Bundle = port("Sum of `stock` sampled every 10 ticks")
+output value: int @ V = port("Value of `stock` at PRICES")
+output pick: Bundle = port("Recipe for an assembler set to 'Set recipe'")
+output mix: Bundle
+output ready: bool @ D
+
+PRICES = {"iron-plate": 2, "copper-plate": 3, "steel-plate": 10}
+GEAR = S("iron-gear-wheel", type="recipe")
+CABLE = S("copper-cable", type="recipe")
+
+def scaled(b, k):
+    return {s: v * k for s, v in b.items()}
+
+totals = Bundle()
+
+every 10 ticks:
+    if reset:
+        totals = Bundle()
+    else:
+        totals += stock
+
+every tick:
+    value = (stock * PRICES).total()
+
+ready = False
+while True:
+    wait until mode != 0
+    if mode == 1:
+        pick = Bundle({GEAR: 1})
+    elif mode == 2:
+        pick = Bundle({CABLE: 1})
+    else:
+        pick = Bundle()
+    mix = scaled(stock, mode) + Bundle(signal_A=mode, iron_plate=stock.get(S("iron-plate"), 7))
+    ready = pick == Bundle({GEAR: 1})
+    wait until mode == 0
+
+test "accumulates and resets":
+    set stock = Bundle(iron_plate=5, copper_plate=2)
+    run until totals.iron_plate >= 15, max 40 ticks
+    assert totals.copper_plate * 5 == totals.iron_plate * 2
+    set reset = True
+    run until len(totals) == 0, max 30 ticks
+
+test "value":
+    set stock = Bundle(iron_plate=5, copper_plate=2, coal=9)
+    run 10 ticks
+    assert value == 16
+
+test "picks recipes":
+    set stock = Bundle(iron_plate=5, copper_plate=2)
+    set mode = 1
+    run until ready, max 20 ticks
+    assert pick == Bundle({GEAR: 1})
+    assert mix == Bundle(iron_plate=10, copper_plate=2, signal_A=1)
+    set mode = 0
+    run 10 ticks
+    set mode = 2
+    run until pick == Bundle({CABLE: 1}), max 20 ticks
+    run 5 ticks
+    assert not ready
+    assert mix == Bundle(iron_plate=15, copper_plate=4, signal_A=2)
+    set stock = Bundle(copper_plate=1)
+    set mode = 0
+    run 10 ticks
+    set mode = 3
+    run 20 ticks
+    assert len(pick) == 0
+    assert mix == Bundle(iron_plate=7, copper_plate=3, signal_A=3)

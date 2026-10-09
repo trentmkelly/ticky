@@ -219,11 +219,17 @@ impl Parser {
                 let ty = self.primary()?;
                 let signal = if self.eat_op("@") {
                     let s = self.span();
+                    if matches!(self.peek_at(1), Tok::Op("(")) {
+                        let e = self.primary()?;
+                        let span = e.span;
+                        Some((SignalSpec::Expr(e), span))
+                    } else {
                     match self.bump().tok {
                         Tok::Name(n) => Some((SignalSpec::Ident(n), s)),
                         Tok::Str(n) => Some((SignalSpec::Exact(n), s)),
                         Tok::Int(i) => Some((SignalSpec::Ident(i.to_string()), s)),
                         _ => return Err(Diag::error(s, "expected a signal name after `@`")),
+                    }
                     }
                 } else {
                     None
@@ -662,7 +668,38 @@ impl Parser {
                 return Ok(Expr { kind: ExprKind::List(items), span: span.to(end) });
             }
             Tok::Op("{") => {
-                return Err(Diag::error(span, "bundle and dict literals are not supported yet"));
+                let mut items = Vec::new();
+                while !self.at_op("}") {
+                    let k = self.expr()?;
+                    self.expect_op(":")?;
+                    let v = self.expr()?;
+                    if items.is_empty() && self.eat_kw("for") {
+                        let target = self.target_list()?;
+                        self.expect_kw("in")?;
+                        let iter = self.or_test()?;
+                        let mut conds = Vec::new();
+                        while self.eat_kw("if") {
+                            conds.push(self.or_test()?);
+                        }
+                        let end = self.expect_op("}")?;
+                        return Ok(Expr {
+                            kind: ExprKind::DictComp {
+                                key: Box::new(k),
+                                value: Box::new(v),
+                                target: Box::new(target),
+                                iter: Box::new(iter),
+                                conds,
+                            },
+                            span: span.to(end),
+                        });
+                    }
+                    items.push((k, v));
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                let end = self.expect_op("}")?;
+                return Ok(Expr { kind: ExprKind::Dict(items), span: span.to(end) });
             }
             ref other => {
                 self.pos -= 1;

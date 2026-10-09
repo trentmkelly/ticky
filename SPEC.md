@@ -2,8 +2,8 @@
 
 > A Python-like language that compiles to Factorio 2.0 combinator blueprints.
 
-- **Status:** Levels 0–2 implemented, plus the first optimisation passes (see NOTES.md);
-  later levels are design
+- **Status:** Levels 0–3 implemented (Level 3: the bundle core, §4.3.5), plus the first
+  optimisation passes (see NOTES.md); later levels are design
 - **Target:** Factorio 2.0 base game (Space Age optional, never required)
 - **Compiler:** Rust, single binary `ticky`
 - **File extension:** `.ticky`
@@ -17,6 +17,16 @@ in-game (or against a `--dump-data` prototype dump) before the compiler relies o
 5 bits and `>>` is arithmetic; decider conditions group as OR-of-ANDs (AND binds tighter);
 combinators, constant combinators and medium poles have a circuit wire reach of 9 tiles; 358
 signals are usable in the base game (146 virtual, 204 item, 8 fluid).
+
+**`each` semantics (verified with harness/ticky-harness/scenarios/probe):** an arithmetic `each`
+operand iterates over the signals present on its selected networks; `each(red) op each(green)`
+works over the **union** of both (missing = 0); a single output sums the per-signal results.
+A decider with `each` in several conditions (mixed with ordinary conditions) iterates over the
+signals of every `each` operand's networks, so a signal missing on one colour is tested as 0
+there; outputting `each` copies or sets each passing signal, a single output sums over them
+(constant 1 → a count). `everything`-output copies all signals of the chosen networks. The
+selector combinator's `select` mode outputs the largest/smallest signal, `count` the number of
+signals.
 
 ---
 
@@ -151,9 +161,13 @@ optional and checked.
   1. An exact prototype name written with `_` in place of `-`: `iron_plate` → `iron-plate`.
   2. The same with a `signal-` prefix: `A` → `signal-A`, `red` → `signal-red`,
      `check` → `signal-check`.
-  3. Ambiguity (possible with mods) is a compile error. The string form is always exact:
-     `S("iron-plate")`, `S("signal-A")`.
-  4. Quality (Space Age): `S("iron-plate", quality="rare")`.
+  3. The string form is always exact: `S("iron-plate")`, `S("signal-A")`. A type picks among
+     same-named signals (an item and its recipe): `S("iron-gear-wheel", type="recipe")`; types
+     are `item` (the default), `fluid`, `virtual`, `recipe`, `quality`, `space-location` and
+     `asteroid-chunk`.
+  4. Names the compiler doesn't know (the base game, Space Age and all recipes are built in)
+     are **warnings**, not errors, so modded signals work: `S("nt-tbu-fuel")`.
+  5. Quality (Space Age): `S("iron-plate", quality="rare")` **[not implemented yet]**.
 - **Where signal names appear:** after `@` in port declarations, as `Bundle(...)` keyword
   arguments, in `bundle.name` attribute access, and through `S(...)`.
 - **Signal-typed values** are compile-time constants, except values coming out of bundle
@@ -224,6 +238,27 @@ is a compile error with an explanation. Sequential iteration is still available 
 Bundle iteration is sequential: it is a loop in a process (§9) and cannot appear in `every tick:`
 blocks. It visits the signals present at loop entry (a snapshot); modifying `b` inside the loop
 does not affect the iteration.
+
+#### 4.3.5 What level 3 implements
+
+- `Bundle` ports (`input stock: Bundle`, no `@`), variables, constants and function
+  parameters/results; bundle state in `every` blocks and the main program.
+- Construction: `Bundle()`, `Bundle(name=value, …)` and dict literals, with runtime values
+  (`Bundle(stone=-4000 if low else 0)`); `S(...)` signal constants (`FUEL = S("nt-fuel")`).
+- Element writes: `b[sig] = x`, `b["name"] = x`, `b[sig] += x` (only that signal changes).
+- Arithmetic: bundle `op` bundle (union), bundle `op` number and number `op` bundle (signals
+  present only, with a warning for `+`/`-`), unary `-`, `==`/`!=` between bundles, `x if c else
+  y`, truthiness (non-empty), augmented assignment.
+- Reads: `b[sig]`, `b["name"]`, `b.name`, `b.get(sig, default)`, `sig in b`, `len(b)`,
+  `b.total()`, `sum(b.values())`, `max(b.values())`, `min(b.values())` (0 for an empty bundle).
+- Comprehensions `{s: value for s, v in b.items() if cond …}`: `value` and `cond` may use `v`,
+  numbers, `+ - * // % & | ^`, comparisons, `and`/`or`/`not`, `x if c else y`, `min`, `max` and
+  `abs`. The key must be `s`. Inside a comprehension (and between bundles) `//` and `%` truncate
+  like Factorio (§12). Conditions on `v` itself cost one decider; conditions on other
+  expressions of `v` (`v % 50 == 0`, `max(v - k, 0)`) compare a computed bundle with 0, with
+  missing signals counted as 0.
+- Not yet: `argmax`/`argmin`/`nth` and runtime `Signal` values, `for s, v in b.items():`
+  loops, quality, `Signal` ports (level 6).
 
 ### 4.4 `list[int, N]`
 
@@ -616,6 +651,9 @@ Each item is deliberate, and the compiler gives a specific error or warning wher
 | Lists are shared references (`ys = xs` aliases) | Arrays are values: assignment and argument passing copy | Each array is its own set of registers |
 | `list * 2` repeats | Same, but only with constants (`[0] * 16`); arrays have no element-wise operators, so use comprehensions | Avoids ambiguity with bundles |
 | Dicts | Only `Bundle`, signal → int | Wire semantics |
+| `Counter + Counter` drops counts ≤ 0 | Bundle `+`/`-` keep every nonzero result (negative too) | Per-signal wire sums |
+| `//`, `%` floor | On bundles and inside bundle comprehensions they truncate (Factorio's rule); on numbers they floor as in Python | One combinator for the whole bundle |
+| `b + 5` (if it existed) | Changes only the signals `b` has (Factorio's `each`); warns | Wire semantics |
 | Recursion | Compile error | No call stack (yet) |
 | `print` | Simulator only | No console in-game |
 | Strings, floats, classes, exceptions, imports | Absent | v1 scope |
@@ -955,8 +993,8 @@ source ─parse→ AST ─sema→ typed AST ─lower→ CFG IR ─sched→ FSM +
    switch. (Tuples in assignments and the cost report also exist already.)
 3. ✅ **Level 2:** functions (inlining and subroutines), tuples, register arrays (constant and
    small runtime indexes), comprehensions, compile-time execution of setup code.
-4. **Level 3:** `Bundle`: element-wise operations, comprehensions, reductions, selector
-   combinator queries.
+4. ✅ **Level 3:** `Bundle`: element-wise operations, comprehensions, reductions, selector
+   combinator queries (§4.3.5; `argmax`/`nth` move to level 6).
 5. **Level 4:** signal arrays and banked RAM, runtime indexing, `sorted`.
 6. **Level 5:** `process` concurrency, single-writer rule, `--checks`.
 7. **Level 6:** bundle iteration, runtime `Signal` values.

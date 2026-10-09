@@ -2,11 +2,93 @@
 //! combinator. Nodes are hash-consed and simplified on construction, and each carries a
 //! conservative integer interval used for folding and for proving operands non-negative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use ticky_factorio::{ArOp, CmpOp};
+use ticky_factorio::{ArOp, CmpOp, Sig};
 
 pub type V = u32;
+
+/// A constant bundle: signals with nonzero values, sorted by signal.
+pub type BVals = Vec<(Sig, i32)>;
+
+/// A compile-time constant value.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Cv {
+    Int(i32),
+    Bun(BVals),
+    /// A signal (`S("iron-plate")`), usable as a bundle key.
+    Sig(Sig),
+}
+
+impl Cv {
+    pub fn int(&self) -> Option<i32> {
+        match self {
+            Cv::Int(k) => Some(*k),
+            _ => None,
+        }
+    }
+}
+
+/// Sorted, merged, without zeros.
+pub fn normalize(vals: impl IntoIterator<Item = (Sig, i32)>) -> BVals {
+    let mut m: BTreeMap<Sig, i32> = BTreeMap::new();
+    for (s, v) in vals {
+        let e = m.entry(s).or_insert(0);
+        *e = e.wrapping_add(v);
+    }
+    m.into_iter().filter(|(_, v)| *v != 0).collect()
+}
+
+fn bval(b: &BVals, s: Sig) -> i32 {
+    b.binary_search_by_key(&s, |(x, _)| *x).map(|i| b[i].1).unwrap_or(0)
+}
+
+/// Operand of a per-signal condition: the value of the current signal (`each`) or a scalar.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum BOp {
+    Each,
+    Val(V),
+}
+
+/// One per-signal decider condition: `a op b`. `a` is never a constant.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct BLit {
+    pub op: CmpOp,
+    pub a: BOp,
+    pub b: BOp,
+}
+
+pub type BDnf = Vec<Vec<BLit>>;
+
+/// What a filter outputs for each signal that passes.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FOut {
+    Copy,
+    Const(i32),
+}
+
+/// One combinator writing (part of) a bundle; a bundle node's value is the sum of its terms.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum BTerm {
+    /// `each(b) op k` for every signal present in bundle `b` (`k` scalar or constant).
+    Map(ArOp, V, V),
+    /// `k op each(b)` for every signal present in `b`.
+    RMap(ArOp, V, V),
+    /// `each(a) op each(b)` over the union of the two bundles' signals.
+    Zip(ArOp, V, V),
+    /// A single signal carrying a scalar's value.
+    One(Sig, V),
+    /// One signal of bundle `b`, times a constant.
+    Pick(V, Sig, i32),
+    /// The signals of `b` passing a per-signal condition, copied or set to a constant.
+    Filter(V, BDnf, FOut),
+    /// The signals of the domain `d` (first) where a per-signal condition on bundle `b`
+    /// holds, counting signals missing from `b` as 0: `each` reads `b`, and the decider
+    /// iterates over the signals of both. Copies `d`'s values. Constants only in conditions.
+    DFilter(V, V, BDnf, FOut),
+    /// Constant signals (a constant combinator on the bundle's wire).
+    K(BVals),
+}
 
 /// Index of a block-level source (own state register or sampled input).
 pub type SrcId = u32;
@@ -36,6 +118,59 @@ pub enum Op {
     /// `Σ cond ? val : 0` over arms with mutually exclusive boolean conditions (runtime
     /// array indexing): one gate per arm, all writing the same signal.
     Sel(Vec<(V, V)>),
+    /// A constant bundle.
+    BConst(BVals),
+    /// A bundle: the sum of its terms.
+    Bun(Vec<BTerm>),
+    /// Bundle select: `t ? a : b` with complementary boolean conditions.
+    BMux { t: V, f: V, a: V, b: V },
+    /// The single signal of a bundle with the largest (`true`) or smallest value.
+    BSelect(V, bool),
+    /// Scalar: one signal of a bundle.
+    BGet(V, Sig),
+    /// Scalar: the sum of a bundle's values.
+    BTotal(V),
+    /// Scalar: how many signals a bundle has.
+    BCount(V),
+    /// Placeholder for the value variable while lowering a bundle comprehension.
+    Each,
+    /// A signal constant (`S("iron-plate")`): used as a bundle key, never computed.
+    SigK(Sig),
+}
+
+impl Op {
+    /// Whether the node's value is a bundle.
+    pub fn is_bundle(&self, src_bun: &[bool]) -> bool {
+        match self {
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) => true,
+            Op::Src(s) => src_bun.get(*s as usize).copied().unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+impl BTerm {
+    pub fn operands(&self) -> Vec<V> {
+        match self {
+            BTerm::Map(_, a, b) | BTerm::RMap(_, a, b) | BTerm::Zip(_, a, b) => vec![*a, *b],
+            BTerm::One(_, x) | BTerm::Pick(x, _, _) => vec![*x],
+            BTerm::Filter(b, d, _) | BTerm::DFilter(_, b, d, _) => {
+                let mut v = vec![*b];
+                if let BTerm::DFilter(dom, ..) = self {
+                    v.push(*dom);
+                }
+                for l in d.iter().flatten() {
+                    for o in [l.a, l.b] {
+                        if let BOp::Val(x) = o {
+                            v.push(x);
+                        }
+                    }
+                }
+                v
+            }
+            BTerm::K(_) => vec![],
+        }
+    }
 }
 
 pub fn dnf_operands(d: &Dnf) -> impl Iterator<Item = V> + '_ {
@@ -104,6 +239,8 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
         Op::Src(s) => src_iv[s as usize],
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
+        Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::Each | Op::SigK(_) => Iv::FULL,
+        Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
             // Any subset of arms may fire; bound the sum by the negative and positive parts.
@@ -185,6 +322,11 @@ pub struct Graph {
     memo: HashMap<Op, V>,
     /// Interval assumed for each source.
     pub src_iv: Vec<Iv>,
+    /// Which sources are bundles.
+    pub src_bun: Vec<bool>,
+    bun: Vec<bool>,
+    /// Whether each node depends on the comprehension placeholder ([`Op::Each`]).
+    each_dep: Vec<bool>,
 }
 
 impl Graph {
@@ -208,7 +350,44 @@ impl Graph {
     }
 
     pub fn is_bool(&self, v: V) -> bool {
-        self.iv(v).is_bool()
+        !self.bun[v as usize] && self.iv(v).is_bool()
+    }
+
+    pub fn is_bundle(&self, v: V) -> bool {
+        self.bun[v as usize]
+    }
+
+    /// Whether `v` depends on a comprehension's value variable.
+    pub fn uses_each(&self, v: V) -> bool {
+        self.each_dep[v as usize]
+    }
+
+    pub fn as_bconst(&self, v: V) -> Option<&BVals> {
+        match &self.nodes[v as usize] {
+            Op::BConst(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// A constant's value, if `v` is one.
+    pub fn as_cv(&self, v: V) -> Option<Cv> {
+        match &self.nodes[v as usize] {
+            Op::Const(k) => Some(Cv::Int(*k)),
+            Op::BConst(b) => Some(Cv::Bun(b.clone())),
+            Op::SigK(s) => Some(Cv::Sig(*s)),
+            _ => None,
+        }
+    }
+
+    pub fn as_sig(&self, v: V) -> Option<Sig> {
+        match self.nodes[v as usize] {
+            Op::SigK(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn sigk(&mut self, s: Sig) -> V {
+        self.intern(Op::SigK(s))
     }
 
     fn intern(&mut self, op: Op) -> V {
@@ -228,8 +407,11 @@ impl Graph {
             return self.konst(iv.lo as i32);
         }
         let v = self.nodes.len() as V;
+        self.bun.push(op.is_bundle(&self.src_bun));
         self.nodes.push(op.clone());
         self.ivs.push(iv);
+        let dep = matches!(op, Op::Each) || self.operands(v).iter().any(|o| self.each_dep[*o as usize]);
+        self.each_dep.push(dep);
         self.memo.insert(op, v);
         v
     }
@@ -324,8 +506,13 @@ impl Graph {
         self.intern(Op::Cmp(op, a, b))
     }
 
-    /// Python truthiness as a 0/1 value.
+    /// Python truthiness as a 0/1 value (a bundle is true when it has any signal).
     pub fn truth(&mut self, v: V) -> V {
+        if self.is_bundle(v) {
+            let n = self.bcount(v);
+            let z = self.konst(0);
+            return self.cmp(CmpOp::Ne, n, z);
+        }
         if self.is_bool(v) {
             v
         } else {
@@ -347,6 +534,9 @@ impl Graph {
     pub fn mux_tf(&mut self, t: V, f: V, a: V, b: V) -> V {
         if a == b {
             return a;
+        }
+        if self.is_bundle(a) {
+            return self.bmux_tf(t, f, a, b);
         }
         // Fusion can fold a condition to a constant.
         if let Some(k) = self.as_const(t) {
@@ -400,6 +590,10 @@ impl Graph {
         if a == b {
             return a;
         }
+        if self.is_bundle(a) {
+            let f = self.not(t);
+            return self.bmux_tf(t, f, a, b);
+        }
         match (self.as_const(a), self.as_const(b)) {
             (Some(1), Some(0)) => return t,
             (Some(0), Some(1)) => return self.not(t),
@@ -409,6 +603,319 @@ impl Graph {
         self.intern(Op::Mux { t, f, a, b })
     }
 
+
+    // ------------------------------------------------------------------ bundles
+
+    pub fn bconst(&mut self, vals: impl IntoIterator<Item = (Sig, i32)>) -> V {
+        let b = normalize(vals);
+        self.intern(Op::BConst(b))
+    }
+
+    pub fn empty_bundle(&mut self) -> V {
+        self.bconst([])
+    }
+
+    /// A constant as a node.
+    pub fn cv(&mut self, c: &Cv) -> V {
+        match c {
+            Cv::Int(k) => self.konst(*k),
+            Cv::Bun(b) => self.bconst(b.iter().copied()),
+            Cv::Sig(s) => self.sigk(*s),
+        }
+    }
+
+    pub fn each(&mut self) -> V {
+        self.intern(Op::Each)
+    }
+
+    /// The constant value of a bundle term, when all its operands are constants.
+    fn fold_term(&self, t: &BTerm) -> Option<BVals> {
+        let k = |v: V| self.as_const(v);
+        let b = |v: V| self.as_bconst(v);
+        Some(match t {
+            BTerm::Map(op, x, y) => {
+                let (x, y) = (b(*x)?, k(*y)?);
+                normalize(x.iter().map(|(s, v)| (*s, op.apply(*v, y))))
+            }
+            BTerm::RMap(op, x, y) => {
+                let (x, y) = (k(*x)?, b(*y)?);
+                normalize(y.iter().map(|(s, v)| (*s, op.apply(x, *v))))
+            }
+            BTerm::Zip(op, x, y) => {
+                let (x, y) = (b(*x)?, b(*y)?);
+                let mut sigs: Vec<Sig> = x.iter().chain(y.iter()).map(|(s, _)| *s).collect();
+                sigs.sort();
+                sigs.dedup();
+                normalize(sigs.into_iter().map(|s| (s, op.apply(bval(x, s), bval(y, s)))))
+            }
+            BTerm::One(s, x) => normalize([(*s, k(*x)?)]),
+            BTerm::Pick(x, s, m) => normalize([(*s, bval(b(*x)?, *s).wrapping_mul(*m))]),
+            BTerm::Filter(x, d, out) => {
+                let x = b(*x)?;
+                let val = |o: BOp, cur: i32| -> Option<i32> {
+                    match o {
+                        BOp::Each => Some(cur),
+                        BOp::Val(v) => k(v),
+                    }
+                };
+                let mut res = Vec::new();
+                for &(s, v) in x {
+                    let mut any = false;
+                    for term in d {
+                        let mut all = true;
+                        for l in term {
+                            all &= l.op.apply(val(l.a, v)?, val(l.b, v)?);
+                        }
+                        any |= all;
+                    }
+                    if any {
+                        res.push((s, match out {
+                            FOut::Copy => v,
+                            FOut::Const(c) => *c,
+                        }));
+                    }
+                }
+                normalize(res)
+            }
+            BTerm::DFilter(dom, x, d, out) => {
+                let (dom, x) = (b(*dom)?, b(*x)?);
+                let mut res = Vec::new();
+                for &(s, dv) in dom {
+                    let v = bval(x, s);
+                    let lit = |o: BOp| -> Option<i32> {
+                        match o {
+                            BOp::Each => Some(v),
+                            BOp::Val(c) => k(c),
+                        }
+                    };
+                    let mut any = false;
+                    for term in d {
+                        let mut all = true;
+                        for l in term {
+                            all &= l.op.apply(lit(l.a)?, lit(l.b)?);
+                        }
+                        any |= all;
+                    }
+                    if any {
+                        res.push((s, match out {
+                            FOut::Copy => dv,
+                            FOut::Const(c) => *c,
+                        }));
+                    }
+                }
+                normalize(res)
+            }
+            BTerm::K(vals) => vals.clone(),
+        })
+    }
+
+    /// A bundle made of terms; constant terms are folded together.
+    pub fn bun(&mut self, terms: Vec<BTerm>) -> V {
+        let mut konst: BVals = Vec::new();
+        let mut rest = Vec::new();
+        for t in terms {
+            match self.fold_term(&t) {
+                Some(vals) => konst.extend(vals),
+                None => rest.push(t),
+            }
+        }
+        let konst = normalize(konst);
+        // A filter that never passes contributes nothing.
+        rest.retain(|t| !matches!(t, BTerm::Filter(_, d, _) | BTerm::DFilter(_, _, d, _) if d.is_empty()));
+        if rest.is_empty() {
+            return self.bconst(konst);
+        }
+        // Identities that need no combinator.
+        if konst.is_empty() && rest.len() == 1 {
+            if let Some(b) = self.identity(&rest[0]) {
+                return b;
+            }
+        }
+        // Sums of single-signal bundles stay single signals.
+        if let [BTerm::Zip(op @ (ArOp::Add | ArOp::Sub), a, b)] = rest.as_slice() {
+            if let (Some(pa), Some(pb)) = (self.singles(*a), self.singles(*b)) {
+                let (op, a_parts) = (*op, pa);
+                let mut m = self.collect(a_parts);
+                for (s, p) in pb {
+                    let y = match p {
+                        Ok(v) => v,
+                        Err(k) => self.konst(k),
+                    };
+                    let cur = m.get(&s).copied().unwrap_or_else(|| self.konst(0));
+                    let v = self.ar(op, cur, y);
+                    m.insert(s, v);
+                }
+                let mut terms: Vec<BTerm> = m.into_iter().map(|(s, v)| BTerm::One(s, v)).collect();
+                terms.push(BTerm::K(konst));
+                return self.bun(terms);
+            }
+        }
+        // A filter of a filter is one filter (the inner one copies values unchanged).
+        let rest: Vec<BTerm> = rest.into_iter().map(|t| self.merge_filter(t)).collect();
+        if !konst.is_empty() {
+            let mut rest = rest;
+            rest.push(BTerm::K(konst));
+            return self.intern(Op::Bun(rest));
+        }
+        self.intern(Op::Bun(rest))
+    }
+
+    /// The bundle a term passes through unchanged (`b + 0`, `b * 1`, `a + empty`, …).
+    fn identity(&self, t: &BTerm) -> Option<V> {
+        let empty = |v: V| self.as_bconst(v).is_some_and(|x| x.is_empty());
+        match *t {
+            BTerm::Map(ArOp::Add | ArOp::Sub | ArOp::Or | ArOp::Xor | ArOp::Shl | ArOp::Shr, b, k) if self.as_const(k) == Some(0) => Some(b),
+            BTerm::Map(ArOp::Mul | ArOp::Div | ArOp::Pow, b, k) if self.as_const(k) == Some(1) => Some(b),
+            BTerm::Zip(ArOp::Add | ArOp::Sub, a, b) if empty(b) => Some(a),
+            BTerm::Zip(ArOp::Add, a, b) if empty(a) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn merge_filter(&self, t: BTerm) -> BTerm {
+        if let BTerm::Filter(b, d, out) = &t {
+            if let Op::Bun(inner) = self.op(*b) {
+                if let [BTerm::Filter(b2, d2, FOut::Copy)] = inner.as_slice() {
+                    let mut both: BDnf = Vec::new();
+                    for x in d2 {
+                        for y in d {
+                            both.push(x.iter().chain(y.iter()).copied().collect());
+                        }
+                    }
+                    if both.len() <= 12 {
+                        return BTerm::Filter(*b2, both, *out);
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// Scalar parts of a bundle built only from single signals and constants, if it is one.
+    fn singles(&self, b: V) -> Option<Vec<(Sig, Result<V, i32>)>> {
+        match self.op(b) {
+            Op::BConst(vals) => Some(vals.iter().map(|(s, v)| (*s, Err(*v))).collect()),
+            Op::Bun(terms) => {
+                let mut out = Vec::new();
+                for t in terms {
+                    match t {
+                        BTerm::One(s, x) => out.push((*s, Ok(*x))),
+                        BTerm::K(vals) => out.extend(vals.iter().map(|(s, v)| (*s, Err(*v)))),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    fn sum_parts(&mut self, parts: Vec<Result<V, i32>>) -> V {
+        let mut acc = self.konst(0);
+        for p in parts {
+            let x = match p {
+                Ok(v) => v,
+                Err(k) => self.konst(k),
+            };
+            acc = self.ar(ArOp::Add, acc, x);
+        }
+        acc
+    }
+
+    pub fn bget(&mut self, b: V, s: Sig) -> V {
+        if let Some(parts) = self.singles(b) {
+            let mine = parts.into_iter().filter(|(x, _)| *x == s).map(|(_, p)| p).collect();
+            return self.sum_parts(mine);
+        }
+        self.intern(Op::BGet(b, s))
+    }
+
+    pub fn btotal(&mut self, b: V) -> V {
+        if let Some(parts) = self.singles(b) {
+            return self.sum_parts(parts.into_iter().map(|(_, p)| p).collect());
+        }
+        self.intern(Op::BTotal(b))
+    }
+
+    pub fn bcount(&mut self, b: V) -> V {
+        if let Some(vals) = self.as_bconst(b) {
+            let n = vals.len() as i32;
+            return self.konst(n);
+        }
+        self.intern(Op::BCount(b))
+    }
+
+    pub fn bselect(&mut self, b: V, max: bool) -> V {
+        if let Some(vals) = self.as_bconst(b) {
+            let best = if max {
+                vals.iter().max_by_key(|(s, v)| (*v, std::cmp::Reverse(*s)))
+            } else {
+                vals.iter().min_by_key(|(s, v)| (*v, *s))
+            };
+            let one: BVals = best.into_iter().copied().collect();
+            return self.bconst(one);
+        }
+        self.intern(Op::BSelect(b, max))
+    }
+
+    /// Bundle select from complementary conditions.
+    pub fn bmux_tf(&mut self, t: V, f: V, a: V, b: V) -> V {
+        if a == b {
+            return a;
+        }
+        if let Some(k) = self.as_const(t) {
+            return if k != 0 { a } else { b };
+        }
+        if let Some(k) = self.as_const(f) {
+            return if k != 0 { b } else { a };
+        }
+        // Bundles made of single signals stay that way: select each signal's value.
+        if let (Some(pa), Some(pb)) = (self.singles(a), self.singles(b)) {
+            let (pa, pb) = (self.collect(pa), self.collect(pb));
+            let mut sigs: Vec<Sig> = pa.keys().chain(pb.keys()).copied().collect();
+            sigs.sort();
+            sigs.dedup();
+            let z = self.konst(0);
+            let mut terms = Vec::new();
+            for s in sigs {
+                let (x, y) = (pa.get(&s).copied().unwrap_or(z), pb.get(&s).copied().unwrap_or(z));
+                let m = self.mux_tf(t, f, x, y);
+                terms.push(BTerm::One(s, m));
+            }
+            return self.bun(terms);
+        }
+        self.intern(Op::BMux { t, f, a, b })
+    }
+
+    /// Each signal's total, as scalar nodes.
+    fn collect(&mut self, parts: Vec<(Sig, Result<V, i32>)>) -> BTreeMap<Sig, V> {
+        let mut by: BTreeMap<Sig, Vec<Result<V, i32>>> = BTreeMap::new();
+        for (s, p) in parts {
+            by.entry(s).or_default().push(p);
+        }
+        by.into_iter().map(|(s, ps)| (s, self.sum_parts(ps))).collect()
+    }
+
+    /// `b` with signal `s` set to `x` (Python `b[s] = x`).
+    pub fn bset(&mut self, b: V, s: Sig, x: V) -> V {
+        if let Some(parts) = self.singles(b) {
+            let mut m = self.collect(parts);
+            m.insert(s, x);
+            let terms = m.into_iter().map(|(s, v)| BTerm::One(s, v)).collect();
+            return self.bun(terms);
+        }
+        let z = self.konst(0);
+        self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Pick(b, s, -1), BTerm::One(s, x)])
+    }
+
+    /// The bundle mux shape `(t, f, a, b)` of a node, scalar or bundle.
+    pub fn as_mux(&self, v: V) -> Option<(V, V, V, V)> {
+        match *self.op(v) {
+            Op::Mux { t, f, a, b } | Op::BMux { t, f, a, b } => Some((t, f, a, b)),
+            _ => None,
+        }
+    }
+
     pub fn operands(&self, v: V) -> Vec<V> {
         match *self.op(v) {
             Op::Const(_) | Op::Src(_) => vec![],
@@ -416,6 +923,10 @@ impl Graph {
             Op::Mux { t, f, a, b } => vec![t, f, a, b],
             Op::Dec(ref arms) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
             Op::Sel(ref arms) => arms.iter().flat_map(|(c, v)| [*c, *v]).collect(),
+            Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
+            Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
+            Op::BMux { t, f, a, b } => vec![t, f, a, b],
+            Op::BSelect(b, _) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) => vec![b],
         }
     }
 

@@ -1,0 +1,794 @@
+# type	name	hidden	parameter	special	order	subgroup  (Factorio 2.0.77 with Space Age, Quality and Elevated Rails: recipes, plus every signal not in signals.tsv; known names only, never used for internal wiring)
+virtual	signal-any-quality	false	false	false	z	qualities
+item	space-platform-hub	true	false	false		space-related
+item	agricultural-tower	false	false	false	a[agricultural-tower]	agriculture
+item	railgun	false	false	false	a[basic-clips]-h[railgun]	gun
+item	teslagun	false	false	false	a[basic-clips]-h[teslagun]	gun
+item	fusion-reactor-equipment	false	false	false	a[energy-source]-c[fusion-reactor]	equipment
+item	big-mining-drill	false	false	false	a[items]-c[big-mining-drill]	extraction-machine
+item	lightning-rod	false	false	false	a[lightning-rod]	environmental-protection
+item	calcite	false	false	false	a[melting]-a[calcite]	vulcanus-processes
+item	metallic-asteroid-chunk	false	false	false	a[metallic]-e[chunk]	space-material
+item	bioflux	false	false	false	a[organic-processing]-b[bioflux]	agriculture-products
+item	yumako-mash	false	false	false	a[organic-processing]-c[yumako-mash]	agriculture-products
+item	jelly	false	false	false	a[organic-processing]-d[jelly]	agriculture-products
+item	carbon-fiber	false	false	false	a[organic-products]-e[carbon-fiber]	agriculture-products
+item	rail-ramp	false	false	false	a[rail]-b[rail-ramp]	train-transport
+item	rail-support	false	false	false	a[rail]-c[rail-support]	train-transport
+item	scrap	false	false	false	a[scrap]-a[scrap]	fulgora-processes
+item	yumako-seed	false	false	false	a[seeds]-a[yumako-seed]	agriculture-processes
+item	jellynut-seed	false	false	false	a[seeds]-b[jellynut-seed]	agriculture-processes
+item	tree-seed	false	false	false	a[seeds]-b[tree-seed]	nauvis-agriculture
+item	space-platform-foundation	false	false	false	a[space-platform-foundation]	space-platform
+item	turbo-transport-belt	false	false	false	a[transport-belt]-d[turbo-transport-belt]	belt
+item	yumako	false	false	false	b[agriculture]-a[yumako]	agriculture-processes
+item	jellynut	false	false	false	b[agriculture]-b[jellynut]	agriculture-processes
+item	iron-bacteria	false	false	false	b[agriculture]-d[bacteria]-a[iron-bacteria]	agriculture-processes
+item	copper-bacteria	false	false	false	b[agriculture]-d[bacteria]-c[copper-bacteria]	agriculture-processes
+item	battery-mk3-equipment	false	false	false	b[battery]-c[battery-equipment-mk3]	equipment
+item	biochamber	false	false	false	b[biochamber]	agriculture
+item	carbonic-asteroid-chunk	false	false	false	b[carbonic]-e[chunk]	space-material
+item	carbon	false	false	false	b[chemistry]-f[carbon]	raw-material
+item	holmium-ore	false	false	false	b[holmium]-a[holmium-ore]	fulgora-processes
+item	holmium-plate	false	false	false	b[holmium]-c[holmium-plate]	fulgora-processes
+item	superconductor	false	false	false	b[holmium]-d[superconductor]	fulgora-processes
+item	supercapacitor	false	false	false	b[holmium]-f[supercapacitor]	fulgora-processes
+item	lightning-collector	false	false	false	b[lightning-collector]	environmental-protection
+item	fluoroketone-hot-barrel	false	false	false	b[new-fluid]-e[aquilo]-d[fluoroketone-hot]	barrel
+item	fluoroketone-cold-barrel	false	false	false	b[new-fluid]-e[aquilo]-e[fluoroketone-cold]	barrel
+item	space-platform-starter-pack	false	false	false	b[space-platform-starter-pack]	space-rocket
+item	rocket-turret	false	false	false	b[turret]-e[rocket-turret]-a[turret]	turret
+item	tesla-turret	false	false	false	b[turret]-f[tesla-turret]-a[turret]	turret
+item	railgun-turret	false	false	false	b[turret]-g[railgun-turret]-a[turret]	turret
+item	turbo-underground-belt	false	false	false	b[underground-belt]-d[turbo-underground-belt]	belt
+item	cargo-bay	false	false	false	c[cargo-bay]	space-platform
+item	biter-egg	false	false	false	c[eggs]-a[biter-egg]	agriculture-products
+item	pentapod-egg	false	false	false	c[eggs]-b[pentapod-egg]	agriculture-products
+item	heating-tower	false	false	false	c[heating-tower]	environmental-protection
+item	artificial-yumako-soil	false	false	false	c[landfill]-b[artificial-yumako-soil]	terrain
+item	overgrowth-yumako-soil	false	false	false	c[landfill]-c[overgrowth-yumako-soil]	terrain
+item	artificial-jellynut-soil	false	false	false	c[landfill]-d[artificial-jellynut-soil]	terrain
+item	overgrowth-jellynut-soil	false	false	false	c[landfill]-e[overgrowth-jellynut-soil]	terrain
+item	ice-platform	false	false	false	c[landfill]-f[ice-platform]	terrain
+item	foundation	false	false	false	c[landfill]-g[foundation]	terrain
+item	lithium	false	false	false	c[lithium]-a[lithium]	aquilo-processes
+item	lithium-plate	false	false	false	c[lithium]-b[lithium-plate]	aquilo-processes
+item	quantum-processor	false	false	false	c[lithium]-c[quantum-processor]	aquilo-processes
+item	fusion-power-cell	false	false	false	c[lithium]-d[fusion-power-cell]	aquilo-processes
+item	spoilage	false	false	false	c[nutrients]-a[spoilage]	agriculture-processes
+item	nutrients	false	false	false	c[nutrients]-b[nutrients]	agriculture-processes
+item	oxide-asteroid-chunk	false	false	false	c[oxide]-e[chunk]	space-material
+item	turbo-splitter	false	false	false	c[splitter]-d[turbo-splitter]	belt
+item	tungsten-ore	false	false	false	c[tungsten]-a[tungsten-ore]	vulcanus-processes
+item	tungsten-carbide	false	false	false	c[tungsten]-b[tungsten-carbide]	vulcanus-processes
+item	tungsten-plate	false	false	false	c[tungsten]-c[tungsten-plate]	vulcanus-processes
+item	asteroid-collector	false	false	false	d[asteroid-collector]	space-platform
+item	foundry	false	false	false	d[foundry]	smelting-machine
+item	turbo-loader	true	false	false	d[loader]-d[turbo-loader]	belt
+item	promethium-asteroid-chunk	false	false	false	d[promethium]-e[chunk]	space-material
+item	quality-module	false	false	false	d[quality]-a[quality-module-1]	module
+item	quality-module-2	false	false	false	d[quality]-b[quality-module-2]	module
+item	quality-module-3	false	false	false	d[quality]-c[quality-module-3]	module
+item	recycler	false	false	false	d[recycler]	smelting-machine
+item	capture-robot-rocket	false	false	false	d[rocket-launcher]-d[capture]	ammo
+item	crusher	false	false	false	e[crusher]	space-platform
+item	railgun-ammo	false	false	false	e[railgun-ammo]-a[basic]	ammo
+item	tesla-ammo	false	false	false	e[railgun-ammo]-a[basic]	ammo
+item	mech-armor	false	false	false	f[mech-armor]	armor
+item	thruster	false	false	false	f[thruster]	space-platform
+item	electromagnetic-plant	false	false	false	g[electromagnetic-plant]	production-machine
+item	fusion-reactor	false	false	false	g[fusion-energy]-a[reactor]	energy
+item	fusion-generator	false	false	false	g[fusion-energy]-b[generator]	energy
+item	toolbelt-equipment	false	false	false	g[toolbelt]-a[night-vision-equipment]	utility-equipment
+item	metallurgic-science-pack	false	false	false	h	science-pack
+item	cryogenic-plant	false	false	false	h[cryogenic-plant]	production-machine
+item	stack-inserter	false	false	false	h[stack-inserter]	inserter
+item	agricultural-science-pack	false	false	false	i	science-pack
+item	electromagnetic-science-pack	false	false	false	j	science-pack
+item	ice	false	false	false	j[ice]	raw-resource
+item	cryogenic-science-pack	false	false	false	k	science-pack
+item	promethium-science-pack	false	false	false	l	science-pack
+item	captive-biter-spawner	false	false	false	z[biter-nest]	agriculture
+item	biolab	false	false	false	z[z-biolab]	production-machine
+fluid	thruster-fuel	false	false	false	b[new-fluid]-a[space]-a[thruster-fuel]	fluid
+fluid	thruster-oxidizer	false	false	false	b[new-fluid]-a[space]-b[thruster-oxidizer]	fluid
+fluid	lava	false	false	false	b[new-fluid]-b[vulcanus]-a[lava]	fluid
+fluid	molten-iron	false	false	false	b[new-fluid]-b[vulcanus]-a[molten-iron]	fluid
+fluid	molten-copper	false	false	false	b[new-fluid]-b[vulcanus]-b[molten-copper]	fluid
+fluid	holmium-solution	false	false	false	b[new-fluid]-c[fulgora]-a[holmium-solution]	fluid
+fluid	electrolyte	false	false	false	b[new-fluid]-c[fulgora]-b[electrolyte]	fluid
+fluid	ammoniacal-solution	false	false	false	b[new-fluid]-e[aquilo]-a[ammoniacal-solution]	fluid
+fluid	ammonia	false	false	false	b[new-fluid]-e[aquilo]-b[ammonia]	fluid
+fluid	fluorine	false	false	false	b[new-fluid]-e[aquilo]-c[fluorine]	fluid
+fluid	fluoroketone-hot	false	false	false	b[new-fluid]-e[aquilo]-d[fluoroketone-hot]	fluid
+fluid	fluoroketone-cold	false	false	false	b[new-fluid]-e[aquilo]-e[fluoroketone-cold]	fluid
+fluid	lithium-brine	false	false	false	b[new-fluid]-e[aquilo]-f[lithium-brine]	fluid
+fluid	fusion-plasma	false	false	false	b[new-fluid]-e[aquilo]-g[fusion-plasma]	fluid
+recipe	accumulator-recycling	true	false	false		other
+recipe	active-provider-chest-recycling	true	false	false		other
+recipe	advanced-circuit-recycling	true	false	false		other
+recipe	agricultural-tower-recycling	true	false	false		other
+recipe	arithmetic-combinator-recycling	true	false	false		other
+recipe	artificial-jellynut-soil-recycling	true	false	false		other
+recipe	artificial-yumako-soil-recycling	true	false	false		other
+recipe	artillery-shell-recycling	true	false	false		other
+recipe	artillery-turret-recycling	true	false	false		other
+recipe	artillery-wagon-recycling	true	false	false		other
+recipe	assembling-machine-1-recycling	true	false	false		other
+recipe	assembling-machine-2-recycling	true	false	false		other
+recipe	assembling-machine-3-recycling	true	false	false		other
+recipe	asteroid-collector-recycling	true	false	false		other
+recipe	atomic-bomb-recycling	true	false	false		other
+recipe	battery-equipment-recycling	true	false	false		other
+recipe	battery-mk2-equipment-recycling	true	false	false		other
+recipe	battery-mk3-equipment-recycling	true	false	false		other
+recipe	battery-recycling	true	false	false		other
+recipe	beacon-recycling	true	false	false		other
+recipe	belt-immunity-equipment-recycling	true	false	false		other
+recipe	big-electric-pole-recycling	true	false	false		other
+recipe	big-mining-drill-recycling	true	false	false		other
+recipe	biochamber-recycling	true	false	false		other
+recipe	boiler-recycling	true	false	false		other
+recipe	buffer-chest-recycling	true	false	false		other
+recipe	bulk-inserter-recycling	true	false	false		other
+recipe	burner-inserter-recycling	true	false	false		other
+recipe	burner-mining-drill-recycling	true	false	false		other
+recipe	cannon-shell-recycling	true	false	false		other
+recipe	capture-robot-rocket-recycling	true	false	false		other
+recipe	car-recycling	true	false	false		other
+recipe	cargo-bay-recycling	true	false	false		other
+recipe	cargo-landing-pad-recycling	true	false	false		other
+recipe	cargo-wagon-recycling	true	false	false		other
+recipe	centrifuge-recycling	true	false	false		other
+recipe	chemical-plant-recycling	true	false	false		other
+recipe	cliff-explosives-recycling	true	false	false		other
+recipe	cluster-grenade-recycling	true	false	false		other
+recipe	combat-shotgun-recycling	true	false	false		other
+recipe	concrete-recycling	true	false	false		other
+recipe	constant-combinator-recycling	true	false	false		other
+recipe	construction-robot-recycling	true	false	false		other
+recipe	crusher-recycling	true	false	false		other
+recipe	cryogenic-plant-recycling	true	false	false		other
+recipe	decider-combinator-recycling	true	false	false		other
+recipe	defender-capsule-recycling	true	false	false		other
+recipe	destroyer-capsule-recycling	true	false	false		other
+recipe	discharge-defense-equipment-recycling	true	false	false		other
+recipe	display-panel-recycling	true	false	false		other
+recipe	distractor-capsule-recycling	true	false	false		other
+recipe	efficiency-module-2-recycling	true	false	false		other
+recipe	efficiency-module-3-recycling	true	false	false		other
+recipe	efficiency-module-recycling	true	false	false		other
+recipe	electric-engine-unit-recycling	true	false	false		other
+recipe	electric-furnace-recycling	true	false	false		other
+recipe	electric-mining-drill-recycling	true	false	false		other
+recipe	electromagnetic-plant-recycling	true	false	false		other
+recipe	electronic-circuit-recycling	true	false	false		other
+recipe	energy-shield-equipment-recycling	true	false	false		other
+recipe	energy-shield-mk2-equipment-recycling	true	false	false		other
+recipe	engine-unit-recycling	true	false	false		other
+recipe	exoskeleton-equipment-recycling	true	false	false		other
+recipe	explosive-cannon-shell-recycling	true	false	false		other
+recipe	explosive-rocket-recycling	true	false	false		other
+recipe	explosive-uranium-cannon-shell-recycling	true	false	false		other
+recipe	express-loader-recycling	true	false	false		other
+recipe	express-splitter-recycling	true	false	false		other
+recipe	express-transport-belt-recycling	true	false	false		other
+recipe	express-underground-belt-recycling	true	false	false		other
+recipe	fast-inserter-recycling	true	false	false		other
+recipe	fast-loader-recycling	true	false	false		other
+recipe	fast-splitter-recycling	true	false	false		other
+recipe	fast-transport-belt-recycling	true	false	false		other
+recipe	fast-underground-belt-recycling	true	false	false		other
+recipe	fission-reactor-equipment-recycling	true	false	false		other
+recipe	flamethrower-recycling	true	false	false		other
+recipe	flamethrower-turret-recycling	true	false	false		other
+recipe	fluid-wagon-recycling	true	false	false		other
+recipe	flying-robot-frame-recycling	true	false	false		other
+recipe	foundation-recycling	true	false	false		other
+recipe	foundry-recycling	true	false	false		other
+recipe	fusion-generator-recycling	true	false	false		other
+recipe	fusion-reactor-equipment-recycling	true	false	false		other
+recipe	fusion-reactor-recycling	true	false	false		other
+recipe	gate-recycling	true	false	false		other
+recipe	grenade-recycling	true	false	false		other
+recipe	gun-turret-recycling	true	false	false		other
+recipe	heat-exchanger-recycling	true	false	false		other
+recipe	heat-interface-recycling	true	false	false		other
+recipe	heat-pipe-recycling	true	false	false		other
+recipe	heating-tower-recycling	true	false	false		other
+recipe	heavy-armor-recycling	true	false	false		other
+recipe	infinity-chest-recycling	true	false	false		other
+recipe	infinity-pipe-recycling	true	false	false		other
+recipe	inserter-recycling	true	false	false		other
+recipe	item-unknown-recycling	true	false	false		other
+recipe	lab-recycling	true	false	false		other
+recipe	land-mine-recycling	true	false	false		other
+recipe	laser-turret-recycling	true	false	false		other
+recipe	lightning-collector-recycling	true	false	false		other
+recipe	lightning-rod-recycling	true	false	false		other
+recipe	loader-recycling	true	false	false		other
+recipe	locomotive-recycling	true	false	false		other
+recipe	logistic-robot-recycling	true	false	false		other
+recipe	long-handed-inserter-recycling	true	false	false		other
+recipe	low-density-structure-recycling	true	false	false		other
+recipe	mech-armor-recycling	true	false	false		other
+recipe	medium-electric-pole-recycling	true	false	false		other
+recipe	modular-armor-recycling	true	false	false		other
+recipe	night-vision-equipment-recycling	true	false	false		other
+recipe	nuclear-fuel-recycling	true	false	false		uranium-processing
+recipe	nuclear-reactor-recycling	true	false	false		other
+recipe	offshore-pump-recycling	true	false	false		other
+recipe	oil-refinery-recycling	true	false	false		other
+recipe	overgrowth-jellynut-soil-recycling	true	false	false		other
+recipe	overgrowth-yumako-soil-recycling	true	false	false		other
+recipe	passive-provider-chest-recycling	true	false	false		other
+recipe	personal-laser-defense-equipment-recycling	true	false	false		other
+recipe	personal-roboport-equipment-recycling	true	false	false		other
+recipe	personal-roboport-mk2-equipment-recycling	true	false	false		other
+recipe	piercing-rounds-magazine-recycling	true	false	false		other
+recipe	piercing-shotgun-shell-recycling	true	false	false		other
+recipe	pipe-to-ground-recycling	true	false	false		other
+recipe	pistol-recycling	true	false	false		other
+recipe	poison-capsule-recycling	true	false	false		other
+recipe	power-armor-mk2-recycling	true	false	false		other
+recipe	power-armor-recycling	true	false	false		other
+recipe	power-switch-recycling	true	false	false		other
+recipe	processing-unit-recycling	true	false	false		other
+recipe	productivity-module-2-recycling	true	false	false		other
+recipe	productivity-module-3-recycling	true	false	false		other
+recipe	productivity-module-recycling	true	false	false		other
+recipe	programmable-speaker-recycling	true	false	false		other
+recipe	pump-recycling	true	false	false		other
+recipe	pumpjack-recycling	true	false	false		other
+recipe	quality-module-2-recycling	true	false	false		other
+recipe	quality-module-3-recycling	true	false	false		other
+recipe	quality-module-recycling	true	false	false		other
+recipe	quantum-processor-recycling	true	false	false		aquilo-processes
+recipe	radar-recycling	true	false	false		other
+recipe	rail-chain-signal-recycling	true	false	false		other
+recipe	rail-ramp-recycling	true	false	false		other
+recipe	rail-recycling	true	false	false		other
+recipe	rail-signal-recycling	true	false	false		other
+recipe	rail-support-recycling	true	false	false		other
+recipe	railgun-ammo-recycling	true	false	false		other
+recipe	railgun-recycling	true	false	false		other
+recipe	railgun-turret-recycling	true	false	false		other
+recipe	recipe-unknown	true	false	false		other
+recipe	recycler-recycling	true	false	false		other
+recipe	refined-concrete-recycling	true	false	false		other
+recipe	repair-pack-recycling	true	false	false		other
+recipe	requester-chest-recycling	true	false	false		other
+recipe	roboport-recycling	true	false	false		other
+recipe	rocket-launcher-recycling	true	false	false		other
+recipe	rocket-recycling	true	false	false		other
+recipe	rocket-silo-recycling	true	false	false		other
+recipe	rocket-turret-recycling	true	false	false		other
+recipe	selector-combinator-recycling	true	false	false		other
+recipe	shotgun-recycling	true	false	false		other
+recipe	shotgun-shell-recycling	true	false	false		other
+recipe	slowdown-capsule-recycling	true	false	false		other
+recipe	small-electric-pole-recycling	true	false	false		other
+recipe	small-lamp-recycling	true	false	false		other
+recipe	solar-panel-equipment-recycling	true	false	false		other
+recipe	solar-panel-recycling	true	false	false		other
+recipe	space-platform-foundation-recycling	true	false	false		other
+recipe	space-platform-hub-recycling	true	false	false		space-related
+recipe	space-platform-starter-pack-recycling	true	false	false		other
+recipe	speed-module-2-recycling	true	false	false		other
+recipe	speed-module-3-recycling	true	false	false		other
+recipe	speed-module-recycling	true	false	false		other
+recipe	spidertron-recycling	true	false	false		other
+recipe	splitter-recycling	true	false	false		other
+recipe	stack-inserter-recycling	true	false	false		other
+recipe	steam-engine-recycling	true	false	false		other
+recipe	steam-turbine-recycling	true	false	false		other
+recipe	steel-furnace-recycling	true	false	false		other
+recipe	storage-chest-recycling	true	false	false		other
+recipe	storage-tank-recycling	true	false	false		other
+recipe	submachine-gun-recycling	true	false	false		other
+recipe	substation-recycling	true	false	false		other
+recipe	supercapacitor-recycling	true	false	false		fulgora-processes
+recipe	tank-recycling	true	false	false		other
+recipe	tesla-ammo-recycling	true	false	false		other
+recipe	tesla-turret-recycling	true	false	false		other
+recipe	teslagun-recycling	true	false	false		other
+recipe	thruster-recycling	true	false	false		other
+recipe	toolbelt-equipment-recycling	true	false	false		other
+recipe	train-stop-recycling	true	false	false		other
+recipe	transport-belt-recycling	true	false	false		other
+recipe	turbo-loader-recycling	true	false	false		other
+recipe	turbo-splitter-recycling	true	false	false		other
+recipe	turbo-transport-belt-recycling	true	false	false		other
+recipe	turbo-underground-belt-recycling	true	false	false		other
+recipe	underground-belt-recycling	true	false	false		other
+recipe	uranium-cannon-shell-recycling	true	false	false		other
+recipe	uranium-rounds-magazine-recycling	true	false	false		other
+recipe	parameter-0	false	true	false	a	parameters
+recipe	parameter-1	false	true	false	a	parameters
+recipe	parameter-2	false	true	false	a	parameters
+recipe	parameter-3	false	true	false	a	parameters
+recipe	parameter-4	false	true	false	a	parameters
+recipe	parameter-5	false	true	false	a	parameters
+recipe	parameter-6	false	true	false	a	parameters
+recipe	parameter-7	false	true	false	a	parameters
+recipe	parameter-8	false	true	false	a	parameters
+recipe	parameter-9	false	true	false	a	parameters
+recipe	agricultural-tower	false	false	false	a[agricultural-tower]	agriculture
+recipe	ammoniacal-solution-separation	false	false	false	a[ammonia]-a[ammoniacal-solution-separation]	aquilo-processes
+recipe	solid-fuel-from-ammonia	false	false	false	a[ammonia]-b[solid-fuel-from-ammonia]	aquilo-processes
+recipe	ammonia-rocket-fuel	false	false	false	a[ammonia]-c[ammonia-rocket-fuel]	aquilo-processes
+recipe	assembling-machine-1	false	false	false	a[assembling-machine-1]	production-machine
+recipe	automation-science-pack	false	false	false	a[automation-science-pack]	science-pack
+recipe	automation-science-pack-recycling	true	false	false	a[automation-science-pack]	science-pack
+recipe	firearm-magazine	false	false	false	a[basic-clips]-a[firearm-magazine]	ammo
+recipe	pistol	true	false	false	a[basic-clips]-a[pistol]	gun
+recipe	piercing-rounds-magazine	false	false	false	a[basic-clips]-b[piercing-rounds-magazine]	ammo
+recipe	submachine-gun	false	false	false	a[basic-clips]-b[submachine-gun]	gun
+recipe	uranium-rounds-magazine	false	false	false	a[basic-clips]-c[uranium-rounds-magazine]	ammo
+recipe	railgun	false	false	false	a[basic-clips]-h[railgun]	gun
+recipe	teslagun	false	false	false	a[basic-clips]-h[teslagun]	gun
+recipe	iron-gear-wheel	false	false	false	a[basic-intermediates]-a[iron-gear-wheel]	intermediate-product
+recipe	iron-stick	false	false	false	a[basic-intermediates]-b[iron-stick]	intermediate-product
+recipe	copper-cable	false	false	false	a[basic-intermediates]-c[copper-cable]	intermediate-product
+recipe	barrel	false	false	false	a[basic-intermediates]-d[empty-barrel]	intermediate-product
+recipe	crude-oil-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	fluoroketone-cold-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	fluoroketone-hot-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	heavy-oil-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	light-oil-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	lubricant-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	petroleum-gas-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	sulfuric-acid-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	water-barrel-recycling	true	false	false	a[basic-intermediates]-d[empty-barrel]	fill-barrel
+recipe	beacon	false	false	false	a[beacon]	module
+recipe	burner-inserter	false	false	false	a[burner-inserter]	inserter
+recipe	electric-energy-interface-recycling	true	false	false	a[electric-energy-interface]-b[electric-energy-interface]	other
+recipe	solar-panel-equipment	false	false	false	a[energy-source]-a[solar-panel]	equipment
+recipe	fission-reactor-equipment	false	false	false	a[energy-source]-b[fission-reactor]	equipment
+recipe	fusion-reactor-equipment	false	false	false	a[energy-source]-c[fusion-reactor]	equipment
+recipe	small-electric-pole	false	false	false	a[energy]-a[small-electric-pole]	energy-pipe-distribution
+recipe	medium-electric-pole	false	false	false	a[energy]-b[medium-electric-pole]	energy-pipe-distribution
+recipe	big-electric-pole	false	false	false	a[energy]-c[big-electric-pole]	energy-pipe-distribution
+recipe	substation	false	false	false	a[energy]-d[substation]	energy-pipe-distribution
+recipe	empty-water-barrel	false	false	false	a[fluid]-a[water]-a[water]	empty-barrel
+recipe	water-barrel	false	false	false	a[fluid]-a[water]-a[water]	fill-barrel
+recipe	crude-oil-barrel	false	false	false	a[fluid]-b[oil]-a[crude-oil]	fill-barrel
+recipe	empty-crude-oil-barrel	false	false	false	a[fluid]-b[oil]-a[crude-oil]	empty-barrel
+recipe	empty-petroleum-gas-barrel	false	false	false	a[fluid]-b[oil]-b[petroleum-gas]	empty-barrel
+recipe	petroleum-gas-barrel	false	false	false	a[fluid]-b[oil]-b[petroleum-gas]	fill-barrel
+recipe	empty-light-oil-barrel	false	false	false	a[fluid]-b[oil]-c[light-oil]	empty-barrel
+recipe	light-oil-barrel	false	false	false	a[fluid]-b[oil]-c[light-oil]	fill-barrel
+recipe	empty-heavy-oil-barrel	false	false	false	a[fluid]-b[oil]-d[heavy-oil]	empty-barrel
+recipe	heavy-oil-barrel	false	false	false	a[fluid]-b[oil]-d[heavy-oil]	fill-barrel
+recipe	empty-lubricant-barrel	false	false	false	a[fluid]-b[oil]-e[lubricant]	empty-barrel
+recipe	lubricant-barrel	false	false	false	a[fluid]-b[oil]-e[lubricant]	fill-barrel
+recipe	empty-sulfuric-acid-barrel	false	false	false	a[fluid]-b[oil]-f[sulfuric-acid]	empty-barrel
+recipe	sulfuric-acid-barrel	false	false	false	a[fluid]-b[oil]-f[sulfuric-acid]	fill-barrel
+recipe	grenade	false	false	false	a[grenade]-a[normal]	capsule
+recipe	cluster-grenade	false	false	false	a[grenade]-b[cluster]	capsule
+recipe	burner-mining-drill	false	false	false	a[items]-a[burner-mining-drill]	extraction-machine
+recipe	linked-chest-recycling	true	false	false	a[items]-a[linked-chest]	other
+recipe	proxy-container-recycling	true	false	false	a[items]-a[proxy-container]	other
+recipe	wooden-chest	false	false	false	a[items]-a[wooden-chest]	storage
+recipe	electric-mining-drill	false	false	false	a[items]-b[electric-mining-drill]	extraction-machine
+recipe	iron-chest	false	false	false	a[items]-b[iron-chest]	storage
+recipe	big-mining-drill	false	false	false	a[items]-c[big-mining-drill]	extraction-machine
+recipe	bottomless-chest-recycling	true	false	false	a[items]-c[bottomless-chest]	other
+recipe	steel-chest	false	false	false	a[items]-c[steel-chest]	storage
+recipe	light-armor	false	false	false	a[light-armor]	armor
+recipe	small-lamp	false	false	false	a[light]-a[small-lamp]	circuit-network
+recipe	lightning-rod	false	false	false	a[lightning-rod]	environmental-protection
+recipe	calcite-recycling	true	false	false	a[melting]-a[calcite]	vulcanus-processes
+recipe	molten-iron-from-lava	false	false	false	a[melting]-a[lava-a]	vulcanus-processes
+recipe	molten-copper-from-lava	false	false	false	a[melting]-a[lava-b]	vulcanus-processes
+recipe	molten-iron	false	false	false	a[melting]-b[molten-iron]	vulcanus-processes
+recipe	molten-copper	false	false	false	a[melting]-c[molten-copper]	vulcanus-processes
+recipe	metallic-asteroid-chunk-recycling	true	false	false	a[metallic]-e[chunk]	space-material
+recipe	basic-oil-processing	false	false	false	a[oil-processing]-a[basic-oil-processing]	fluid-recipes
+recipe	advanced-oil-processing	false	false	false	a[oil-processing]-b[advanced-oil-processing]	fluid-recipes
+recipe	simple-coal-liquefaction	false	false	false	a[oil-processing]-c[coal-liquefaction]	fluid-recipes
+recipe	coal-liquefaction	false	false	false	a[oil-processing]-d[coal-liquefaction]	fluid-recipes
+recipe	bioflux-recycling	true	false	false	a[organic-processing]-b[bioflux]	agriculture-products
+recipe	yumako-mash-recycling	true	false	false	a[organic-processing]-c[yumako-mash]	agriculture-products
+recipe	jelly-recycling	true	false	false	a[organic-processing]-d[jelly]	agriculture-products
+recipe	rocket-fuel-from-jelly	false	false	false	a[organic-products]-a[rocket-fuel-from-jelly]	agriculture-products
+recipe	biolubricant	false	false	false	a[organic-products]-b[biolubricant]	agriculture-products
+recipe	bioplastic	false	false	false	a[organic-products]-c[bioplastic]	agriculture-products
+recipe	biosulfur	false	false	false	a[organic-products]-d[biosulfur]	agriculture-products
+recipe	carbon-fiber-recycling	true	false	false	a[organic-products]-e[carbon-fiber]	agriculture-products
+recipe	bioflux	false	false	false	a[organic-products]-g[bioflux]	agriculture-products
+recipe	burnt-spoilage	false	false	false	a[organic-products]-h[burnt-spoilage]	agriculture-products
+recipe	carbon-fiber	false	false	false	a[organic-products]-h[carbon-fiber]	agriculture-products
+recipe	pipe	false	false	false	a[pipe]-a[pipe]	energy-pipe-distribution
+recipe	pipe-to-ground	false	false	false	a[pipe]-b[pipe-to-ground]	energy-pipe-distribution
+recipe	rail	false	false	false	a[rail]-a[rail]	train-transport
+recipe	rail-ramp	false	false	false	a[rail]-b[rail-ramp]	train-transport
+recipe	rail-support	false	false	false	a[rail]-c[rail-support]	train-transport
+recipe	logistic-robot	false	false	false	a[robot]-a[logistic-robot]	logistic-network
+recipe	construction-robot	false	false	false	a[robot]-b[construction-robot]	logistic-network
+recipe	rocket-silo	false	false	false	a[rocket-silo]	space-interactors
+recipe	wood-processing	false	false	false	a[seeds]-a[wood-processing]	nauvis-agriculture
+recipe	yumako-processing	false	false	false	a[seeds]-a[yumako-processing]	agriculture-processes
+recipe	yumako-seed-recycling	true	false	false	a[seeds]-a[yumako-seed]	agriculture-processes
+recipe	jellynut-processing	false	false	false	a[seeds]-b[jellynut-processing]	agriculture-processes
+recipe	jellynut-seed-recycling	true	false	false	a[seeds]-b[jellynut-seed]	agriculture-processes
+recipe	tree-seed-recycling	true	false	false	a[seeds]-b[tree-seed]	nauvis-agriculture
+recipe	energy-shield-equipment	false	false	false	a[shield]-a[energy-shield-equipment]	military-equipment
+recipe	energy-shield-mk2-equipment	false	false	false	a[shield]-b[energy-shield-equipment-mk2]	military-equipment
+recipe	firearm-magazine-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	iron-chest-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	iron-gear-wheel-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	iron-plate	false	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	iron-plate-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	iron-stick-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	light-armor-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	pipe-recycling	true	false	false	a[smelting]-a[iron-plate]	raw-material
+recipe	copper-cable-recycling	true	false	false	a[smelting]-b[copper-plate]	raw-material
+recipe	copper-plate	false	false	false	a[smelting]-b[copper-plate]	raw-material
+recipe	copper-plate-recycling	true	false	false	a[smelting]-b[copper-plate]	raw-material
+recipe	barrel-recycling	true	false	false	a[smelting]-c[steel-plate]	intermediate-product
+recipe	steel-chest-recycling	true	false	false	a[smelting]-c[steel-plate]	raw-material
+recipe	steel-plate	false	false	false	a[smelting]-c[steel-plate]	raw-material
+recipe	steel-plate-recycling	true	false	false	a[smelting]-c[steel-plate]	raw-material
+recipe	space-platform-foundation	false	false	false	a[space-platform-foundation]	space-platform
+recipe	speed-module	false	false	false	a[speed]-a[speed-module-1]	module
+recipe	speed-module-2	false	false	false	a[speed]-b[speed-module-2]	module
+recipe	speed-module-3	false	false	false	a[speed]-c[speed-module-3]	module
+recipe	stone-brick	false	false	false	a[stone-brick]	terrain
+recipe	stone-brick-recycling	true	false	false	a[stone-brick]	terrain
+recipe	stone-wall-recycling	true	false	false	a[stone-brick]	terrain
+recipe	stone-furnace	false	false	false	a[stone-furnace]	smelting-machine
+recipe	stone-wall	false	false	false	a[stone-wall]-a[stone-wall]	defensive-structure
+recipe	thruster-fuel	false	false	false	a[thruster-fuel]	space-processing
+recipe	transport-belt	false	false	false	a[transport-belt]-a[transport-belt]	belt
+recipe	fast-transport-belt	false	false	false	a[transport-belt]-b[fast-transport-belt]	belt
+recipe	express-transport-belt	false	false	false	a[transport-belt]-c[express-transport-belt]	belt
+recipe	turbo-transport-belt	false	false	false	a[transport-belt]-d[turbo-transport-belt]	belt
+recipe	scrap-recycling	false	false	false	a[trash]-a[trash-recycling]	fulgora-processes
+recipe	uranium-processing	false	false	false	a[uranium-processing]-a[uranium-processing]	uranium-processing
+recipe	uranium-235-recycling	true	false	false	a[uranium-processing]-b[uranium-235]	uranium-processing
+recipe	uranium-238-recycling	true	false	false	a[uranium-processing]-c[uranium-238]	uranium-processing
+recipe	gate	false	false	false	a[wall]-b[gate]	defensive-structure
+recipe	wood-recycling	true	false	false	a[wood]	raw-resource
+recipe	wooden-chest-recycling	true	false	false	a[wood]	raw-resource
+recipe	metallic-asteroid-crushing	false	false	false	b-a-a	space-crushing
+recipe	carbonic-asteroid-crushing	false	false	false	b-a-b	space-crushing
+recipe	oxide-asteroid-crushing	false	false	false	b-a-c	space-crushing
+recipe	metallic-asteroid-reprocessing	false	false	false	b-b-a	space-crushing
+recipe	carbonic-asteroid-reprocessing	false	false	false	b-b-b	space-crushing
+recipe	oxide-asteroid-reprocessing	false	false	false	b-b-c	space-crushing
+recipe	personal-laser-defense-equipment	false	false	false	b[active-defense]-a[personal-laser-defense-equipment]	military-equipment
+recipe	discharge-defense-equipment	false	false	false	b[active-defense]-b[discharge-defense-equipment]-a[equipment]	military-equipment
+recipe	advanced-thruster-fuel	false	false	false	b[advanced-thruster-fuel]	space-processing
+recipe	yumako-recycling	true	false	false	b[agriculture]-a[yumako]	agriculture-processes
+recipe	jellynut-recycling	true	false	false	b[agriculture]-b[jellynut]	agriculture-processes
+recipe	iron-bacteria	false	false	false	b[agriculture]-d[bacteria]-a[iron-bacteria]	agriculture-processes
+recipe	iron-bacteria-recycling	true	false	false	b[agriculture]-d[bacteria]-a[iron-bacteria]	agriculture-processes
+recipe	iron-bacteria-cultivation	false	false	false	b[agriculture]-d[bacteria]-b[iron-bacteria-cultivation]	agriculture-processes
+recipe	copper-bacteria	false	false	false	b[agriculture]-d[bacteria]-c[copper-bacteria]	agriculture-processes
+recipe	copper-bacteria-recycling	true	false	false	b[agriculture]-d[bacteria]-c[copper-bacteria]	agriculture-processes
+recipe	copper-bacteria-cultivation	false	false	false	b[agriculture]-d[bacteria]-d[copper-bacteria-cultivation]	agriculture-processes
+recipe	assembling-machine-2	false	false	false	b[assembling-machine-2]	production-machine
+recipe	battery-equipment	false	false	false	b[battery]-a[battery-equipment]	equipment
+recipe	battery-mk2-equipment	false	false	false	b[battery]-b[battery-equipment-mk2]	equipment
+recipe	battery-mk3-equipment	false	false	false	b[battery]-c[battery-equipment-mk3]	equipment
+recipe	biochamber	false	false	false	b[biochamber]	agriculture
+recipe	carbonic-asteroid-chunk-recycling	true	false	false	b[carbonic]-e[chunk]	space-material
+recipe	casting-iron	false	false	false	b[casting]-a[casting-iron]	vulcanus-processes
+recipe	casting-copper	false	false	false	b[casting]-b[casting-copper]	vulcanus-processes
+recipe	casting-steel	false	false	false	b[casting]-c[casting-steel]	vulcanus-processes
+recipe	casting-iron-gear-wheel	false	false	false	b[casting]-d[casting-iron-gear-wheel]	vulcanus-processes
+recipe	casting-iron-stick	false	false	false	b[casting]-e[casting-iron-stick]	vulcanus-processes
+recipe	casting-pipe	false	false	false	b[casting]-f[casting-pipe]	energy-pipe-distribution
+recipe	casting-low-density-structure	false	false	false	b[casting]-f[low-density-structure]	vulcanus-processes
+recipe	casting-pipe-to-ground	false	false	false	b[casting]-g[casting-pipe-to-ground]	energy-pipe-distribution
+recipe	concrete-from-molten-iron	false	false	false	b[casting]-g[concrete]	vulcanus-processes
+recipe	casting-copper-cable	false	false	false	b[casting]-h[casting-copper-cable]	vulcanus-processes
+recipe	rocket-fuel-recycling	true	false	false	b[chemistry]-a[solid-fuel]	raw-material
+recipe	solid-fuel-recycling	true	false	false	b[chemistry]-a[solid-fuel]	raw-material
+recipe	plastic-bar	false	false	false	b[chemistry]-b[plastic-bar]	raw-material
+recipe	plastic-bar-recycling	true	false	false	b[chemistry]-b[plastic-bar]	raw-material
+recipe	sulfur	false	false	false	b[chemistry]-c[sulfur]	raw-material
+recipe	sulfur-recycling	true	false	false	b[chemistry]-c[sulfur]	raw-material
+recipe	battery	false	false	false	b[chemistry]-d[battery]	raw-material
+recipe	explosives	false	false	false	b[chemistry]-e[explosives]	raw-material
+recipe	explosives-recycling	true	false	false	b[chemistry]-e[explosives]	raw-material
+recipe	carbon	false	false	false	b[chemistry]-f[carbon]	raw-material
+recipe	carbon-recycling	true	false	false	b[chemistry]-f[carbon]	raw-material
+recipe	electronic-circuit	false	false	false	b[circuits]-a[electronic-circuit]	intermediate-product
+recipe	advanced-circuit	false	false	false	b[circuits]-b[advanced-circuit]	intermediate-product
+recipe	processing-unit	false	false	false	b[circuits]-c[processing-unit]	intermediate-product
+recipe	coal-recycling	true	false	false	b[coal]	raw-resource
+recipe	concrete	false	false	false	b[concrete]-a[plain]	terrain
+recipe	hazard-concrete-recycling	true	false	false	b[concrete]-a[plain]	terrain
+recipe	hazard-concrete	false	false	false	b[concrete]-b[hazard]	terrain
+recipe	refined-concrete	false	false	false	b[concrete]-c[refined]	terrain
+recipe	refined-hazard-concrete-recycling	true	false	false	b[concrete]-c[refined]	terrain
+recipe	refined-hazard-concrete	false	false	false	b[concrete]-d[refined-hazard]	terrain
+recipe	heavy-oil-cracking	false	false	false	b[fluid-chemistry]-a[heavy-oil-cracking]	fluid-recipes
+recipe	light-oil-cracking	false	false	false	b[fluid-chemistry]-b[light-oil-cracking]	fluid-recipes
+recipe	solid-fuel-from-petroleum-gas	false	false	false	b[fluid-chemistry]-c[solid-fuel-from-petroleum-gas]	fluid-recipes
+recipe	solid-fuel-from-light-oil	false	false	false	b[fluid-chemistry]-d[solid-fuel-from-light-oil]	fluid-recipes
+recipe	solid-fuel-from-heavy-oil	false	false	false	b[fluid-chemistry]-e[solid-fuel-from-heavy-oil]	fluid-recipes
+recipe	storage-tank	false	false	false	b[fluid]-a[storage-tank]	storage
+recipe	offshore-pump	false	false	false	b[fluids]-a[offshore-pump]	extraction-machine
+recipe	pumpjack	false	false	false	b[fluids]-b[pumpjack]	extraction-machine
+recipe	fluoroketone	false	false	false	b[fluoroketone]-a[fluoroketone]	aquilo-processes
+recipe	fluoroketone-cooling	false	false	false	b[fluoroketone]-b[fluoroketone-cooling]	aquilo-processes
+recipe	heat-interface	true	false	false	b[heat-interface]	other
+recipe	heavy-armor	false	false	false	b[heavy-armor]	armor
+recipe	holmium-ore-recycling	true	false	false	b[holmium]-a[holmium-ore]	fulgora-processes
+recipe	holmium-solution	false	false	false	b[holmium]-b[holmium-solution]	fulgora-processes
+recipe	holmium-plate	false	false	false	b[holmium]-c[holmium-plate]	fulgora-processes
+recipe	holmium-plate-recycling	true	false	false	b[holmium]-c[holmium-plate]	fulgora-processes
+recipe	superconductor	false	false	false	b[holmium]-d[superconductor]	fulgora-processes
+recipe	superconductor-recycling	true	false	false	b[holmium]-d[superconductor]	fulgora-processes
+recipe	electrolyte	false	false	false	b[holmium]-e[electrolyte]	fulgora-processes
+recipe	supercapacitor	false	false	false	b[holmium]-f[supercapacitor]	fulgora-processes
+recipe	inserter	false	false	false	b[inserter]	inserter
+recipe	lane-splitter-recycling	true	false	false	b[items]-b[lane-splitter]	other
+recipe	linked-belt-recycling	true	false	false	b[items]-b[linked-belt]	other
+recipe	one-way-valve-recycling	true	false	false	b[items]-o[one-way-valve]	other
+recipe	overflow-valve-recycling	true	false	false	b[items]-o[overflow-valve]	other
+recipe	top-up-valve-recycling	true	false	false	b[items]-o[top-up-valve]	other
+recipe	lightning-collector	false	false	false	b[lightning-collector]	environmental-protection
+recipe	logistic-science-pack	false	false	false	b[logistic-science-pack]	science-pack
+recipe	logistic-science-pack-recycling	true	false	false	b[logistic-science-pack]	science-pack
+recipe	fish-breeding	false	false	false	b[nauvis-agriculture]-b[fish-breeding]	nauvis-agriculture
+recipe	nutrients-from-fish	false	false	false	b[nauvis-agriculture]-c[nutrients-from-fish]	nauvis-agriculture
+recipe	nutrients-from-biter-egg	false	false	false	b[nauvis-agriculture]-d[nutrients-from-biter-egg]	nauvis-agriculture
+recipe	empty-fluoroketone-hot-barrel	false	false	false	b[new-fluid]-e[aquilo]-d[fluoroketone-hot]	empty-barrel
+recipe	fluoroketone-hot-barrel	false	false	false	b[new-fluid]-e[aquilo]-d[fluoroketone-hot]	fill-barrel
+recipe	empty-fluoroketone-cold-barrel	false	false	false	b[new-fluid]-e[aquilo]-e[fluoroketone-cold]	empty-barrel
+recipe	fluoroketone-cold-barrel	false	false	false	b[new-fluid]-e[aquilo]-e[fluoroketone-cold]	fill-barrel
+recipe	car	false	false	false	b[personal-transport]-a[car]	transport
+recipe	tank	false	false	false	b[personal-transport]-b[tank]	transport
+recipe	spidertron	false	false	false	b[personal-transport]-c[spidertron]-a[spider]	transport
+recipe	pump	false	false	false	b[pipe]-c[pump]	energy-pipe-distribution
+recipe	poison-capsule	false	false	false	b[poison-capsule]	capsule
+recipe	repair-pack	false	false	false	b[repair]-a[repair-pack]	tool
+recipe	rocket-part	false	false	false	b[rocket-part]	space-interactors
+recipe	shotgun	false	false	false	b[shotgun]-a[basic]	gun
+recipe	shotgun-shell	false	false	false	b[shotgun]-a[basic]	ammo
+recipe	combat-shotgun	false	false	false	b[shotgun]-a[combat]	gun
+recipe	piercing-shotgun-shell	false	false	false	b[shotgun]-b[piercing]	ammo
+recipe	space-platform-starter-pack	false	false	false	b[space-platform-starter-pack]	space-rocket
+recipe	boiler	false	false	false	b[steam-power]-a[boiler]	energy
+recipe	steam-engine	false	false	false	b[steam-power]-b[steam-engine]	energy
+recipe	steel-furnace	false	false	false	b[steel-furnace]	smelting-machine
+recipe	active-provider-chest	false	false	false	b[storage]-c[active-provider-chest]	logistic-network
+recipe	passive-provider-chest	false	false	false	b[storage]-c[passive-provider-chest]	logistic-network
+recipe	storage-chest	false	false	false	b[storage]-c[storage-chest]	logistic-network
+recipe	buffer-chest	false	false	false	b[storage]-d[buffer-chest]	logistic-network
+recipe	requester-chest	false	false	false	b[storage]-e[requester-chest]	logistic-network
+recipe	train-stop	false	false	false	b[train-automation]-a[train-stop]	train-transport
+recipe	rail-signal	false	false	false	b[train-automation]-b[rail-signal]	train-transport
+recipe	rail-chain-signal	false	false	false	b[train-automation]-c[rail-chain-signal]	train-transport
+recipe	gun-turret	false	false	false	b[turret]-a[gun-turret]	turret
+recipe	laser-turret	false	false	false	b[turret]-b[laser-turret]	turret
+recipe	flamethrower-turret	false	false	false	b[turret]-c[flamethrower-turret]	turret
+recipe	artillery-turret	false	false	false	b[turret]-d[artillery-turret]-a[turret]	turret
+recipe	rocket-turret	false	false	false	b[turret]-e[rocket-turret]-a[turret]	turret
+recipe	tesla-turret	false	false	false	b[turret]-f[tesla-turret]-a[turret]	turret
+recipe	railgun-turret	false	false	false	b[turret]-g[railgun-turret]-a[turret]	turret
+recipe	underground-belt	false	false	false	b[underground-belt]-a[underground-belt]	belt
+recipe	fast-underground-belt	false	false	false	b[underground-belt]-b[fast-underground-belt]	belt
+recipe	express-underground-belt	false	false	false	b[underground-belt]-c[express-underground-belt]	belt
+recipe	turbo-underground-belt	false	false	false	b[underground-belt]-d[turbo-underground-belt]	belt
+recipe	uranium-fuel-cell	false	false	false	b[uranium-products]-a[uranium-fuel-cell]	uranium-processing
+recipe	uranium-fuel-cell-recycling	true	false	false	b[uranium-products]-a[uranium-fuel-cell]	uranium-processing
+recipe	depleted-uranium-fuel-cell-recycling	true	false	false	b[uranium-products]-b[depleted-uranium-fuel-cell]	uranium-processing
+recipe	nuclear-fuel-reprocessing	false	false	false	b[uranium-products]-b[nuclear-fuel-reprocessing]	uranium-processing
+recipe	kovarex-enrichment-process	false	false	false	b[uranium-products]-c[kovarex-enrichment-process]	uranium-processing
+recipe	nuclear-fuel	false	false	false	b[uranium-products]-d[nuclear-fuel]	uranium-processing
+recipe	advanced-metallic-asteroid-crushing	false	false	false	c-a-b	space-crushing
+recipe	engine-unit	false	false	false	c[advanced-intermediates]-a[engine-unit]	intermediate-product
+recipe	electric-engine-unit	false	false	false	c[advanced-intermediates]-b[electric-engine-unit]	intermediate-product
+recipe	flying-robot-frame	false	false	false	c[advanced-intermediates]-c[flying-robot-frame]	intermediate-product
+recipe	assembling-machine-3	false	false	false	c[assembling-machine-3]	production-machine
+recipe	blueprint-recycling	true	false	false	c[automated-construction]-a[blueprint]	tool
+recipe	deconstruction-planner-recycling	true	false	false	c[automated-construction]-b[deconstruction-planner]	tool
+recipe	upgrade-planner-recycling	true	false	false	c[automated-construction]-c[upgrade-planner]	tool
+recipe	blueprint-book-recycling	true	false	false	c[automated-construction]-d[blueprint-book]	tool
+recipe	belt-immunity-equipment	false	false	false	c[belt-immunity]-a[belt-immunity]	utility-equipment
+recipe	cargo-bay	false	false	false	c[cargo-bay]	space-platform
+recipe	cargo-landing-pad	false	false	false	c[cargo-landing-pad]	space-interactors
+recipe	arithmetic-combinator	false	false	false	c[combinators]-a[arithmetic-combinator]	circuit-network
+recipe	decider-combinator	false	false	false	c[combinators]-b[decider-combinator]	circuit-network
+recipe	selector-combinator	false	false	false	c[combinators]-c[selector-combinator]	circuit-network
+recipe	constant-combinator	false	false	false	c[combinators]-d[constant-combinator]	circuit-network
+recipe	efficiency-module	false	false	false	c[efficiency]-a[efficiency-module-1]	module
+recipe	efficiency-module-2	false	false	false	c[efficiency]-b[efficiency-module-2]	module
+recipe	efficiency-module-3	false	false	false	c[efficiency]-c[efficiency-module-3]	module
+recipe	biter-egg	false	false	false	c[eggs]-a[biter-egg]	agriculture-products
+recipe	biter-egg-recycling	true	false	false	c[eggs]-a[biter-egg]	agriculture-products
+recipe	pentapod-egg-recycling	true	false	false	c[eggs]-b[pentapod-egg]	agriculture-products
+recipe	electric-furnace	false	false	false	c[electric-furnace]	smelting-machine
+recipe	heating-tower	false	false	false	c[heating-tower]	environmental-protection
+recipe	infinity-cargo-wagon-recycling	true	false	false	c[item]-o[infinity-cargo-wagon]	other
+recipe	infinity-chest	true	false	false	c[item]-o[infinity-chest]	other
+recipe	landfill	false	false	false	c[landfill]-a[dirt]	terrain
+recipe	landfill-recycling	true	false	false	c[landfill]-a[dirt]	terrain
+recipe	artificial-yumako-soil	false	false	false	c[landfill]-b[artificial-yumako-soil]	terrain
+recipe	overgrowth-yumako-soil	false	false	false	c[landfill]-c[overgrowth-yumako-soil]	terrain
+recipe	artificial-jellynut-soil	false	false	false	c[landfill]-d[artificial-jellynut-soil]	terrain
+recipe	overgrowth-jellynut-soil	false	false	false	c[landfill]-e[overgrowth-jellynut-soil]	terrain
+recipe	ice-platform	false	false	false	c[landfill]-f[ice-platform]	terrain
+recipe	foundation	false	false	false	c[landfill]-g[foundation]	terrain
+recipe	lithium	false	false	false	c[lithium]-a[lithium]	aquilo-processes
+recipe	lithium-recycling	true	false	false	c[lithium]-a[lithium]	aquilo-processes
+recipe	lithium-plate	false	false	false	c[lithium]-b[lithium-plate]	aquilo-processes
+recipe	lithium-plate-recycling	true	false	false	c[lithium]-b[lithium-plate]	aquilo-processes
+recipe	quantum-processor	false	false	false	c[lithium]-c[quantum-processor]	aquilo-processes
+recipe	fusion-power-cell	false	false	false	c[lithium]-d[fusion-power-cell]	aquilo-processes
+recipe	fusion-power-cell-recycling	true	false	false	c[lithium]-d[fusion-power-cell]	aquilo-processes
+recipe	long-handed-inserter	false	false	false	c[long-handed-inserter]	inserter
+recipe	military-science-pack	false	false	false	c[military-science-pack]	science-pack
+recipe	military-science-pack-recycling	true	false	false	c[military-science-pack]	science-pack
+recipe	modular-armor	false	false	false	c[modular-armor]	armor
+recipe	nutrients-recycling	true	false	false	c[nutrients]-a[spoilage]	agriculture-processes
+recipe	spoilage-recycling	true	false	false	c[nutrients]-a[spoilage]	agriculture-processes
+recipe	nutrients-from-spoilage	false	false	false	c[nutrients]-c[nutrients-from-spoilage]	agriculture-processes
+recipe	nutrients-from-yumako-mash	false	false	false	c[nutrients]-d[nutrients-from-yumako-mash]	agriculture-processes
+recipe	nutrients-from-bioflux	false	false	false	c[nutrients]-e[nutrients-from-bioflux]	agriculture-processes
+recipe	lubricant	false	false	false	c[oil-products]-a[lubricant]	fluid-recipes
+recipe	sulfuric-acid	false	false	false	c[oil-products]-b[sulfuric-acid]	fluid-recipes
+recipe	oxide-asteroid-chunk-recycling	true	false	false	c[oxide]-e[chunk]	space-material
+recipe	productivity-module	false	false	false	c[productivity]-a[productivity-module-1]	module
+recipe	productivity-module-2	false	false	false	c[productivity]-b[productivity-module-2]	module
+recipe	productivity-module-3	false	false	false	c[productivity]-c[productivity-module-3]	module
+recipe	locomotive	false	false	false	c[rolling-stock]-a[locomotive]	train-transport
+recipe	cargo-wagon	false	false	false	c[rolling-stock]-b[cargo-wagon]	train-transport
+recipe	fluid-wagon	false	false	false	c[rolling-stock]-c[fluid-wagon]	train-transport
+recipe	artillery-wagon	false	false	false	c[rolling-stock]-d[artillery-wagon]	train-transport
+recipe	roboport	false	false	false	c[signal]-a[roboport]	logistic-network
+recipe	slowdown-capsule	false	false	false	c[slowdown-capsule]	capsule
+recipe	splitter	false	false	false	c[splitter]-a[splitter]	belt
+recipe	fast-splitter	false	false	false	c[splitter]-b[fast-splitter]	belt
+recipe	express-splitter	false	false	false	c[splitter]-c[express-splitter]	belt
+recipe	turbo-splitter	false	false	false	c[splitter]-d[turbo-splitter]	belt
+recipe	thruster-oxidizer	false	false	false	c[thruster-oxidizer]	space-processing
+recipe	tungsten-ore-recycling	true	false	false	c[tungsten]-a[tungsten-ore]	vulcanus-processes
+recipe	tungsten-carbide	false	false	false	c[tungsten]-b[tungsten-carbide]	vulcanus-processes
+recipe	tungsten-carbide-recycling	true	false	false	c[tungsten]-b[tungsten-carbide]	vulcanus-processes
+recipe	tungsten-plate	false	false	false	c[tungsten]-c[tungsten-plate]	vulcanus-processes
+recipe	tungsten-plate-recycling	true	false	false	c[tungsten]-c[tungsten-plate]	vulcanus-processes
+recipe	advanced-thruster-oxidizer	false	false	false	d[advanced-thruster-oxydizer]	space-processing
+recipe	asteroid-collector	false	false	false	d[asteroid-collector]	space-platform
+recipe	cannon-shell	false	false	false	d[cannon-shell]-a[basic]	ammo
+recipe	explosive-cannon-shell	false	false	false	d[cannon-shell]-c[explosive]	ammo
+recipe	uranium-cannon-shell	false	false	false	d[cannon-shell]-c[uranium]	ammo
+recipe	chemical-science-pack	false	false	false	d[chemical-science-pack]	science-pack
+recipe	chemical-science-pack-recycling	true	false	false	d[chemical-science-pack]	science-pack
+recipe	cliff-explosives	false	false	false	d[cliff-explosives]	terrain
+recipe	defender-capsule	false	false	false	d[defender]-b[capsule]	capsule
+recipe	exoskeleton-equipment	false	false	false	d[exoskeleton]-a[exoskeleton-equipment]	utility-equipment
+recipe	explosive-uranium-cannon-shell	false	false	false	d[explosive-cannon-shell]-c[uranium]	ammo
+recipe	artillery-shell	false	false	false	d[explosive-cannon-shell]-d[artillery]	ammo
+recipe	fast-inserter	false	false	false	d[fast-inserter]	inserter
+recipe	foundry	false	false	false	d[foundry]	smelting-machine
+recipe	infinity-pipe	true	false	false	d[item]-o[infinity-pipe]	other
+recipe	loader	true	false	false	d[loader]-a[basic-loader]	belt
+recipe	fast-loader	true	false	false	d[loader]-b[fast-loader]	belt
+recipe	express-loader	true	false	false	d[loader]-c[express-loader]	belt
+recipe	turbo-loader	true	false	false	d[loader]-d[turbo-loader]	belt
+recipe	pentapod-egg	false	false	false	d[organic-processing]-a[pentapod-egg]	agriculture-processes
+recipe	acid-neutralisation	false	false	false	d[other-chemistry]-a[acid-neutralisation]	fluid-recipes
+recipe	steam-condensation	false	false	false	d[other-chemistry]-b[steam-condensation]	fluid-recipes
+recipe	ice-melting	false	false	false	d[other-chemistry]-c[ice-melting]	fluid-recipes
+recipe	power-switch	false	false	false	d[other]-a[power-switch]	circuit-network
+recipe	programmable-speaker	false	false	false	d[other]-b[programmable-speaker]	circuit-network
+recipe	power-armor	false	false	false	d[power-armor]	armor
+recipe	promethium-asteroid-chunk-recycling	true	false	false	d[promethium]-e[chunk]	space-material
+recipe	quality-module	false	false	false	d[quality]-a[quality-module-1]	module
+recipe	quality-module-2	false	false	false	d[quality]-b[quality-module-2]	module
+recipe	quality-module-3	false	false	false	d[quality]-c[quality-module-3]	module
+recipe	radar	false	false	false	d[radar]-a[radar]	defensive-structure
+recipe	recycler	false	false	false	d[recycler]	smelting-machine
+recipe	oil-refinery	false	false	false	d[refinery]	production-machine
+recipe	rocket-launcher	false	false	false	d[rocket-launcher]	gun
+recipe	rocket	false	false	false	d[rocket-launcher]-a[basic]	ammo
+recipe	explosive-rocket	false	false	false	d[rocket-launcher]-b[explosive]	ammo
+recipe	atomic-bomb	false	false	false	d[rocket-launcher]-d[atomic-bomb]	ammo
+recipe	capture-robot-rocket	false	false	false	d[rocket-launcher]-d[capture]	ammo
+recipe	low-density-structure	false	false	false	d[rocket-parts]-a[low-density-structure]	intermediate-product
+recipe	rocket-fuel	false	false	false	d[rocket-parts]-b[rocket-fuel]	intermediate-product
+recipe	solar-panel	false	false	false	d[solar-panel]-a[solar-panel]	energy
+recipe	stone-furnace-recycling	true	false	false	d[stone]	raw-resource
+recipe	stone-recycling	true	false	false	d[stone]	raw-resource
+recipe	accumulator	false	false	false	e[accumulator]-a[accumulator]	energy
+recipe	advanced-carbonic-asteroid-crushing	false	false	false	e[advanced-carbonic-asteroid-crushing]	space-crushing
+recipe	selection-tool-recycling	true	false	false	e[automated-construction]-a[blueprint]	other
+recipe	chemical-plant	false	false	false	e[chemical-plant]	production-machine
+recipe	crusher	false	false	false	e[crusher]	space-platform
+recipe	distractor-capsule	false	false	false	e[distractor]-b[capsule]	capsule
+recipe	flamethrower	false	false	false	e[flamethrower]	gun
+recipe	flamethrower-ammo	false	false	false	e[flamethrower]	ammo
+recipe	flamethrower-ammo-recycling	true	false	false	e[flamethrower]	ammo
+recipe	iron-ore-recycling	true	false	false	e[iron-ore]	raw-resource
+recipe	power-armor-mk2	false	false	false	e[power-armor-mk2]	armor
+recipe	production-science-pack	false	false	false	e[production-science-pack]	science-pack
+recipe	production-science-pack-recycling	true	false	false	e[production-science-pack]	science-pack
+recipe	railgun-ammo	false	false	false	e[railgun-ammo]-a[basic]	ammo
+recipe	tesla-ammo	false	false	false	e[railgun-ammo]-a[basic]	ammo
+recipe	personal-roboport-equipment	false	false	false	e[robotics]-a[personal-roboport-equipment]	utility-equipment
+recipe	personal-roboport-mk2-equipment	false	false	false	e[robotics]-b[personal-roboport-mk2-equipment]	utility-equipment
+recipe	advanced-oxide-asteroid-crushing	false	false	false	f[advanced-oxide-asteroid-crushing]	space-crushing
+recipe	bulk-inserter	false	false	false	f[bulk-inserter]	inserter
+recipe	centrifuge	false	false	false	f[centrifuge]	production-machine
+recipe	copper-ore-recycling	true	false	false	f[copper-ore]	raw-resource
+recipe	destroyer-capsule	false	false	false	f[destroyer]-b[capsule]	capsule
+recipe	land-mine	false	false	false	f[land-mine]	defensive-structure
+recipe	mech-armor	false	false	false	f[mech-armor]	armor
+recipe	night-vision-equipment	false	false	false	f[night-vision]-a[night-vision-equipment]	utility-equipment
+recipe	nuclear-reactor	false	false	false	f[nuclear-energy]-a[reactor]	energy
+recipe	heat-pipe	false	false	false	f[nuclear-energy]-b[heat-pipe]	energy
+recipe	heat-exchanger	false	false	false	f[nuclear-energy]-c[heat-exchanger]	energy
+recipe	steam-turbine	false	false	false	f[nuclear-energy]-d[steam-turbine]	energy
+recipe	thruster	false	false	false	f[thruster]	space-platform
+recipe	utility-science-pack	false	false	false	f[utility-science-pack]	science-pack
+recipe	utility-science-pack-recycling	true	false	false	f[utility-science-pack]	science-pack
+recipe	electromagnetic-plant	false	false	false	g[electromagnetic-plant]	production-machine
+recipe	fusion-reactor	false	false	false	g[fusion-energy]-a[reactor]	energy
+recipe	fusion-generator	false	false	false	g[fusion-energy]-b[generator]	energy
+recipe	space-science-pack	false	false	false	g[space-science-pack]	science-pack
+recipe	space-science-pack-recycling	true	false	false	g[space-science-pack]	science-pack
+recipe	toolbelt-equipment	false	false	false	g[toolbelt]-a[night-vision-equipment]	utility-equipment
+recipe	uranium-ore-recycling	true	false	false	g[uranium-ore]	raw-resource
+recipe	metallurgic-science-pack	false	false	false	h	science-pack
+recipe	metallurgic-science-pack-recycling	true	false	false	h	science-pack
+recipe	cryogenic-plant	false	false	false	h[cryogenic-plant]	production-machine
+recipe	raw-fish-recycling	true	false	false	h[raw-fish]	raw-resource
+recipe	stack-inserter	false	false	false	h[stack-inserter]	inserter
+recipe	agricultural-science-pack	false	false	false	i	science-pack
+recipe	agricultural-science-pack-recycling	true	false	false	i	science-pack
+recipe	electromagnetic-science-pack	false	false	false	j	science-pack
+recipe	electromagnetic-science-pack-recycling	true	false	false	j	science-pack
+recipe	ice-platform-recycling	true	false	false	j[ice]	raw-resource
+recipe	ice-recycling	true	false	false	j[ice]	raw-resource
+recipe	cryogenic-science-pack	false	false	false	k	science-pack
+recipe	cryogenic-science-pack-recycling	true	false	false	k	science-pack
+recipe	promethium-science-pack	false	false	false	l	science-pack
+recipe	promethium-science-pack-recycling	true	false	false	l	science-pack
+recipe	coal-synthesis	false	false	false	m	raw-material
+recipe	display-panel	false	false	false	s[display-panel]	circuit-network
+recipe	simple-entity-with-force-recycling	true	false	false	s[simple-entity-with-force]-f[simple-entity-with-force]	other
+recipe	simple-entity-with-owner-recycling	true	false	false	s[simple-entity-with-owner]-o[simple-entity-with-owner]	other
+recipe	burner-generator-recycling	true	false	false	t[item]-o[burner-generator]	other
+recipe	coin-recycling	true	false	false	y	science-pack
+recipe	captive-biter-spawner	false	false	false	z[biter-nest]	agriculture
+recipe	captive-biter-spawner-recycling	true	false	false	z[biter-nest]	agriculture
+recipe	lab	false	false	false	z[lab]	production-machine
+recipe	empty-module-slot-recycling	true	false	false	z[meta]-a[empty-module-slot]	module
+recipe	biolab	false	false	false	z[z-biolab]	production-machine
+recipe	biolab-recycling	true	false	false	z[z-biolab]	production-machine
+recipe	science-recycling	true	false	false	zz[science]	science-pack
+quality	normal	false	false	false	a	qualities
+quality	uncommon	false	false	false	b	qualities
+quality	rare	false	false	false	c	qualities
+quality	epic	false	false	false	d	qualities
+quality	legendary	false	false	false	e	qualities
+quality	quality-unknown	true	false	false	z	other
+space-location	space-location-unknown	true	false	false		other
+space-location	nauvis	false	false	false	a[nauvis]	planets
+space-location	vulcanus	false	false	false	b[vulcanus]	planets
+space-location	gleba	false	false	false	c[gleba]	planets
+space-location	fulgora	false	false	false	d[fulgora]	planets
+space-location	aquilo	false	false	false	e[aquilo]	planets
+space-location	solar-system-edge	false	false	false	f[solar-system-edge]	planets
+space-location	shattered-planet	false	false	false	g[shattered-planet]	planets
+asteroid-chunk	asteroid-chunk-unknown	true	false	false		other
+asteroid-chunk	parameter-0	false	true	false	a	parameters
+asteroid-chunk	parameter-1	false	true	false	a	parameters
+asteroid-chunk	parameter-2	false	true	false	a	parameters
+asteroid-chunk	parameter-3	false	true	false	a	parameters
+asteroid-chunk	parameter-4	false	true	false	a	parameters
+asteroid-chunk	parameter-5	false	true	false	a	parameters
+asteroid-chunk	parameter-6	false	true	false	a	parameters
+asteroid-chunk	parameter-7	false	true	false	a	parameters
+asteroid-chunk	parameter-8	false	true	false	a	parameters
+asteroid-chunk	parameter-9	false	true	false	a	parameters
+asteroid-chunk	metallic-asteroid-chunk	false	false	false	a[metallic]-a[chunk]	space-material
+asteroid-chunk	carbonic-asteroid-chunk	false	false	false	b[carbonic]-a[chunk]	space-material
+asteroid-chunk	oxide-asteroid-chunk	false	false	false	c[oxide]-a[chunk]	space-material
+asteroid-chunk	promethium-asteroid-chunk	false	false	false	d[promethium]-a[chunk]	space-material

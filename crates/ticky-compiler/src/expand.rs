@@ -75,7 +75,7 @@ const MAX_UNROLL: usize = 1024;
 
 pub struct Expander<'a> {
     fns: &'a HashMap<String, FnDef>,
-    consts: &'a HashMap<String, i32>,
+    consts: &'a HashMap<String, crate::ir::Cv>,
     shapes: HashMap<String, Shape>,
     frames: Vec<Frame>,
     aliases: Vec<HashMap<String, Expr>>,
@@ -215,12 +215,22 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             visit(iter, f);
             conds.iter().for_each(|x| visit(x, f));
         }
+        ExprKind::Dict(items) => items.iter().for_each(|(k, v)| {
+            visit(k, f);
+            visit(v, f);
+        }),
+        ExprKind::DictComp { key, value, iter, conds, .. } => {
+            visit(key, f);
+            visit(value, f);
+            visit(iter, f);
+            conds.iter().for_each(|x| visit(x, f));
+        }
         ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Name(_) => {}
     }
 }
 
 impl<'a> Expander<'a> {
-    pub fn new(fns: &'a HashMap<String, FnDef>, consts: &'a HashMap<String, i32>, shapes: HashMap<String, Shape>) -> Self {
+    pub fn new(fns: &'a HashMap<String, FnDef>, consts: &'a HashMap<String, crate::ir::Cv>, shapes: HashMap<String, Shape>) -> Self {
         Expander {
             fns,
             consts,
@@ -283,7 +293,7 @@ impl<'a> Expander<'a> {
     }
 
     fn fold(&self, e: &Expr) -> Option<i32> {
-        eval_const(e, self.consts, &[]).ok()
+        eval_const(e, self.consts, &[]).ok().and_then(|c| c.int())
     }
 
     fn scalar(&self, v: Val, span: Span) -> Result<Expr, Diag> {
@@ -343,8 +353,11 @@ impl<'a> Expander<'a> {
                 // `x in xs` / `x not in xs` over an array.
                 if let [(op @ (CmpOp::In | CmpOp::NotIn), rhs)] = rest.as_slice() {
                     let x = self.expr_scalar(first, out)?;
-                    let Val::Array(items) = self.expr(rhs, out)? else {
-                        return Err(Diag::error(rhs.span, "`in` needs an array on the right"));
+                    let items = match self.expr(rhs, out)? {
+                        Val::Array(items) => items,
+                        // A bundle: `sig in b`, checked when lowering.
+                        Val::Scalar(b) => return Ok(rebuild(ExprKind::Compare(Box::new(x), vec![(*op, b)]))),
+                        _ => return Err(Diag::error(rhs.span, "`in` needs an array or a bundle on the right")),
                     };
                     let tmp = self.bind(x, out);
                     let (cmp, bop) = if *op == CmpOp::In { (CmpOp::Eq, BoolOp::Or) } else { (CmpOp::Ne, BoolOp::And) };
@@ -411,8 +424,22 @@ impl<'a> Expander<'a> {
                 }
             }
             ExprKind::Call { func, args, kwargs } => {
+                if let ExprKind::Attr(base, m) = &func.kind {
+                    // A bundle method: `b.total()`, `b.items()`, …
+                    let b = self.expr_scalar(base, out)?;
+                    let mut a = Vec::new();
+                    for x in args {
+                        a.push(self.expr_scalar(x, out)?);
+                    }
+                    let mut kw = Vec::new();
+                    for (k, x) in kwargs {
+                        kw.push((k.clone(), self.expr_scalar(x, out)?));
+                    }
+                    let f = Expr { kind: ExprKind::Attr(Box::new(b), m.clone()), span: func.span };
+                    return Ok(rebuild(ExprKind::Call { func: Box::new(f), args: a, kwargs: kw }));
+                }
                 let ExprKind::Name(fname) = &func.kind else {
-                    return Err(Diag::error(func.span, "methods aren't supported yet"));
+                    return Err(Diag::error(func.span, "only named functions can be called"));
                 };
                 if self.alias(fname).is_none() && self.fns.contains_key(fname.as_str()) && !self.is_local(fname) {
                     return self.call(fname, args, kwargs, span, out);
@@ -420,8 +447,14 @@ impl<'a> Expander<'a> {
                 self.builtin(fname, args, kwargs, span, out)?
             }
             ExprKind::Index(base, idx) => {
-                let Val::Array(items) = self.expr(base, out)? else {
-                    return Err(Diag::error(base.span, "only arrays can be indexed"));
+                let items = match self.expr(base, out)? {
+                    Val::Array(items) => items,
+                    // A bundle: `b[sig]`, checked when lowering.
+                    Val::Scalar(b) => {
+                        let i = self.expr_scalar(idx, out)?;
+                        return Ok(rebuild(ExprKind::Index(Box::new(b), Box::new(i))));
+                    }
+                    _ => return Err(Diag::error(base.span, "only arrays and bundles can be indexed")),
                 };
                 let i = self.expr_scalar(idx, out)?;
                 match self.fold(&i) {
@@ -442,7 +475,63 @@ impl<'a> Expander<'a> {
                     }
                 }
             }
-            ExprKind::Attr(..) => return Err(Diag::error(span, "attributes (bundles) aren't supported yet")),
+            ExprKind::Attr(base, n) => {
+                let b = self.expr_scalar(base, out)?;
+                rebuild(ExprKind::Attr(Box::new(b), n.clone()))
+            }
+            ExprKind::Dict(items) => {
+                let mut v = Vec::new();
+                for (k, x) in items {
+                    v.push((self.expr_scalar(k, out)?, self.expr_scalar(x, out)?));
+                }
+                rebuild(ExprKind::Dict(v))
+            }
+            ExprKind::DictComp { key, value, target, iter, conds } => {
+                // The comprehension's own names (`s`, `v`) get fresh names so they never
+                // clash with variables or function locals.
+                let id = self.fresh();
+                let mut own = HashMap::new();
+                let mut new_target = Vec::new();
+                if let ExprKind::Tuple(ts) = &target.kind {
+                    for (i, t) in ts.iter().enumerate() {
+                        if let ExprKind::Name(n) = &t.kind {
+                            let fresh = format!("#{}{id}.{n}", if i == 0 { 's' } else { 'v' });
+                            own.insert(n.clone(), name(&fresh, t.span));
+                            new_target.push(name(&fresh, t.span));
+                        }
+                    }
+                }
+                if new_target.len() != 2 {
+                    return Err(Diag::error(target.span, "a bundle comprehension needs two names: `for s, v in b.items()`"));
+                }
+                for x in std::iter::once(&**value).chain(conds.iter()) {
+                    if has_call(x, self.fns) {
+                        return Err(Diag::error(x.span, "functions can't be called inside a bundle comprehension")
+                            .with_help("it runs on every signal at once, in a few combinators; compute the function's result first"));
+                    }
+                }
+                let iter = self.expr_scalar(iter, out)?;
+                self.aliases.push(own);
+                let r = (|| -> Result<(Expr, Expr, Vec<Expr>), Diag> {
+                    let k = self.expr_scalar(key, out)?;
+                    let v = self.expr_scalar(value, out)?;
+                    let mut cs = Vec::new();
+                    for c in conds {
+                        cs.push(self.expr_scalar(c, out)?);
+                    }
+                    Ok((k, v, cs))
+                })();
+                self.aliases.pop();
+                let (k, v, cs) = r?;
+                let target = Expr { kind: ExprKind::Tuple(new_target), span: target.span };
+                rebuild(ExprKind::DictComp {
+                    key: Box::new(k),
+                    value: Box::new(v),
+                    target: Box::new(target),
+                    iter: Box::new(iter),
+                    conds: cs,
+                })
+            }
             ExprKind::Tuple(items) => {
                 let mut v = Vec::new();
                 for i in items {
@@ -595,7 +684,8 @@ impl<'a> Expander<'a> {
         }
         match (f, vals.as_slice()) {
             ("len", [Val::Array(xs)]) => return Ok(Val::Scalar(int(xs.len() as i64, span))),
-            ("len", _) => return Err(Diag::error(span, "`len` needs an array")),
+            ("len", [Val::Scalar(_)]) => {} // a bundle
+            ("len", _) => return Err(Diag::error(span, "`len` needs an array or a bundle")),
             ("sum", [Val::Array(xs)]) => {
                 if xs.is_empty() {
                     return Ok(Val::Scalar(int(0, span)));
@@ -842,6 +932,14 @@ impl<'a> Expander<'a> {
                 }
                 self.parallel_assign(names, values, span, out);
             }
+            ExprKind::Index(base, idx) if self.is_bundle_name(base) => {
+                // `b[k] = e` is `b = #bset(b, k, e)`: only that signal changes.
+                let b = self.expr_scalar(base, out)?;
+                let k = self.expr_scalar(idx, out)?;
+                let e = self.scalar(v, span)?;
+                let set = Expr { kind: ExprKind::Call { func: Box::new(name("#bset", span)), args: vec![b, k, e], kwargs: vec![] }, span };
+                self.assign_to(base, Val::Scalar(set), span, out)?;
+            }
             ExprKind::Index(base, idx) => {
                 let (arr, len) = self.array_name(base)?;
                 let i = self.expr_scalar(idx, out)?;
@@ -893,6 +991,14 @@ impl<'a> Expander<'a> {
         let targets = Expr { kind: ExprKind::Tuple(names.iter().map(|n| name(n, span)).collect()), span };
         let value = Expr { kind: ExprKind::Tuple(values), span };
         out.push(stmt(StmtKind::Assign { targets: vec![targets], value }, span));
+    }
+
+    /// A named single value (a bundle, when indexed): not an array.
+    fn is_bundle_name(&self, base: &Expr) -> bool {
+        match &base.kind {
+            ExprKind::Name(n) => self.alias(n).is_none() && self.shape(&self.resolve(n)) == Shape::Scalar,
+            _ => false,
+        }
     }
 
     fn array_name(&self, base: &Expr) -> Result<(String, usize), Diag> {
@@ -962,6 +1068,13 @@ impl<'a> Expander<'a> {
                 }
             }
             StmtKind::AugAssign { target, op, value } => {
+                if let ExprKind::Index(base, _) = &target.kind {
+                    if self.is_bundle_name(base) {
+                        // `b[k] += e` is `b[k] = b[k] + e`.
+                        let rhs = Expr { kind: ExprKind::Binary(*op, Box::new(target.clone()), Box::new(value.clone())), span };
+                        return self.stmt(&stmt(StmtKind::Assign { targets: vec![target.clone()], value: rhs }, span), out);
+                    }
+                }
                 let v = self.expr_scalar(value, out)?;
                 match &target.kind {
                     ExprKind::Name(n) => {
@@ -1205,6 +1318,12 @@ pub fn display(n: &str) -> String {
     if n.starts_with("#t") {
         return "a temporary value".into();
     }
+    // A comprehension's own names: `#s4.s` → `s`.
+    if n.starts_with("#s") || n.starts_with("#v") {
+        if let Some((_, own)) = n.split_once('.') {
+            return own.to_string();
+        }
+    }
     if let Some((f, rest)) = n.split_once('.') {
         // `f.3.x` (an inlined call's local) or `f.x` (a subroutine's local).
         let local = rest.split_once('.').map_or(rest, |(_, l)| l);
@@ -1446,7 +1565,7 @@ fn sequential_fns(fns: &HashMap<String, FnDef>) -> HashSet<String> {
 
 /// Top-level names assigned once from a constant and never anywhere else (approximately what
 /// the analysis will treat as constants), for folding indexes and ranges.
-fn module_consts(m: &Module, fns: &HashMap<String, FnDef>) -> HashMap<String, i32> {
+fn module_consts(m: &Module, fns: &HashMap<String, FnDef>) -> HashMap<String, crate::ir::Cv> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let count = |counts: &mut HashMap<String, usize>, body: &[Stmt]| {
         let mut set = HashSet::new();

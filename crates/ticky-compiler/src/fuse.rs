@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ticky_factorio::{ArOp, CmpOp};
 
-use crate::ir::{dnf_operands, Dnf, Graph, Iv, Lit, Op, V};
+use crate::ir::{dnf_operands, BLit, BOp, BTerm, Dnf, Graph, Iv, Lit, Op, V};
 
 /// Most guarded loads one register update is split into.
 const MAX_LOADS: usize = 8;
@@ -237,7 +237,32 @@ impl<'g> Fuser<'g> {
         }
         let hint = self.g.iv(v);
         let r = match self.g.op(v).clone() {
-            Op::Const(_) | Op::Src(_) | Op::Dec(_) => v,
+            Op::Const(_) | Op::Src(_) | Op::Dec(_) | Op::BConst(_) | Op::Each | Op::SigK(_) => v,
+            Op::Bun(terms) => {
+                let terms = terms.into_iter().map(|t| self.rebuild_term(t)).collect();
+                self.g.bun(terms)
+            }
+            Op::BMux { t, f, a, b } => {
+                let (t, f) = (self.cond_node(t), self.cond_node(f));
+                let (a, b) = (self.rebuild(a), self.rebuild(b));
+                self.g.bmux_tf(t, f, a, b)
+            }
+            Op::BSelect(b, max) => {
+                let b = self.rebuild(b);
+                self.g.bselect(b, max)
+            }
+            Op::BGet(b, sig) => {
+                let b = self.rebuild(b);
+                self.g.bget(b, sig)
+            }
+            Op::BTotal(b) => {
+                let b = self.rebuild(b);
+                self.g.btotal(b)
+            }
+            Op::BCount(b) => {
+                let b = self.rebuild(b);
+                self.g.bcount(b)
+            }
             Op::Sel(arms) => {
                 let arms = arms.into_iter().map(|(c, x)| (self.cond_node(c), self.rebuild(x))).collect();
                 self.g.sel(arms)
@@ -283,6 +308,26 @@ impl<'g> Fuser<'g> {
         r
     }
 
+    fn rebuild_term(&mut self, t: BTerm) -> BTerm {
+        match t {
+            BTerm::Map(op, b, k) => BTerm::Map(op, self.rebuild(b), self.rebuild(k)),
+            BTerm::RMap(op, k, b) => BTerm::RMap(op, self.rebuild(k), self.rebuild(b)),
+            BTerm::Zip(op, a, b) => BTerm::Zip(op, self.rebuild(a), self.rebuild(b)),
+            BTerm::One(s, x) => BTerm::One(s, self.rebuild(x)),
+            BTerm::Pick(b, s, m) => BTerm::Pick(self.rebuild(b), s, m),
+            BTerm::Filter(b, d, out) => {
+                let mut op = |o: BOp| match o {
+                    BOp::Each => BOp::Each,
+                    BOp::Val(v) => BOp::Val(self.rebuild(v)),
+                };
+                let d = d.into_iter().map(|t| t.into_iter().map(|l| BLit { op: l.op, a: op(l.a), b: op(l.b) }).collect()).collect();
+                BTerm::Filter(self.rebuild(b), d, out)
+            }
+            BTerm::DFilter(d, b, conds, out) => BTerm::DFilter(self.rebuild(d), self.rebuild(b), conds, out),
+            BTerm::K(vals) => BTerm::K(vals),
+        }
+    }
+
     /// A boolean node as a single decider where possible.
     fn cond_node(&mut self, t: V) -> V {
         match self.dnf(t, false) {
@@ -319,7 +364,7 @@ impl<'g> Fuser<'g> {
         // Splitting a select only pays when a path keeps the old value or loads a constant
         // (otherwise it just multiplies loads), and the number of loads stays small.
         let worth = |this: &Self, x: V| Some(x) == own || this.g.as_const(x).is_some() || this.mentions(x, own);
-        if let Op::Mux { t, f, a, b } = self.g.op(v).clone() {
+        if let Some((t, f, a, b)) = self.g.as_mux(v) {
             // The top-level split is cheap (two loads) and saves the select stage.
             let top = is_true(&guard);
             let useful = (top || worth(self, a) || worth(self, b)) && loads.len() < MAX_LOADS;
@@ -362,12 +407,9 @@ impl<'g> Fuser<'g> {
 
     /// Whether `x` is a select tree with `own` (the old value) or a constant among its leaves.
     fn mentions(&self, x: V, own: Option<V>) -> bool {
-        match self.g.op(x) {
-            Op::Mux { a, b, .. } => {
-                let (a, b) = (*a, *b);
-                [a, b].iter().any(|y| Some(*y) == own || self.g.as_const(*y).is_some() || self.mentions(*y, own))
-            }
-            _ => false,
+        match self.g.as_mux(x) {
+            Some((_, _, a, b)) => [a, b].iter().any(|y| Some(*y) == own || self.g.as_const(*y).is_some() || self.mentions(*y, own)),
+            None => false,
         }
     }
 

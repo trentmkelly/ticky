@@ -100,6 +100,13 @@ fn decider_json(t: &SignalTable, d: &Decider) -> Value {
     json!({ "decider_conditions": { "conditions": conds, "outputs": outs } })
 }
 
+fn selector_json(t: &SignalTable, s: &Selector) -> Value {
+    match s {
+        Selector::Select { max, index } => json!({ "operation": "select", "select_max": max, "index_constant": index }),
+        Selector::Count { out } => json!({ "operation": "count", "count_signal": signal_json(t, *out) }),
+    }
+}
+
 fn constant_json(t: &SignalTable, c: &ConstComb) -> Value {
     let filters: Vec<Value> = c
         .values
@@ -135,12 +142,19 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
             m.insert("entity_number".into(), json!(i + 1));
             m.insert("name".into(), json!(e.kind.proto_name()));
             m.insert("position".into(), json!({ "x": e.pos.0, "y": e.pos.1 }));
-            if e.dir == Dir::East {
-                m.insert("direction".into(), json!(4));
+            match e.dir {
+                Dir::North => {}
+                Dir::East => {
+                    m.insert("direction".into(), json!(4));
+                }
+                Dir::West => {
+                    m.insert("direction".into(), json!(12));
+                }
             }
             let cb = match &e.kind {
                 Kind::Arith(a) => Some(arith_json(t, a)),
                 Kind::Decider(d) => Some(decider_json(t, d)),
+                Kind::Selector(sel) => Some(selector_json(t, sel)),
                 Kind::Constant(c) => Some(constant_json(t, c)),
                 Kind::Pole => None,
             };

@@ -206,13 +206,64 @@ pub fn plan(g: &mut Graph, srcs: &[SrcKind], plans: &mut Vec<(usize, WriterPlan)
     }
 
     let mut tau: Vec<Option<i32>> = vec![None; g.nodes.len()];
-    for v in live {
+    for &v in &live {
         tau[v as usize] = match *g.op(v) {
             Op::Const(_) => None,
             Op::Src(s) if matches!(srcs[s as usize], SrcKind::Own(_)) => Some(0),
             Op::Src(_) => Some(-latency),
             _ => g.operands(v).iter().filter_map(|o| tau[*o as usize]).max().map(|m| m + 1),
         };
+    }
+    // Then as late as possible: values that only depend on inputs are computed just before
+    // they're needed, so values are delayed close to the inputs, where many consumers
+    // share one delay chain, rather than once per result.
+    let mut users: Vec<Vec<V>> = vec![Vec::new(); g.nodes.len()];
+    for &v in &live {
+        for u in g.operands(v) {
+            users[u as usize].push(v);
+        }
+    }
+    let mut latest: Vec<Option<i32>> = vec![None; g.nodes.len()];
+    for &(v, at) in &need {
+        let l = &mut latest[v as usize];
+        *l = Some(l.map_or(at, |x| x.min(at)));
+    }
+    let asap = tau.clone();
+    for &v in live.iter().rev() {
+        let movable = od[v as usize].is_none() && !matches!(g.op(v), Op::Const(_) | Op::Src(_) | Op::BConst(_));
+        if !movable {
+            continue;
+        }
+        let mut t = latest[v as usize];
+        for &w in &users[v as usize] {
+            if let Some(tw) = tau[w as usize] {
+                t = Some(t.map_or(tw - 1, |x| x.min(tw - 1)));
+            }
+        }
+        if let (Some(t), Some(cur)) = (t, tau[v as usize]) {
+            if t > cur {
+                tau[v as usize] = Some(t);
+            }
+        }
+    }
+    // Neither schedule always wins (late is worse when a result has many consumers): keep
+    // the one needing fewer delay combinators.
+    let delays = |tau: &[Option<i32>]| -> i32 {
+        let mut total = 0;
+        for &u in &live {
+            let Some(tu) = tau[u as usize] else { continue };
+            let mut last = latest[u as usize].unwrap_or(tu);
+            for &w in &users[u as usize] {
+                if let Some(tw) = tau[w as usize] {
+                    last = last.max(tw - 1);
+                }
+            }
+            total += (last - tu).max(0);
+        }
+        total
+    };
+    if delays(&asap) < delays(&tau) {
+        tau = asap;
     }
     *plans = rest;
     Some(Pipe { latency: latency as u32, tau, accs })

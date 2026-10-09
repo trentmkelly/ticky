@@ -1,0 +1,44 @@
+# Inventory monitor: summarises a logistic network and flags low items.
+input  stock: Bundle = port("Logistic network contents")
+input  limit: int @ L = port("Low-stock threshold")
+output low: Bundle = port("Items below the threshold (value = how many short)")
+output stacks: Bundle = port("Stock in stacks of 50, rounded up")
+output whole: Bundle = port("Items stored as whole stacks of 50 (value = stacks)")
+output spare: Bundle = port("How far above the threshold")
+output total: int @ T
+output kinds: int @ K
+output most: int @ M
+output least: int @ N
+output alarm: bool @ A
+
+every tick:
+    low = {s: limit - v for s, v in stock.items() if v < limit}
+    stacks = {s: (v + 49) // 50 for s, v in stock.items() if v > 0}
+    whole = {s: v // 50 for s, v in stock.items() if v % 50 == 0}
+    spare = {s: max(v - limit, 0) for s, v in stock.items()}
+    total = stock.total()
+    kinds = len(stock)
+    most = max(stock.values())
+    least = min(stock.values())
+    alarm = S("iron-plate") in low or stock.get(S("copper-plate"), 0) < 10
+
+test "summary":
+    set limit = 100
+    set stock = Bundle(iron_plate=40, copper_plate=250, coal=-5, stone=100)
+    run 20 ticks
+    assert low == Bundle(iron_plate=60, coal=105)
+    assert stacks == Bundle(iron_plate=1, copper_plate=5, stone=2)
+    assert whole == Bundle(copper_plate=5, stone=2)
+    assert spare == Bundle(copper_plate=150)
+    assert total == 385
+    assert kinds == 4
+    assert most == 250
+    assert least == -5
+    assert alarm
+
+test "no alarm when stocked":
+    set limit = 10
+    set stock = Bundle(iron_plate=40, copper_plate=250)
+    run 20 ticks
+    assert not alarm
+    assert len(low) == 0

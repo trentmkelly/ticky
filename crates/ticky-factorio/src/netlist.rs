@@ -67,10 +67,21 @@ pub struct ConstComb {
     pub on: bool,
 }
 
+/// Selector combinator modes Ticky uses. It reads both input wires and has no network
+/// selection.
+#[derive(Clone, Debug)]
+pub enum Selector {
+    /// The input signal ranked `index` (0-based) by value, largest first if `max`.
+    Select { max: bool, index: i32 },
+    /// How many distinct signals the input has, on `out`.
+    Count { out: Sig },
+}
+
 #[derive(Clone, Debug)]
 pub enum Kind {
     Arith(Arith),
     Decider(Decider),
+    Selector(Selector),
     Constant(ConstComb),
     Pole,
 }
@@ -80,6 +91,7 @@ impl Kind {
         match self {
             Kind::Arith(_) => "arithmetic-combinator",
             Kind::Decider(_) => "decider-combinator",
+            Kind::Selector(_) => "selector-combinator",
             Kind::Constant(_) => "constant-combinator",
             Kind::Pole => "medium-electric-pole",
         }
@@ -87,7 +99,7 @@ impl Kind {
 
     /// Arithmetic and decider combinators have separate input and output connectors.
     pub fn is_combinator(&self) -> bool {
-        matches!(self, Kind::Arith(_) | Kind::Decider(_))
+        matches!(self, Kind::Arith(_) | Kind::Decider(_) | Kind::Selector(_))
     }
 }
 
@@ -95,6 +107,7 @@ impl Kind {
 pub enum Dir {
     North,
     East,
+    West,
 }
 
 /// What an entity is for. Used by the simulator (ports) and the build report.
@@ -185,16 +198,16 @@ impl Netlist {
         if e.kind.is_combinator() {
             match e.dir {
                 Dir::North => (1, 2),
-                Dir::East => (2, 1),
+                Dir::East | Dir::West => (2, 1),
             }
         } else {
             (1, 1)
         }
     }
 
-    /// Checks that no two entities overlap, wires are within reach and every powered
-    /// entity is covered by a pole. Returns human-readable problems.
-    pub fn validate(&self) -> Vec<String> {
+    /// Checks that no two entities overlap, wires are within reach and (if `power`) every
+    /// powered entity is covered by a pole. Returns human-readable problems.
+    pub fn validate(&self, power: bool) -> Vec<String> {
         let mut problems = Vec::new();
         let mut tiles = std::collections::HashMap::new();
         for (i, _) in self.entities.iter().enumerate() {
@@ -219,7 +232,7 @@ impl Netlist {
         let poles: Vec<(f64, f64)> =
             self.entities.iter().filter(|e| matches!(e.kind, Kind::Pole)).map(|e| e.pos).collect();
         for (i, e) in self.entities.iter().enumerate() {
-            if !e.kind.is_combinator() {
+            if !power || !e.kind.is_combinator() {
                 continue;
             }
             let (w, h) = self.footprint(i);

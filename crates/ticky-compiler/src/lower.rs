@@ -4,7 +4,8 @@ use ticky_factorio::{ArOp, CmpOp};
 use ticky_syntax::ast::{self, BinOp, BoolOp, Expr, ExprKind, UnOp};
 use ticky_syntax::{Diag, Span};
 
-use crate::ir::{Graph, V};
+use crate::bundle::{self, Kind};
+use crate::ir::{BTerm, Graph, V};
 
 /// Resolves names to values; implemented differently for constants, blocks and tests.
 pub trait Names {
@@ -39,6 +40,11 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 }
             }
             let x = expr(g, names, inner)?;
+            if g.is_bundle(x) {
+                let m = g.konst(-1);
+                return Ok(g.bun(vec![BTerm::Map(ArOp::Mul, x, m)]));
+            }
+            let x = bundle::int(g, x, inner.span)?;
             let z = g.konst(0);
             g.ar(ArOp::Sub, z, x)
         }
@@ -46,6 +52,10 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         ExprKind::Unary(UnOp::Invert, inner) => {
             let x = expr(g, names, inner)?;
             let m = g.konst(-1);
+            if g.is_bundle(x) {
+                return Ok(g.bun(vec![BTerm::Map(ArOp::Xor, x, m)]));
+            }
+            let x = bundle::int(g, x, inner.span)?;
             g.ar(ArOp::Xor, x, m)
         }
         ExprKind::Binary(op, a, b) => {
@@ -54,6 +64,18 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     .with_help("use `//` for integer division (or `tdiv(a, b)` for Factorio's truncating division)"));
             }
             let (x, y) = (expr(g, names, a)?, expr(g, names, b)?);
+            if bundle::kind(g, x) == Kind::Bundle || bundle::kind(g, y) == Kind::Bundle {
+                return bundle::binop(g, *op, x, y, e.span);
+            }
+            let (x, y) = (bundle::int(g, x, a.span)?, bundle::int(g, y, b.span)?);
+            // Per-signal arithmetic (inside a bundle comprehension) truncates like Factorio.
+            if g.uses_each(x) || g.uses_each(y) {
+                match op {
+                    BinOp::FloorDiv => return Ok(g.ar(ArOp::Div, x, y)),
+                    BinOp::Mod => return Ok(g.ar(ArOp::Mod, x, y)),
+                    _ => {}
+                }
+            }
             binop(g, *op, x, y)
         }
         // `a % b == 0` doesn't depend on the remainder's sign, so skip Python's correction.
@@ -65,6 +87,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         {
             let ExprKind::Binary(_, a, b) = &first.kind else { unreachable!() };
             let (x, y) = (expr(g, names, a)?, expr(g, names, b)?);
+            let (x, y) = (bundle::int(g, x, a.span)?, bundle::int(g, y, b.span)?);
             let r = match log2_const(g, y) {
                 Some(k) => {
                     let mask = g.konst((1 << k) - 1);
@@ -77,27 +100,54 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         }
         ExprKind::Compare(first, rest) => {
             let mut left = expr(g, names, first)?;
+            let mut left_span = first.span;
             let mut acc: Option<V> = None;
             for (op, right) in rest {
                 let r = expr(g, names, right)?;
-                let op = match op {
-                    ast::CmpOp::Lt => CmpOp::Lt,
-                    ast::CmpOp::Gt => CmpOp::Gt,
-                    ast::CmpOp::Eq => CmpOp::Eq,
-                    ast::CmpOp::Ge => CmpOp::Ge,
-                    ast::CmpOp::Le => CmpOp::Le,
-                    ast::CmpOp::Ne => CmpOp::Ne,
-                    _ => {
-                        return Err(Diag::error(e.span, "`in` and `is` aren't supported yet")
-                            .with_help("compare with `==` instead"))
+                let (kl, kr) = (bundle::kind(g, left), bundle::kind(g, r));
+                let special = match op {
+                    ast::CmpOp::In | ast::CmpOp::NotIn => {
+                        let sig = bundle::signal(g, left, left_span)?;
+                        let b = bundle::bundle(g, r, right.span)?;
+                        let x = g.bget(b, sig);
+                        let z = g.konst(0);
+                        Some(g.cmp(if *op == ast::CmpOp::In { CmpOp::Ne } else { CmpOp::Eq }, x, z))
+                    }
+                    ast::CmpOp::Eq | ast::CmpOp::Ne if kl == Kind::Bundle && kr == Kind::Bundle => {
+                        Some(bundle::equal(g, left, r, *op == ast::CmpOp::Eq))
+                    }
+                    ast::CmpOp::Eq | ast::CmpOp::Ne if kl == Kind::Signal && kr == Kind::Signal => {
+                        let same = g.as_sig(left) == g.as_sig(r);
+                        Some(g.konst((same == (*op == ast::CmpOp::Eq)) as i32))
+                    }
+                    _ => None,
+                };
+                let c = match special {
+                    Some(c) => c,
+                    None => {
+                        if kl == Kind::Bundle || kr == Kind::Bundle {
+                            return Err(Diag::error(e.span, "bundles can only be compared with `==` and `!=`")
+                                .with_help("to compare each signal, use a comprehension, e.g. `{s: v for s, v in b.items() if v > 10}`"));
+                        }
+                        let (l, rr) = (bundle::int(g, left, left_span)?, bundle::int(g, r, right.span)?);
+                        let op = match op {
+                            ast::CmpOp::Lt => CmpOp::Lt,
+                            ast::CmpOp::Gt => CmpOp::Gt,
+                            ast::CmpOp::Eq => CmpOp::Eq,
+                            ast::CmpOp::Ge => CmpOp::Ge,
+                            ast::CmpOp::Le => CmpOp::Le,
+                            ast::CmpOp::Ne => CmpOp::Ne,
+                            _ => return Err(Diag::error(e.span, "`is` isn't supported").with_help("compare with `==` instead")),
+                        };
+                        g.cmp(op, l, rr)
                     }
                 };
-                let c = g.cmp(op, left, r);
                 acc = Some(match acc {
                     None => c,
                     Some(prev) => g.ar(ArOp::And, prev, c),
                 });
                 left = r;
+                left_span = right.span;
             }
             acc.unwrap()
         }
@@ -105,6 +155,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
             let mut acc = expr(g, names, &items[0])?;
             for item in &items[1..] {
                 let next = expr(g, names, item)?;
+                same_kind(g, acc, next, item.span)?;
                 acc = if g.is_bool(acc) && g.is_bool(next) {
                     g.ar(if *op == BoolOp::And { ArOp::And } else { ArOp::Or }, acc, next)
                 } else if *op == BoolOp::And {
@@ -124,16 +175,63 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         ExprKind::IfExp { cond, then, orelse } => {
             let c = expr(g, names, cond)?;
             let (a, b) = (expr(g, names, then)?, expr(g, names, orelse)?);
+            same_kind(g, a, b, orelse.span)?;
             g.mux(c, a, b)
         }
         ExprKind::Call { func, args, kwargs } => {
+            if let ExprKind::Attr(base, m) = &func.kind {
+                return method(g, names, base, m, args, kwargs, e.span);
+            }
             let ExprKind::Name(fname) = &func.kind else {
-                return Err(Diag::error(func.span, "methods aren't supported yet"));
+                return Err(Diag::error(func.span, "only named functions can be called"));
             };
+            match fname.as_str() {
+                "S" => return Ok(g.sigk(bundle::s_call(args, kwargs, e.span)?)),
+                // Internal: `b[k] = x` (from the expansion pass).
+                "#bset" => {
+                    let b = expr(g, names, &args[0])?;
+                    let b = bundle::bundle(g, b, args[0].span).map_err(|_| Diag::error(args[0].span, "only bundles and arrays can be indexed"))?;
+                    let k = bundle::key(g, names, &args[1])?;
+                    let x = expr(g, names, &args[2])?;
+                    let x = bundle::int(g, x, args[2].span)?;
+                    return Ok(g.bset(b, k, x));
+                }
+                "Bundle" => return bundle::construct(g, names, args, kwargs, e.span),
+                "len" if args.len() == 1 => {
+                    let b = expr(g, names, &args[0])?;
+                    let b = bundle::bundle(g, b, args[0].span)?;
+                    return Ok(g.bcount(b));
+                }
+                "sum" | "max" | "min" if args.len() == 1 => {
+                    let ExprKind::Call { func: vf, args: va, .. } = &args[0].kind else {
+                        return Err(Diag::error(e.span, format!("`{fname}` of a single value")).with_help(format!("for a bundle, write `{fname}(b.values())`")));
+                    };
+                    let ExprKind::Attr(base, m) = &vf.kind else {
+                        return Err(Diag::error(e.span, format!("`{fname}` of a single value")));
+                    };
+                    if m != "values" || !va.is_empty() {
+                        return Err(Diag::error(args[0].span, format!("`{fname}` of a bundle needs `.values()`")));
+                    }
+                    let b = expr(g, names, base)?;
+                    let b = bundle::bundle(g, b, base.span)?;
+                    return Ok(match fname.as_str() {
+                        "sum" => g.btotal(b),
+                        f => {
+                            let one = g.bselect(b, f == "max");
+                            g.btotal(one)
+                        }
+                    });
+                }
+                _ => {}
+            }
             if let Some((k, _)) = kwargs.first() {
                 return Err(Diag::error(e.span, format!("`{fname}` doesn't take a keyword argument `{k}`")));
             }
-            let vals: Vec<V> = args.iter().map(|a| expr(g, names, a)).collect::<Result<_, _>>()?;
+            let mut vals: Vec<V> = Vec::new();
+            for a in args {
+                let v = expr(g, names, a)?;
+                vals.push(bundle::int(g, v, a.span)?);
+            }
             let arity = |n: usize| -> Result<(), Diag> {
                 if vals.len() == n {
                     Ok(())
@@ -201,7 +299,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     }
                     g.sel(arms)
                 }
-                "print" | "len" | "sum" | "sorted" | "range" | "S" | "Bundle" | "port" => {
+                "print" | "len" | "sum" | "sorted" | "range" | "port" => {
                     return Err(Diag::error(e.span, format!("`{fname}` isn't available here yet")))
                 }
                 _ => {
@@ -210,13 +308,68 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 }
             }
         }
-        ExprKind::Attr(..) | ExprKind::Index(..) => {
-            return Err(Diag::error(e.span, "bundles and arrays aren't supported yet"))
+        ExprKind::Attr(base, name) => {
+            let b = expr(g, names, base)?;
+            let b = bundle::bundle(g, b, base.span)?;
+            let sig = bundle::ident(name, e.span);
+            g.bget(b, sig)
+        }
+        ExprKind::Index(base, idx) => {
+            let b = expr(g, names, base)?;
+            let b = bundle::bundle(g, b, base.span).map_err(|_| Diag::error(base.span, "only bundles and arrays can be indexed"))?;
+            let sig = bundle::key(g, names, idx)?;
+            g.bget(b, sig)
+        }
+        ExprKind::Dict(items) => bundle::dict(g, names, items)?,
+        ExprKind::DictComp { key, value, target, iter, conds } => {
+            bundle::comprehension(g, names, key, value, target, iter, conds, e.span)?
         }
         ExprKind::Tuple(_) | ExprKind::List(_) | ExprKind::ListComp { .. } => {
             return Err(Diag::error(e.span, "tuples and lists can only be used in assignments like `a, b = b, a`"))
         }
     })
+}
+
+/// Both sides of a select (or `and`/`or`) must be the same kind of value.
+fn same_kind(g: &Graph, a: V, b: V, span: Span) -> Result<(), Diag> {
+    let (ka, kb) = (bundle::kind(g, a), bundle::kind(g, b));
+    if ka != kb {
+        let name = |k: Kind| match k {
+            Kind::Int => "a number",
+            Kind::Bundle => "a bundle",
+            Kind::Signal => "a signal",
+        };
+        return Err(Diag::error(span, format!("this is {}, but the other side is {}", name(kb), name(ka))));
+    }
+    Ok(())
+}
+
+/// `b.method(...)` on a bundle.
+fn method(g: &mut Graph, names: &mut dyn Names, base: &Expr, m: &str, args: &[Expr], kwargs: &[(String, Expr)], span: Span) -> Result<V, Diag> {
+    let b = expr(g, names, base)?;
+    let b = bundle::bundle(g, b, base.span).map_err(|_| Diag::error(base.span, format!("`.{m}()` needs a bundle")))?;
+    if let Some((k, _)) = kwargs.first() {
+        return Err(Diag::error(span, format!("`.{m}()` doesn't take a keyword argument `{k}`")));
+    }
+    match (m, args) {
+        ("total", []) => Ok(g.btotal(b)),
+        ("get", [k]) | ("get", [k, _]) => {
+            let sig = bundle::key(g, names, k)?;
+            let x = g.bget(b, sig);
+            if let [_, d] = args {
+                // Like dict.get: the default when the signal is missing (0).
+                let dv = expr(g, names, d)?;
+                let dv = bundle::int(g, dv, d.span)?;
+                let z = g.konst(0);
+                let has = g.cmp(CmpOp::Ne, x, z);
+                return Ok(g.mux(has, x, dv));
+            }
+            Ok(x)
+        }
+        ("values" | "items" | "keys", _) => Err(Diag::error(span, format!("`.{m}()` can only be used inside `sum`, `min`, `max` or a comprehension"))),
+        _ => Err(Diag::error(span, format!("bundles have no method `{m}` with {} argument(s)", args.len()))
+            .with_help("bundle methods: `.total()`, `.get(sig, default)`, `.items()` (in comprehensions), `.values()` (in sum/min/max)")),
+    }
 }
 
 pub fn binop(g: &mut Graph, op: BinOp, x: V, y: V) -> V {

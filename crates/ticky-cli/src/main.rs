@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use ticky_compiler::testrun::{run_tests, Harness};
+use ticky_compiler::program::Ty;
+use ticky_compiler::testrun::{run_tests, Harness, PVal};
 use ticky_compiler::{compile, Compiled, Opt, Options};
 use ticky_factorio::{blueprint, SignalTable};
 use ticky_syntax::ast::PortDir;
@@ -32,12 +33,16 @@ enum Cmd {
         /// Optimise for `speed` (default) or `size`.
         #[arg(long, default_value = "speed", value_parser = parse_opt)]
         opt: Opt,
+        #[command(flatten)]
+        place: Placement,
     },
     /// Check a program and print its cost report.
     Check {
         file: PathBuf,
         #[arg(long, default_value = "speed", value_parser = parse_opt)]
         opt: Opt,
+        #[command(flatten)]
+        place: Placement,
     },
     /// Run the program's `test` blocks in the simulator.
     Test { file: PathBuf },
@@ -61,9 +66,40 @@ enum Cmd {
         ticks: u64,
         #[arg(long = "set")]
         sets: Vec<String>,
+        /// `west`: also build the output return lines.
+        #[arg(long, default_value = "east", value_parser = parse_side)]
+        outputs: Side,
     },
     /// Decode a blueprint string (from a file or argument) to JSON.
     Decode { input: String },
+}
+
+/// Where the blueprint's pieces go.
+#[derive(clap::Args, Clone, Copy)]
+struct Placement {
+    /// Leave out the medium poles that power the combinators (power them yourself, e.g.
+    /// with substations). Poles that carry long circuit wires stay.
+    #[arg(long)]
+    no_poles: bool,
+    /// Where outputs are delivered: `east` (default, the output ports) or `west`: each
+    /// output also runs back on its own chain of poles (red wire), north of the blueprint,
+    /// to a pole above the inputs. The first output's line is the northernmost.
+    #[arg(long, default_value = "east", value_parser = parse_side)]
+    outputs: Side,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    East,
+    West,
+}
+
+fn parse_side(s: &str) -> Result<Side, String> {
+    match s {
+        "east" => Ok(Side::East),
+        "west" => Ok(Side::West),
+        _ => Err("expected `east` or `west`".into()),
+    }
 }
 
 fn parse_opt(s: &str) -> Result<Opt, String> {
@@ -90,10 +126,11 @@ fn print_diags(diags: &[Diag], file: &str, src: &str) {
     }
 }
 
-fn build(file: &Path, autostart: bool, opt: Opt) -> Result<(String, String, Compiled), ExitCode> {
+fn build(file: &Path, autostart: bool, opt: Opt, place: Placement) -> Result<(String, String, Compiled), ExitCode> {
     let (name, src) = load(file)?;
     let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    match compile(&src, &Options { autostart, label, opt }) {
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West };
+    match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
             Ok((name, src, c))
@@ -107,23 +144,41 @@ fn build(file: &Path, autostart: bool, opt: Opt) -> Result<(String, String, Comp
     }
 }
 
+/// Parses a bundle value: `iron-plate:5,copper-plate:3` (or `name=value`; `{}` is empty).
+fn parse_bundle(val: &str) -> Result<PVal, String> {
+    let t = SignalTable::base();
+    let mut vals = Vec::new();
+    for part in val.trim_matches(|c| c == '{' || c == '}').split(',').filter(|p| !p.trim().is_empty()) {
+        let (n, v) = part.rsplit_once([':', '=']).ok_or(format!("expected signal:value in `{part}`"))?;
+        let n = n.trim();
+        let sig = t
+            .lookup(n)
+            .or_else(|| t.resolve_ident(n))
+            .unwrap_or_else(|| t.intern(ticky_factorio::SignalKind::Item, n));
+        vals.push((sig, v.trim().parse::<i32>().map_err(|e| format!("bad value in `{part}`: {e}"))?));
+    }
+    Ok(PVal::Bun(ticky_compiler::ir::normalize(vals)))
+}
+
 /// Parses `name=value[@tick]` into (tick, port index, value).
-fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, i32)>, String> {
+fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, PVal)>, String> {
     let mut out = Vec::new();
     for s in sets {
         let (name, rest) = s.split_once('=').ok_or(format!("expected name=value, got `{s}`"))?;
-        let (val, tick) = match rest.split_once('@') {
+        let (val, tick) = match rest.rsplit_once('@') {
             Some((v, t)) => (v, t.parse::<u64>().map_err(|e| format!("bad tick in `{s}`: {e}"))?),
             None => (rest, 0),
         };
-        let v = match val {
-            "True" | "true" => 1,
-            "False" | "false" => 0,
-            _ => val.parse::<i32>().map_err(|e| format!("bad value in `{s}`: {e}"))?,
+        let int = |val: &str| -> Result<i32, String> {
+            match val {
+                "True" | "true" => Ok(1),
+                "False" | "false" => Ok(0),
+                _ => val.parse::<i32>().map_err(|e| format!("bad value in `{s}`: {e}")),
+            }
         };
         // `RUN` toggles the RUN switch.
         if name == "RUN" {
-            out.push((tick, usize::MAX, v));
+            out.push((tick, usize::MAX, PVal::Int(int(val)?)));
             continue;
         }
         let pi = c
@@ -131,23 +186,38 @@ fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, i32)>, S
             .port_index(name)
             .filter(|&i| c.program.ports[i].dir == PortDir::Input)
             .ok_or(format!("`{name}` is not an input port"))?;
+        let v = if c.program.ports[pi].ty == Ty::Bundle { parse_bundle(val)? } else { PVal::Int(int(val)?) };
         out.push((tick, pi, v));
     }
     out.sort_by_key(|s| s.0);
     Ok(out)
 }
 
+/// A value as the harness writes it: numbers, or `{name=value,…}` sorted by signal name.
+fn canonical(v: &PVal) -> String {
+    match v {
+        PVal::Int(k) => k.to_string(),
+        PVal::Bun(b) => {
+            let t = SignalTable::base();
+            let mut parts: Vec<(&str, i32)> = b.iter().map(|(s, v)| (t.name(*s), *v)).collect();
+            parts.sort();
+            let parts: Vec<String> = parts.iter().map(|(n, v)| format!("{n}={v}")).collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
 /// Output values observed at each tick, after applying that tick's input changes.
-fn sim_trace(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> Vec<Vec<i32>> {
+fn sim_trace(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> Vec<Vec<PVal>> {
     let outs: Vec<usize> = (0..c.program.ports.len()).filter(|&i| c.program.ports[i].dir == PortDir::Output).collect();
     let mut h = Harness::new(c);
     let mut rows = Vec::new();
     for i in 0..ticks {
-        for &(_, pi, v) in sets.iter().filter(|s| s.0 == i) {
-            if pi == usize::MAX {
-                h.sim.set_constant_on(c.cg.run_switch, v != 0);
+        for (_, pi, v) in sets.iter().filter(|s| s.0 == i) {
+            if *pi == usize::MAX {
+                h.sim.set_constant_on(c.cg.run_switch, *v != PVal::Int(0));
             } else {
-                h.set(pi, v);
+                h.set(*pi, v.clone());
             }
         }
         rows.push(outs.iter().map(|&o| h.get(o)).collect());
@@ -167,7 +237,7 @@ fn lua_str(s: &str) -> String {
 }
 
 /// A Lua job file for the in-game harness (harness/ticky-harness).
-fn job_lua(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> String {
+fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
     let t = SignalTable::base();
     let sig = |s| {
         let info = t.info(s);
@@ -175,16 +245,34 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> String {
     };
     let mut ports = Vec::new();
     for (i, p) in c.program.ports.iter().enumerate() {
+        // Outputs with a return line are read at the line's far end.
+        let end = c.layout.line_ends.iter().find(|(port, _)| *port == c.cg.port_ents[i]).map(|(_, e)| *e);
         ports.push(format!(
-            "{{name={}, dir={}, entity={}, signal={}}}",
+            "{{name={}, dir={}, entity={}, signal={}, bundle={}, pole={}}}",
             lua_str(&p.name),
             lua_str(if p.dir == PortDir::Input { "in" } else { "out" }),
-            c.cg.port_ents[i] + 1,
-            sig(p.sig)
+            end.unwrap_or(c.cg.port_ents[i]) + 1,
+            sig(p.sig),
+            p.ty == Ty::Bundle,
+            end.is_some()
         ));
     }
-    let sets: Vec<String> =
-        sets.iter().map(|(tk, pi, v)| format!("{{t={tk}, port={}, value={v}}}", pi.wrapping_add(1))).collect();
+    let sets: Vec<String> = sets
+        .iter()
+        .map(|(tk, pi, v)| match v {
+            PVal::Int(k) => format!("{{t={tk}, port={}, value={k}}}", pi.wrapping_add(1)),
+            PVal::Bun(b) => {
+                let vals: Vec<String> = b
+                    .iter()
+                    .map(|(s, k)| {
+                        let info = t.info(*s);
+                        format!("{{type={}, name={}, value={k}}}", lua_str(info.kind.as_str()), lua_str(&info.name))
+                    })
+                    .collect();
+                format!("{{t={tk}, port={}, values={{{}}}}}", pi + 1, vals.join(", "))
+            }
+        })
+        .collect();
     format!(
         "return {{\n  bp = {},\n  ticks = {ticks},\n  run = {},\n  ports = {{{}}},\n  sets = {{{}}},\n}}\n",
         lua_str(&c.blueprint_string()),
@@ -194,10 +282,12 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> String {
     )
 }
 
+const DEFAULT_PLACE: Placement = Placement { no_poles: false, outputs: Side::East };
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.cmd {
-        Cmd::Build { file, output, json, autostart, opt } => build(&file, autostart, opt).and_then(|(_, src, c)| {
+        Cmd::Build { file, output, json, autostart, opt, place } => build(&file, autostart, opt, place).and_then(|(_, src, c)| {
             eprint!("{}", c.report(&src));
             let text = if json {
                 serde_json::to_string_pretty(&c.blueprint_json()).unwrap()
@@ -215,8 +305,8 @@ fn main() -> ExitCode {
                 }
             }
         }),
-        Cmd::Check { file, opt } => build(&file, false, opt).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file } => build(&file, false, Opt::Speed).and_then(|(name, src, c)| {
+        Cmd::Check { file, opt, place } => build(&file, false, opt, place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
+        Cmd::Test { file } => build(&file, false, Opt::Speed, DEFAULT_PLACE).and_then(|(name, src, c)| {
             let results = run_tests(&c, &src);
             if results.is_empty() {
                 eprintln!("no tests in {name}");
@@ -239,7 +329,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, ticks, sets, all } => build(&file, false, Opt::Speed).and_then(|(_, _, c)| {
+        Cmd::Sim { file, ticks, sets, all } => build(&file, false, Opt::Speed, DEFAULT_PLACE).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
@@ -250,13 +340,13 @@ fn main() -> ExitCode {
             let rows = sim_trace(&c, &sets, ticks);
             for (i, row) in rows.iter().enumerate() {
                 if all || i == 0 || rows[i - 1] != *row {
-                    let cells: Vec<String> = row.iter().zip(&names).map(|(v, n)| format!("{v:>w$}", w = n.len())).collect();
+                    let cells: Vec<String> = row.iter().zip(&names).map(|(v, n)| format!("{:>w$}", v.to_string(), w = n.len())).collect();
                     println!("{i:>4}  {}", cells.join("  "));
                 }
             }
             Ok(())
         }),
-        Cmd::Difftest { file, ticks, sets } => build(&file, false, Opt::Speed).and_then(|(_, _, c)| {
+        Cmd::Difftest { file, ticks, sets, outputs } => build(&file, false, Opt::Speed, Placement { no_poles: false, outputs }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
@@ -274,10 +364,9 @@ fn main() -> ExitCode {
                 eprintln!("error: no trace from the game: {e}");
                 ExitCode::FAILURE
             })?;
-            let actual: Vec<Vec<i32>> = trace
-                .lines()
-                .map(|l| l.split_whitespace().skip(1).map(|v| v.parse().unwrap()).collect())
-                .collect();
+            let expected: Vec<Vec<String>> = expected.iter().map(|r| r.iter().map(canonical).collect()).collect();
+            let actual: Vec<Vec<String>> =
+                trace.lines().map(|l| l.split_whitespace().skip(1).map(|v| v.to_string()).collect()).collect();
             // The harness script reads outputs one tick later than the simulator records them
             // (calibrated: every program shows exactly this shift), so game[i + 1] ~ sim[i].
             const OFFSET: usize = 1;

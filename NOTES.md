@@ -166,3 +166,87 @@ below 100: 3187 → 1509 ticks; button counter 22 → 16 combinators.
   the visible failures were capacity limits ("out of signals" on a huge nested-call program,
   "too much branching" from a long short-circuit chain), not wrong answers. A complete,
   size-capped run is still to do (the output of that run was truncated).
+
+## 2026-10-08 (night) — Level 3: bundles
+
+### Verified first (harness/ticky-harness/scenarios/probe)
+A probe scenario builds combinators directly and records their outputs; the simulator test
+`wildcard_tests::matches_the_game` reproduces every result. Findings the design relies on:
+`each(red) op signal(green)`; `each(red) op each(green)` over the union of signals (so `a + b`
+is one combinator); `each` in several decider conditions plus ordinary ones; a single output
+of an `each` decider sums (constant 1 → count); `everything` copy; selector `select`/`count`
+(blueprint: `{"operation": "select", "select_max": true, "index_constant": 0}`).
+
+### Signals (ticky-factorio/src/signals.rs)
+- One global table: base game (internal wiring only uses these), then
+  `data/signals-extra.tsv` (recipes + Space Age/Quality/Elevated Rails, dumped with
+  `TICKY_SPACE_AGE=1 TICKY_SCENARIO=dump harness/run.sh`), then names programs make up:
+  `intern(kind, name)` adds them (`known = false`) and the compiler warns.
+- `SignalKind` covers recipe, quality, space-location, asteroid-chunk.
+
+### Compiler
+- **IR** (ir.rs): bundle nodes `BConst`, `Bun(terms)` (a bundle is the sum of its terms, each
+  one combinator writing the bundle's wire: `Map` = each op k, `RMap` = k op each, `Zip` =
+  each(red) op each(green), `One` = scalar → one signal, `Filter`, `DFilter`, `K` = constant
+  combinator), `BMux`, `BSelect`; scalar reads `BGet`, `BTotal`, `BCount`; `SigK` (signal
+  constants) and `Each` (comprehension placeholder). Constant terms fold; `g.mux` routes bundles.
+  Constants are `Cv` (int, bundle or signal) everywhere (consts, prologue, consteval).
+- **Comprehensions** (bundle.rs): `v` lowers to `Op::Each`; the scalar expression is then
+  converted to bundle operations over a *domain* (the input's signals passing the filter),
+  where every intermediate bundle holds a subexpression's value with missing = 0. Operations
+  that keep 0 at 0 (or apply to `v` itself, never 0) are one `Map`; others add the domain
+  explicitly (`Zip` with the scalar spread over the domain). Selects restrict the domain.
+  Conditions on `v` are decider literals; conditions on other expressions compare their
+  bundle with 0 in a `DFilter`, whose `each` iterates the domain (green) and the bundle (red),
+  so signals missing from the bundle are tested as 0. `//`/`%` truncate per signal.
+- **Types**: `Ty::Bundle`; un-annotated bundle variables are inferred syntactically to a
+  fixpoint (`bundle_names`); assignments, `if` merges and selects check kinds.
+- **Codegen**: a bundle value is a `BRef` with its own wires, created per colour on first read
+  and connected to all producers at the end (`bfinish`); bundle combinators read the bundle on
+  red and numbers from the bus on green (never both on red: user bundles may contain any
+  signal, including the compiler's own). Bundle registers: hold decider (`everything` copy
+  from red while no load) plus `each * enable` loads; samples likewise. Pipelined blocks delay
+  bundles with `each + 0` combinators.
+- **Layout**: bundle wires can join distant entities (ports at the edges), so long hops go
+  through relay poles placed greedily on free tiles.
+
+### Tooling
+- `--set stock=iron-plate:5,copper-plate:3@10`; `sim` prints bundles as `{name=value,…}`.
+- The in-game harness sets bundle injectors slot by slot and records bundle outputs from
+  `signals_last_tick`; difftest compares canonical strings.
+- `tools/fuzz_bundles.py`: random bundle expressions/comprehensions in `every tick`,
+  `every 20 ticks` and main-loop programs against a Python model of `each` semantics.
+
+### Status
+- New examples `requester`, `inventory`, `deliveries`, `bundles`; all difftest-match the game.
+- Fuzzer: 300 programs, 0 mismatches.
+- Not yet: `argmax`/`nth`, runtime `Signal`, `for s, v in b.items():`, quality.
+- Cost: pipelined blocks give every output its own register; outputs that are pure functions
+  of the inputs could skip it (and its delay taps). Worth doing with the layout work.
+
+## 2026-10-09 — Optimisations: register-free outputs, step fusion, late scheduling
+
+Measured with `tools/bench.sh` (combinators per example; before → after):
+inventory 70 → 52, math 127 → 95, deliveries 41 → 33, requester 11 → 6, bundles 66 → 61,
+demo 30 → 28, arrays 182 → 179; calculator and primes +2 (step copies) but faster.
+
+- **Register-free outputs** (codegen `combinational`): an output of an `every tick` block that
+  is assigned once, unconditionally (or constants under conditions), and read by no process,
+  needs no register: the output port reads the pipeline. Constant-under-condition outputs
+  (bools, `x if c else k`) become one decider per constant. When other states of the block
+  still use registers, these outputs are taken one tick later so an iteration's outputs
+  still change together; otherwise the warm-up taps aren't needed at all.
+- **Late scheduling** (pipeline.rs): input-only values can be computed as late as possible,
+  so alignment delays sit on the inputs (shared by every consumer) instead of on each result.
+  Both schedules are costed in delay combinators and the cheaper one is kept (late scheduling
+  loses when one result has many consumers, e.g. arrays).
+- **Step fusion** (cfg.rs `fuse`): `A; goto B` merges into one step when B doesn't wait; B is
+  copied if it has other predecessors and is small (≤ 6 statements). Steps rarely end in a
+  plain jump (loops are rotated, straight code is already one step), so the gain is in
+  runtime: calculator 786 → 752 ticks, primes 801 → 717.
+- **Fix**: a variable is inferred `bool` only if every assignment is syntactically boolean.
+
+Where the time goes now: a step lasts its logic depth + 1 tick (the register), which is
+already the minimum for register-based steps; loop iterations are bounded by the depth of
+their loop-carried calculation. Further: if-conversion of branch targets (merge a branch's
+simple successor into the branching step), register sharing, real placement.
