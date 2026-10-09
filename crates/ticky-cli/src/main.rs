@@ -50,6 +50,9 @@ enum Cmd {
         /// Don't warn about signal names Ticky doesn't know (modded names).
         #[arg(long)]
         allow_unknown_signals: bool,
+        /// Compile with runtime checks (see `build --checks`).
+        #[arg(long)]
+        checks: bool,
     },
     /// Simulate and print output ports whenever they change.
     Sim {
@@ -66,6 +69,9 @@ enum Cmd {
         /// Don't warn about signal names Ticky doesn't know (modded names).
         #[arg(long)]
         allow_unknown_signals: bool,
+        /// Compile with runtime checks (see `build --checks`).
+        #[arg(long)]
+        checks: bool,
     },
     /// Run the program in the simulator and in headless Factorio, and compare tick by tick.
     Difftest {
@@ -117,6 +123,10 @@ struct Placement {
     /// without the Quality mod (Space Age). Internal wiring then uses normal signals.
     #[arg(long)]
     no_quality: bool,
+    /// Runtime checks: failed `assert`s, out-of-range runtime indexes and division by zero
+    /// halt the process, light the error lamp and put a code on the `error` output (signal-E).
+    #[arg(long)]
+    checks: bool,
 }
 
 impl Placement {
@@ -175,7 +185,7 @@ fn print_diags(diags: &[Diag], file: &str, src: &str) {
 fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(String, String, Compiled), ExitCode> {
     let (name, src) = load(file)?;
     let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -328,7 +338,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false }
+    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false }
 }
 
 fn main() -> ExitCode {
@@ -353,7 +363,7 @@ fn main() -> ExitCode {
             }
         }),
         Cmd::Check { file, opt, place } => build(&file, false, opt, &place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file, allow_unknown_signals } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, ..default_place() }).and_then(|(name, src, c)| {
+        Cmd::Test { file, allow_unknown_signals, checks } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, ..default_place() }).and_then(|(name, src, c)| {
             let results = run_tests(&c, &src);
             if results.is_empty() {
                 eprintln!("no tests in {name}");
@@ -376,7 +386,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, ..default_place() }).and_then(|(_, _, c)| {
+        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals, checks } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, ..default_place() }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE

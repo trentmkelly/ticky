@@ -76,6 +76,9 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     _ => {}
                 }
             }
+            if matches!(op, BinOp::FloorDiv | BinOp::Mod) {
+                div_check(g, y, e.span);
+            }
             binop(g, *op, x, y)
         }
         // `a % b == 0` doesn't depend on the remainder's sign, so skip Python's correction.
@@ -88,6 +91,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
             let ExprKind::Binary(_, a, b) = &first.kind else { unreachable!() };
             let (x, y) = (expr(g, names, a)?, expr(g, names, b)?);
             let (x, y) = (bundle::int(g, x, a.span)?, bundle::int(g, y, b.span)?);
+            div_check(g, y, first.span);
             let r = match log2_const(g, y) {
                 Some(k) => {
                     let mask = g.konst((1 << k) - 1);
@@ -154,7 +158,13 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         ExprKind::BoolOp(op, items) => {
             let mut acc = expr(g, names, &items[0])?;
             for item in &items[1..] {
-                let next = expr(g, names, item)?;
+                // The right side only runs when the left doesn't decide the result.
+                let t = g.truth(acc);
+                let runs = if *op == BoolOp::And { t } else { g.not(t) };
+                g.path.push(runs);
+                let next = expr(g, names, item);
+                g.path.pop();
+                let next = next?;
                 same_kind(g, acc, next, item.span)?;
                 acc = if g.is_bool(acc) && g.is_bool(next) {
                     g.ar(if *op == BoolOp::And { ArOp::And } else { ArOp::Or }, acc, next)
@@ -174,7 +184,15 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         }
         ExprKind::IfExp { cond, then, orelse } => {
             let c = expr(g, names, cond)?;
-            let (a, b) = (expr(g, names, then)?, expr(g, names, orelse)?);
+            let t = g.truth(c);
+            g.path.push(t);
+            let a = expr(g, names, then);
+            g.path.pop();
+            let nt = g.not(t);
+            g.path.push(nt);
+            let b = expr(g, names, orelse);
+            g.path.pop();
+            let (a, b) = (a?, b?);
             same_kind(g, a, b, orelse.span)?;
             g.mux(c, a, b)
         }
@@ -325,6 +343,23 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     arity(0)?;
                     names.ticks(g, e.span)?
                 }
+                // Internal (`--checks`): `#chk(i, n, x)` is `x`, an element at runtime index `i`
+                // of an array of `n`, checking the index.
+                "#chk" => {
+                    let n = vals[1];
+                    let z = g.konst(0);
+                    let (lo, hi) = (g.cmp(CmpOp::Lt, vals[0], z), g.cmp(CmpOp::Ge, vals[0], n));
+                    let bad = g.ar(ArOp::Or, lo, hi);
+                    g.check(bad, e.span, "index out of range");
+                    vals[2]
+                }
+                // Internal (`--checks`): `#ixok(i, n)`: is `i` a valid index for an array of `n`.
+                "#ixok" => {
+                    let n = vals[1];
+                    let z = g.konst(0);
+                    let (lo, hi) = (g.cmp(CmpOp::Ge, vals[0], z), g.cmp(CmpOp::Lt, vals[0], n));
+                    g.ar(ArOp::And, lo, hi)
+                }
                 // Internal: `#select(i, x0, x1, …)` is `x_i`, or 0 when `i` is out of range.
                 "#select" => {
                     let i = vals[0];
@@ -364,6 +399,13 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
             return Err(Diag::error(e.span, "tuples and lists can only be used in assignments like `a, b = b, a`"))
         }
     })
+}
+
+/// With `--checks`: division (or remainder) by `y` fails when `y` is 0.
+pub fn div_check(g: &mut Graph, y: V, span: Span) {
+    let z = g.konst(0);
+    let zero = g.cmp(CmpOp::Eq, y, z);
+    g.check(zero, span, "division by zero");
 }
 
 /// Both sides of a select (or `and`/`or`) must be the same kind of value.

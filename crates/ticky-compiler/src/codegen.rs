@@ -23,7 +23,7 @@ use ticky_syntax::{Diag, Span};
 
 use crate::fuse::{is_true, LoadVal, WriterPlan};
 use crate::ir::{BOp, BTerm, Dnf, FOut, Graph, Lit, Op, V};
-use crate::program::{Next, Program, SrcKind, StepKind, Ty, WaitN, MAIN};
+use crate::program::{Next, Program, SrcKind, StepKind, Ty, WaitN};
 
 /// A bundle value: everything its producers output, on its own wires (never the bus).
 type BRef = usize;
@@ -87,6 +87,8 @@ pub struct StepStats {
 }
 
 pub struct MainStats {
+    /// `main` or the process's name.
+    pub name: String,
     pub steps: Vec<StepStats>,
     pub combinators: usize,
 }
@@ -105,7 +107,8 @@ pub struct Codegen {
     pub port_ents: Vec<EntId>,
     pub run_switch: EntId,
     pub blocks: Vec<BlockStats>,
-    pub main: Option<MainStats>,
+    /// Sequential processes, in `Program::procs` order.
+    pub procs: Vec<MainStats>,
     pub signals_used: usize,
 }
 
@@ -186,6 +189,8 @@ struct Cg {
     bvals: Vec<BVal>,
     each: Sig,
     everything: Sig,
+    /// With `--checks`: the error code register (the first failed check's code).
+    err: Option<Sig>,
 }
 
 /// A condition read from the bus only (for combinators whose red input carries a bundle).
@@ -814,6 +819,33 @@ impl Cg {
         Ok(self.warm[n - 1])
     }
 
+    /// `--checks`: one decider per failing check (`None`: always fails), firing with the
+    /// conditions `base` when no earlier check of the same group fails and no error is recorded
+    /// yet. It loads the check's code into the error register (and pulses `also`, e.g. a
+    /// process's ANY so that it halts).
+    fn error_deciders(&mut self, base: &[Cond], also: Option<Sig>, fails: &[(Option<Sig>, i32)], what: &str) {
+        let Some(e) = self.err else { return };
+        for (k, (bad, code)) in fails.iter().enumerate() {
+            let mut conds = base.to_vec();
+            conds.extend(bad.map(|x| c(x, CmpOp::Ne, 0)));
+            for (earlier, _) in &fails[..k] {
+                conds.push(self.passes(*earlier));
+            }
+            conds.push(c(e, CmpOp::Eq, 0));
+            let mut outs = vec![out_const(e, *code)];
+            outs.extend(also.map(|a| out_const(a, 1)));
+            self.core(dec(conds, outs), format!("{what}: check {code} failed (error code)"));
+        }
+    }
+
+    /// The condition that a check passes (`None`: never).
+    fn passes(&self, fail: Option<Sig>) -> Cond {
+        match fail {
+            Some(x) => c(x, CmpOp::Eq, 0),
+            None => c(self.run, CmpOp::Lt, i32::MIN),
+        }
+    }
+
     fn combinators_since(&self, first: EntId) -> usize {
         self.net.entities[first..].iter().filter(|e| e.kind.is_combinator()).count()
     }
@@ -830,6 +862,17 @@ struct Writer<'a> {
     lit: &'a dyn Fn(&Lit) -> Cond,
     /// Conditions read one tick earlier, by enable deciders.
     lit_eg: &'a dyn Fn(&Lit) -> Cond,
+}
+
+/// Where each check's failure condition is (`None`: a constant failure), with its code.
+fn fail_sigs(checks: &[crate::program::Check], loc: &dyn Fn(V) -> Ref) -> Vec<(Option<Sig>, i32)> {
+    checks
+        .iter()
+        .map(|ck| match loc(ck.fail).op() {
+            Operand::Sig(x) => (Some(x), ck.code),
+            Operand::Const(_) => (None, ck.code),
+        })
+        .collect()
 }
 
 fn lit_cond(l: &Lit, loc: &dyn Fn(V) -> Ref) -> Cond {
@@ -887,7 +930,7 @@ fn live_states(p: &Program) -> Vec<bool> {
     for b in &p.blocks {
         mark(&b.srcs);
     }
-    if let Some(m) = &p.main {
+    for m in &p.procs {
         mark(&m.srcs);
     }
     live
@@ -908,7 +951,7 @@ fn combinational(p: &Program, live: &[bool]) -> std::collections::HashSet<usize>
     for b in &p.blocks {
         mark(&b.srcs);
     }
-    if let Some(m) = &p.main {
+    for m in &p.procs {
         mark(&m.srcs);
     }
     let mut out = std::collections::HashSet::new();
@@ -956,6 +999,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         bvals: Vec::new(),
         each: t.special("signal-each"),
         everything: t.special("signal-everything"),
+        err: None,
     };
     let mut state_bun: HashMap<usize, BRef> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {
@@ -978,11 +1022,25 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     );
     cg.nets[0].members.push((run_switch, Conn::Green));
 
-    let any = if p.main.is_some() { Some(cg.alloc()?) } else { None };
+    // One ANY signal per process: its step-commit pulse (also emitted by ST).
+    let mut anys = Vec::new();
+    for _ in &p.procs {
+        anys.push(cg.alloc()?);
+    }
     cg.core(dec_const(vec![c(run, CmpOp::Ne, 0)], rp, 1), "control: RUN delayed one tick");
     let mut st_outs = vec![out_const(st, 1)];
-    st_outs.extend(any.map(|a| out_const(a, 1)));
+    st_outs.extend(anys.iter().map(|a| out_const(*a, 1)));
     cg.core(dec(vec![c(run, CmpOp::Ne, 0), c(rp, CmpOp::Eq, 0)], st_outs), "control: start pulse (loads initial values)");
+    // `--checks`: the error register (loaded once, by the first failing check) and the lamp.
+    if p.error_port.is_some() {
+        let e = cg.alloc()?;
+        cg.err = Some(e);
+        cg.core(dec_copy(vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], e), "checks: error code (hold)");
+        let lamp = cg.net.add(Kind::Lamp(c(e, CmpOp::Ne, 0)), Role::ErrorLamp);
+        cg.net.entities[lamp].description =
+            Some("Ticky error lamp (--checks): lights when a runtime check fails; the `error` output port gives the code.".into());
+        cg.nets[0].members.push((lamp, Conn::Green));
+    }
     let ticks = if p.uses_ticks() {
         let tk = cg.alloc()?;
         cg.counter(tk, vec![c(rp, CmpOp::Ne, 0)], "ticks() counter");
@@ -1081,11 +1139,15 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
             src_ref.push(if let SrcKind::Own(_) = kind { raw } else { cg.sample_ref(raw, ei, &format!("{what}: {name}"))? });
         }
         let plans: Vec<&(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).collect();
-        let roots: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
+        let mut roots: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
+        roots.extend(b.checks.iter().map(|ck| ck.fail));
         let src = |s: u32| src_ref[s as usize];
         let nodes = cg.logic(&b.graph, &roots, &src, &what)?;
         let loc = |v: V| locate(&b.graph, v, &src, &nodes);
         let lit = |l: &Lit| lit_cond(l, &loc);
+        // Checks are read with the commit; the block keeps running.
+        let fails = fail_sigs(&b.checks, &loc);
+        cg.error_deciders(&es_prefix, None, &fails, &what);
         for (si, s) in p.states.iter().enumerate() {
             if s.owner != Some(bi) || !live[si] {
                 continue;
@@ -1111,14 +1173,33 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         });
     }
 
-    let main = match &p.main {
-        Some(m) => Some(main_proc(&mut cg, p, m, &shared, any.unwrap(), &live)?),
-        None => None,
-    };
+    let mut procs = Vec::new();
+    for (m, any) in p.procs.iter().zip(&anys) {
+        procs.push(main_proc(&mut cg, p, m, &shared, *any, &live)?);
+    }
 
     // Output ports: the state's value while running, 0 when stopped.
     for (pi, port) in p.ports.iter().enumerate() {
         if port.dir != PortDir::Output {
+            continue;
+        }
+        if p.error_port == Some(pi) {
+            let e = cg.err.unwrap();
+            let id = cg.net.add(arith(Operand::Sig(e), ArOp::Mul, Operand::Sig(run), port.sig), Role::OutputPort { name: port.name.clone(), signal: port.sig });
+            if outputs_west {
+                // Same shape as the other outputs: a gate here, the port at the west edge.
+                cg.net.entities[id].role = Role::OutputGate { name: port.name.clone() };
+            }
+            cg.net.entities[id].dir = Dir::East;
+            cg.net.entities[id].description = Some("Ticky output `error` (--checks): the code of the first failed runtime check (see the build report), 0 while all is well.".into());
+            cg.nets[0].members.push((id, Conn::InGreen));
+            port_ents[pi] = id;
+            if outputs_west {
+                let a = Arith { first: Operand::Sig(port.sig), first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, op: ArOp::Add, out: port.sig };
+                let out = cg.net.add(Kind::Arith(a), Role::OutputPort { name: port.name.clone(), signal: port.sig });
+                cg.net.entities[out].dir = Dir::West;
+                port_ents[pi] = out;
+            }
             continue;
         }
         let si = p.output_state(pi).unwrap();
@@ -1182,7 +1263,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     }
     cg.bfinish();
 
-    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, main, signals_used: cg.used })
+    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, procs, signals_used: cg.used })
 }
 
 /// A block that runs every tick: logic is a balanced pipeline reading inputs directly.
@@ -1509,7 +1590,7 @@ fn main_proc(
     let pc_of = |s: Option<usize>| s.map_or(0, |i| i as i32 + 1);
 
     // Step timer: ticks since the current step started.
-    cg.counter(tm, vec![c(any, CmpOp::Eq, 0), c(rp, CmpOp::Ne, 0)], "main: step timer");
+    cg.counter(tm, vec![c(any, CmpOp::Eq, 0), c(rp, CmpOp::Ne, 0)], &format!("{}: step timer", m.name));
 
     // Sources: own variables directly, inputs and other processes' state sampled at each
     // step start, and live (unsampled) versions for `wait until`.
@@ -1517,7 +1598,7 @@ fn main_proc(
     for &kind in &m.srcs {
         let (raw, name) = shared.raw(p, kind);
         src_ref.push(match kind {
-            SrcKind::Input(_) | SrcKind::Foreign(_) | SrcKind::Ticks => cg.sample_ref(raw, any, &format!("main: {name}"))?,
+            SrcKind::Input(_) | SrcKind::Foreign(_) | SrcKind::Ticks => cg.sample_ref(raw, any, &format!("{}: {name}", m.name))?,
             _ => raw,
         });
     }
@@ -1527,7 +1608,7 @@ fn main_proc(
         s.plans.retain(|(si, _)| live[*si]);
     }
     let roots: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
-    let nodes = cg.logic(g, &roots, &src, "main")?;
+    let nodes = cg.logic(g, &roots, &src, &m.name)?;
     let loc = |v: V| locate(g, v, &src, &nodes);
     let opnd = |v: V| loc(v).op();
     let sig_of = |v: V| loc(v).sig();
@@ -1545,7 +1626,7 @@ fn main_proc(
     let mut cm: Vec<Option<(Sig, Vec<Cond>)>> = Vec::new();
     let mut stats = Vec::new();
     for (i, s) in steps.iter().enumerate() {
-        let line = format!("main step {}", i + 1);
+        let line = format!("{} step {}", m.name, i + 1);
         let mut prefix = vec![c(pc, CmpOp::Eq, i as i32 + 1), c(any, CmpOp::Eq, 0)];
         let mut extra: CDnf = vec![vec![]];
         // Commits land `depth` ticks after the step starts (at least one), when everything
@@ -1582,6 +1663,15 @@ fn main_proc(
                 format!("n ticks (≥ {})", ready + 2)
             }
         };
+        // Checks: the step only commits if they all pass; otherwise an error decider records
+        // the first failure's code and pulses ANY without a commit, so the PC drops to 0
+        // (halted).
+        let fails = fail_sigs(&s.checks, &loc);
+        let base = prefix.clone();
+        for (f, _) in &fails {
+            prefix.push(cg.passes(*f));
+        }
+        cg.error_deciders(&base, Some(any), &fails, &line);
         let cms = cg.alloc()?;
         cg.core(dec(distribute(&prefix, &extra), vec![out_const(cms, 1), out_const(any, 1)]), format!("{line}: commit"));
         cm.push(Some((cms, prefix)));
@@ -1628,15 +1718,15 @@ fn main_proc(
             }
         }
     }
-    cg.core(dec_copy(vec![c(any, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], pc), "main: program counter (hold)");
-    cg.core(dec_const(vec![c(st, CmpOp::Ne, 0)], pc, pc_of(Some(m.entry))), "main: program counter (start)");
+    cg.core(dec_copy(vec![c(any, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], pc), format!("{}: program counter (hold)", m.name));
+    cg.core(dec_const(vec![c(st, CmpOp::Ne, 0)], pc, pc_of(Some(m.entry))), format!("{}: program counter (start)", m.name));
     for k in pc_loads {
-        cg.core(k, "main: program counter (next step)");
+        cg.core(k, format!("{}: program counter (next step)", m.name));
     }
 
     // Variables.
     for (si, s) in p.states.iter().enumerate() {
-        if s.owner != Some(MAIN) || !live[si] {
+        if s.owner != Some(m.owner) || !live[si] {
             continue;
         }
         let mut ws = Vec::new();
@@ -1668,7 +1758,7 @@ fn main_proc(
             .collect();
         let ws: Vec<Writer> =
             plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit }).collect();
-        cg.register(r, 0, &ws, &format!("main: return address of `{func}`"))?;
+        cg.register(r, 0, &ws, &format!("{}: return address of `{func}`", m.name))?;
     }
-    Ok(MainStats { steps: stats, combinators: cg.combinators_since(first_ent) })
+    Ok(MainStats { name: m.name.clone(), steps: stats, combinators: cg.combinators_since(first_ent) })
 }

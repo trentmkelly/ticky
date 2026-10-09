@@ -72,7 +72,7 @@ struct Builder<'a> {
 /// Statements that can stay inside a step (after flattening any inlined blocks).
 fn is_simple(stmts: &[Stmt]) -> bool {
     stmts.iter().all(|s| match &s.kind {
-        StmtKind::Assign { .. } | StmtKind::AugAssign { .. } | StmtKind::AnnAssign { .. } | StmtKind::Pass => true,
+        StmtKind::Assign { .. } | StmtKind::AugAssign { .. } | StmtKind::AnnAssign { .. } | StmtKind::Pass | StmtKind::Assert(_) => true,
         StmtKind::Expr(_) => true,
         StmtKind::If { .. } | StmtKind::Block { .. } => crate::expand::flattenable(s),
         _ => false,
@@ -124,7 +124,12 @@ impl Builder<'_> {
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), Diag> {
         match &s.kind {
-            StmtKind::Assign { .. } | StmtKind::AugAssign { .. } | StmtKind::AnnAssign { .. } | StmtKind::Pass | StmtKind::Expr(_) => {
+            StmtKind::Assign { .. }
+            | StmtKind::AugAssign { .. }
+            | StmtKind::AnnAssign { .. }
+            | StmtKind::Pass
+            | StmtKind::Expr(_)
+            | StmtKind::Assert(_) => {
                 self.steps[self.cur].stmts.push(s.clone());
             }
             StmtKind::Block { label, body } => {
@@ -223,13 +228,8 @@ impl Builder<'_> {
             }
             StmtKind::Return(_) => return Err(Diag::error(s.span, "`return` outside a function")),
             StmtKind::Global(_) => return Err(Diag::error(s.span, "`global` is only meaningful inside a function")),
-            StmtKind::Assert(_) => {
-                return Err(Diag::error(s.span, "`assert` in programs isn't supported yet (planned with `--checks`)"))
-            }
             StmtKind::Def { .. } => return Err(Diag::error(s.span, "`def` isn't supported yet (planned for level 2)")),
-            StmtKind::Process { .. } => {
-                return Err(Diag::error(s.span, "`process` isn't supported yet (planned for level 5)"))
-            }
+            StmtKind::Process { .. } => return Err(Diag::error(s.span, "processes must be declared at the top level of the file")),
             StmtKind::Every { .. } | StmtKind::Port { .. } | StmtKind::Test { .. } => {
                 return Err(Diag::error(s.span, "declarations must be at the top level of the file"))
             }

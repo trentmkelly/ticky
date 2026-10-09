@@ -14,12 +14,14 @@ every tick:
         steam_on = False
 ```
 
-**Status: levels 0–3.** Programs are made of ports, constants, `every` blocks and ordinary
+**Status: levels 0–5.** Programs are made of ports, constants, `every` blocks and ordinary
 sequential code (`while`, `for`, `if`, `break`/`continue`, `wait until`, `wait n`, `ticks()`),
-with functions (`def`, defaults, keyword arguments, tuple returns), fixed-size arrays
-(`[0] * 8`, indexing, comprehensions, `sum`/`min`/`max`) and **bundles**: everything on a wire
-as one value, with element-wise arithmetic, dict comprehensions and reductions (SPEC §4.3).
-Large RAM arrays and runtime `Signal` values come in later levels (SPEC §16).
+with functions (`def`, defaults, keyword arguments, tuple returns), arrays (`[0] * 8`,
+indexing, comprehensions, `sum`/`min`/`max`/`sorted`; arrays indexed at runtime live on
+signals, SPEC §4.4), **bundles** (everything on a wire as one value, with element-wise
+arithmetic, dict comprehensions and reductions, SPEC §4.3), concurrent **processes**
+(`process name:`, SPEC §9.2) and runtime checks (`--checks`, SPEC §13). Runtime `Signal`
+values and bundle iteration come in level 6 (SPEC §16).
 
 ```python
 input  stock: Bundle = port("Logistic network contents")
@@ -64,6 +66,7 @@ ticky build prog.ticky --place=anneal   # experimental: smaller footprint by sim
 ticky build prog.ticky --place=anneal --max-width 30   # ... at most 30 tiles wide (or --max-height)
 ticky build prog.ticky --allow-unknown-signals         # no warnings for modded item/recipe names
 ticky build prog.ticky --no-quality    # for games without the Quality mod (see below)
+ticky build prog.ticky --checks        # runtime checks: error lamp + `error` code output
 ticky check prog.ticky                  # errors, warnings and the cost report
 ticky test  prog.ticky                  # run the program's `test` blocks in the simulator
 ticky sim   prog.ticky --ticks 300 --set charge=10 --set charge=90@100   # print output changes
@@ -95,6 +98,9 @@ off and on.
   (uncommon to legendary), so it needs the Quality mod (part of Space Age), and every normal
   signal is yours: nothing a program reads or writes collides with the internals. Build with
   `--no-quality` for a game without it.
+- **Error lamp** (`--checks` only): the lamp beside the RUN switch lights red when a runtime
+  check fails (an `assert`, an index out of range, a division by zero); the `error` output
+  (signal-E) gives the check's code, and the build report lists what each code means.
 - Every port's in-game description names it, e.g. *"Ticky output `half` (int): sends signal-H…"*.
 
 ## Layout of this directory

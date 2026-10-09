@@ -328,3 +328,50 @@ width with exact rows, the best area within 2:1, a square block) and keeps the s
 Annealing is never larger than the grid now: `--no-poles --outputs=west` saves 9–14%
 (enf 1260 → 1120, sorting 1116 → 957); with poles the pole columns fix the width, so it
 ties the grid's footprint and saves relays.
+
+## 2026-10-09 — Level 5: processes and `--checks`
+
+### Processes (`process name:`, SPEC §9.2)
+- Parsed already; now each `process` (and `main`) is a `MainProc` in `Program::procs` with its
+  own owner id (`proc_owner(k)` counts down from `MAIN`), state machine (PC, step timer,
+  ANY), samples and subroutine return registers. ST pulses every process's ANY.
+- **Own variables.** After the prologue is known (program.rs), names a process assigns that
+  have no prologue value and aren't ports are renamed `P:x` throughout its body and its
+  subroutines. Only prologue variables (and outputs) are shared, so `main` and processes can
+  all use `i`; anything else could not legally be read by another process anyway. Display:
+  "`x` in process `P`"; reading another process's own variable says whose it is.
+- **Subroutines per process.** The expander namespaces subroutines by process (`P:f`, locals
+  `P:f.x`), so every process has its own copy (its own return register and locals).
+- Fixed on the way: the expander's module constants ignored assignments inside processes,
+  so `z = 1` in `main` turned a process's own `z` into the constant 1 (found by the fuzzer).
+- `tools/fuzz_procs.py`: 2–3 processes (sometimes `main`), each a random program from
+  fuzz_programs over its own a, b, c, chained by "result, then flag" handshakes; Python runs
+  them in order. 160 programs, 0 failures (after the fix). handshake (§15.10) matches the game.
+
+### Runtime checks (`--checks`, SPEC §13)
+- Thread-local `checks_on()` (like the quality pool). Hooks: the expander turns `assert e`
+  into a statement (dropped without `--checks`), adds `assert #ixok(i, n)` before runtime
+  writes and wraps runtime reads in `#chk(i, n, read)`; lowering records `g.check(fail,
+  span, what)` for those and for `//`/`%` (also `//=`/`%=`) by a divisor that may be 0.
+- **Path conditions** (`Graph::path`): `if` branches, `x if c else y` and the right side of
+  `and`/`or` push their condition, and a check's failure condition is ANDed with the path, so
+  `x // y if y else 0` never fails. Constant-false checks vanish by interval/constant folding.
+- **Steps**: checks are fused (`fused_checks`) and read by the commit decider (`fail == 0`
+  for each, which also gates the guarded-load enables) one tick before the commit, so a step
+  with checks may be one tick longer. One error decider per check (same timing conditions,
+  `fail_k != 0`, earlier checks passing, `ERR == 0`) loads the code into ERR and pulses ANY
+  without a commit: PC drops to 0 (halted). ERR is one hold decider; codes are numbered
+  blocks first, then processes in step order, and listed in the build report.
+- `every` blocks: checks force multi-cycle (no pipeline); error deciders fire with the commit
+  pulse's conditions; the block keeps running.
+- Error lamp (`Kind::Lamp`, `Role::ErrorLamp`, beside the RUN switch, on the bus; blueprint
+  format dumped from the game with the `lampdump` scenario: `circuit_enabled`,
+  `circuit_condition`, `color`) and a synthetic `error` output port (signal-E). The harness
+  now writes lamps' states (`lamps.txt`): off before, lit after a failure, in-game.
+- In constant expressions a failing check (division by zero) makes the expression non-
+  constant, so it runs (and fails) at run time; a constant assert that fails stops the
+  prologue the same way.
+- `CHECKS=1 tools/fuzz_programs.py`: Python raising ZeroDivisionError ⇔ the circuit's error
+  output nonzero, otherwise identical values and error 0: 200 programs, 0 failures.
+- Example `checks` (first line `# ticky: --checks`, which tests/examples.rs honours) matches
+  the game, including a block division by zero, an assert and a RUN reset.

@@ -21,6 +21,9 @@ fn examples_compile_and_pass() {
         count += 1;
         let src = std::fs::read_to_string(&path).unwrap();
         let name = path.display().to_string();
+        // `# ticky: --checks` on the first line: the tests need runtime checks.
+        let checks = src.starts_with("# ticky: --checks");
+        let opts = || Options { checks, ..opts() };
         let c = compile(&src, &opts()).unwrap_or_else(|d| {
             panic!("{}", d.iter().map(|d| d.render(&name, &src)).collect::<String>())
         });
@@ -92,6 +95,30 @@ fn helpful_errors() {
     assert!(error_of("input b: Bundle @ A\n").contains("no `@ signal`"));
     assert!(error_of(&format!("{b}every tick:\n    o = b + 1 if y else 0\n")).contains("the other side is a bundle"));
     assert!(error_of("for i in range(0, 10, 0):\n    pass\n").contains("can't be 0"));
+    // Processes.
+    assert!(error_of("output y: int\nprocess a:\n    y = 1\nprocess b:\n    y = 2\n").contains("more than one process"));
+    assert!(error_of("output y: int\nprocess a:\n    x = 1\nprocess b:\n    y = x\n").contains("belongs to process `a`"));
+    assert!(error_of("output y: int\nprocess a:\n    y = 1\nprocess a:\n    y = 2\n").contains("already the name"));
+    assert!(error_of("output y: int\ninput k: int\nx = k\nprocess a:\n    y = x\n").contains("might not have run yet"));
+    assert!(error_of("output y: int\nwhile True:\n    process a:\n        y = 1\n").contains("top level"));
+    // `--checks` reserves the `error` port.
+    let c = compile("output error: int\nerror = 1\n", &Options { checks: true, ..opts() });
+    assert!(c.is_err_and(|d| d[0].message.contains("reserved")));
+}
+
+/// Variables a process assigns are its own unless they have an initial value at the top of
+/// the file; subroutines are compiled once per process.
+#[test]
+fn processes_have_their_own_variables() {
+    let src = "output a: int @ A\noutput b: int @ B\ndef tri(k):\n    t = 0\n    for i in range(k + 1):\n        t += i\n    return t\n\
+               process p:\n    for i in range(3):\n        wait 2\n    a = tri(4) + 2\n\
+               for i in range(5):\n    wait 1\nb = tri(3) + 4\n\
+               test \"t\":\n    run 100 ticks\n    assert a == 12 and b == 10\n";
+    let c = compile(src, &opts()).unwrap();
+    assert_eq!(c.cg.procs.len(), 2);
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+    }
 }
 
 #[test]

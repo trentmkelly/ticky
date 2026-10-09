@@ -341,6 +341,12 @@ pub struct Graph {
     bun: Vec<bool>,
     /// Whether each node depends on the comprehension placeholder ([`Op::Each`]).
     each_dep: Vec<bool>,
+    /// Runtime checks (`--checks`): a condition that is true when the check fails, where it
+    /// is, and what it checks.
+    pub checks: Vec<(V, ticky_syntax::Span, &'static str)>,
+    /// Conditions under which the code being lowered runs (the branches of `if`s and of
+    /// `x if c else y`, the right side of `and`/`or`): a check only fails where it runs.
+    pub path: Vec<V>,
 }
 
 impl Graph {
@@ -518,6 +524,28 @@ impl Graph {
             return a;
         }
         self.intern(Op::Cmp(op, a, b))
+    }
+
+    /// Records a runtime check that fails when `fail` is true (with `--checks` only).
+    pub fn check(&mut self, fail: V, span: ticky_syntax::Span, what: &'static str) {
+        if !crate::checks_on() {
+            return;
+        }
+        let mut f = self.truth(fail);
+        for p in self.path.clone() {
+            f = self.ar(ArOp::And, f, p);
+        }
+        if self.as_const(f) != Some(0) {
+            self.checks.push((f, span, what));
+        }
+    }
+
+    /// Runs `f` with `cond` (a 0/1 value) added to the path condition.
+    pub fn under<T>(&mut self, cond: V, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.path.push(cond);
+        let r = f(self);
+        self.path.pop();
+        r
     }
 
     /// Python truthiness as a 0/1 value (a bundle is true when it has any signal).

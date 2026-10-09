@@ -2,8 +2,9 @@
 
 > A Python-like language that compiles to Factorio 2.0 combinator blueprints.
 
-- **Status:** Levels 0–4 implemented (Level 3: the bundle core, §4.3.5; Level 4: signal
-  arrays, §4.4), plus the first optimisation passes (see NOTES.md); later levels are design
+- **Status:** Levels 0–5 implemented (Level 3: the bundle core, §4.3.5; Level 4: signal
+  arrays, §4.4; Level 5: processes and `--checks`, §9.2, §13), plus the first optimisation
+  passes (see NOTES.md); later levels are design
 - **Target:** Factorio 2.0. By default the compiler wires its internals with *quality*
   variants of signals (uncommon to legendary), which needs the Quality mod (part of Space
   Age); `--no-quality` builds for the base game alone, with normal signals inside.
@@ -397,7 +398,7 @@ impure, short-circuiting is honoured with real control flow.
 | `break`, `continue`, `pass`, `return` | |
 | `wait until cond` | §9.3 |
 | `wait n` | §9.3 |
-| `assert cond` | Simulator: fails the run. Build with `--checks`: halts and lights the error lamp. Otherwise removed. |
+| `assert cond` | Built with `--checks`: a failure halts the process, lights the error lamp and outputs a code (§13). Otherwise removed, like `python -O` (its expression isn't evaluated). |
 | `print(...)` | Simulator only, logs with the tick number. Removed from blueprints (with a note in the build report). |
 | `global x` | Required to assign module-level state inside a `def`, as in Python |
 
@@ -513,7 +514,20 @@ process blinker:
 ```
 
 Each `process` is an independent state machine that runs concurrently with `main` and with the
-other processes. Processes start together.
+other processes. Processes start together. A process that reaches the end of its body halts,
+like `main`.
+
+- **Variables.** A variable that a process assigns is the process's own, unless it has an
+  initial value at the top of the file (the prologue, §9.1) or is a port: only those are
+  shared, and subject to the single-writer rule (§9.6). So two processes (or a process and
+  `main`) can each use `i`, `total`, … without clashing, while `ready = False` at the top
+  makes `ready` one variable that one process writes and the others read. (Nothing else
+  could be shared anyway: a variable without an initial value might not have been assigned
+  yet when another process reads it.)
+- **Functions** called from several processes are inlined per call or, when they contain
+  loops or waits, compiled as one subroutine *per process* (each process has its own program
+  counter, so it needs its own copy).
+- Process names must differ from each other, from `main` and from function names.
 
 ### 9.3 Waiting
 
@@ -536,7 +550,7 @@ iteration starts.
 
 Bots build blueprints entity by entity, and a program that starts half-built would compute
 garbage. So **every blueprint includes a RUN switch**: a constant combinator, saved as *off*,
-next to the input ports. Each blueprint also includes an error lamp (§13).
+next to the input ports. Blueprints built with `--checks` also include an error lamp (§13).
 
 - While RUN is off, all state is held at initial values, all outputs read 0, and nothing runs.
 - Turning RUN on starts everything on the same tick.
@@ -555,6 +569,13 @@ Losing power freezes the circuit and losing combinators breaks it. Both are outs
   set the flag; wait for the flag, then read the data" pattern is safe.
 - For a value that several processes contribute to, give each its own variable and combine them
   in the reader.
+
+**Implementation.** Each process is its own state machine (program counter, step timer and
+commit pulse ANY). A reader samples other processes' variables when its own step starts (and
+reads them live in `wait until`), so a write committed on tick `t` is seen by any step that
+starts after `t`; writes in one step commit together. Verified in-game with §15.10
+(examples/handshake.ticky) and fuzzed against Python with chains of processes that pass
+results through "data, then flag" handshakes (tools/fuzz_procs.py).
 
 ---
 
@@ -689,14 +710,28 @@ Each item is deliberate, and the compiler gives a specific error or warning wher
 
 ## 13. Runtime checks and the error lamp
 
-Every blueprint contains an **error lamp** next to the RUN switch. Without `--checks` it is only
-used for one built-in condition: a process reaching an internal "impossible" state, which would
-indicate a compiler bug. With `--checks`:
+`ticky build --checks` adds runtime checks. The blueprint then has an **error lamp** next to
+the RUN switch and an extra output port, `error` (signal-E; the name is reserved under
+`--checks`):
 
-- `assert` failures, out-of-range runtime indices and division by zero halt the offending
-  process and light the lamp red.
-- The program also outputs a `signal-E` code on a dedicated port, identifying the failing source
-  location through a table printed in the build report.
+- `assert` failures, out-of-range runtime indexes (reads and writes, negative indexes
+  included) and division or remainder by zero (`//`, `%`, `//=`, `%=`; not `tdiv`/`tmod`,
+  which are Factorio's operations by name) are checked.
+- A check only fails where Python would actually evaluate it: `x // y if y else 0`,
+  `y != 0 and x // y > 3` and divisions inside `if y:` never fail when `y` is 0.
+- When a check fails in a process (`main` or a `process`), that step doesn't commit: the
+  process halts there, the lamp lights (red) and `error` gives the check's **code**. The build
+  report lists every code with its line, column, kind and process. Other processes keep
+  running. The first failure's code stays until the program is reset (RUN off and on).
+- In an `every` block a failed check lights the lamp and records the code, and the block keeps
+  running (it has no single place to stop). Blocks with checks run multi-cycle rather than
+  pipelined, so `--checks` can make such a block slower.
+- If checks in two processes fail on the very same tick, their codes add up.
+- Asserts whose value is known when compiling are checked then. A step with checks may take a
+  tick longer, because the checks must be ready one tick before the step commits.
+
+Without `--checks` there is no lamp and no `error` port: asserts are removed, and division by
+zero and out-of-range indexes behave as in §12.
 
 ---
 
@@ -944,7 +979,9 @@ while True:
     wait 300
     alarm = False
 ```
-Exercises: the single-writer rule, visibility ordering (§9.6) and `wait` with a runtime value.
+Exercises: the single-writer rule and visibility ordering (§9.6). Implemented as
+examples/handshake.ticky (with 60 and 30 instead of 600 and 300, so its tests run quickly);
+`watch` takes 5 ticks per iteration, so the alarm sounds after 60 iterations, not ticks.
 
 ### 15.11 Higher / lower guessing game (comfortable, interactive)
 
@@ -1023,7 +1060,7 @@ source ─parse→ AST ─sema→ typed AST ─lower→ CFG IR ─sched→ FSM +
 4. ✅ **Level 3:** `Bundle`: element-wise operations, comprehensions, reductions, selector
    combinator queries (§4.3.5; `argmax`/`nth` move to level 6).
 5. ✅ **Level 4:** signal arrays and banked RAM, runtime indexing, `sorted` (§4.4).
-6. **Level 5:** `process` concurrency, single-writer rule, `--checks`.
+6. ✅ **Level 5:** `process` concurrency, single-writer rule, `--checks`.
 7. **Level 6:** bundle iteration, runtime `Signal` values.
 8. **Optimisation passes:** ✅ decider fusion, guarded loads, loop rotation, one-tick
    pipelining and accumulators for `every tick:`, `--opt` modes, signal namespaces per logic

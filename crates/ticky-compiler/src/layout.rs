@@ -90,10 +90,15 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputGate { .. })).collect();
     let east_col: &[EntId] = if opts.outputs_west { &gates } else { &outputs };
     let run = net.find_role(|r| *r == Role::RunSwitch);
+    let lamp = net.find_role(|r| *r == Role::ErrorLamp);
 
-    // Left: RUN switch above the input ports (placed first: the annealer counts their wires).
+    // Left: RUN switch above the input ports, the error lamp beside it (placed first: the
+    // annealer counts their wires).
     if let Some(r) = run {
         net.entities[r].pos = (-1.5, 0.5);
+    }
+    if let Some(l) = lamp {
+        net.entities[l].pos = (-2.5, 0.5);
     }
     for (i, &id) in inputs.iter().enumerate() {
         net.entities[id].pos = (-2.0, i as f64 + 1.5);
@@ -123,7 +128,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         Some(a) => {
             // Wire networks as member lists, counting only entities with a position yet.
             let known: std::collections::HashSet<EntId> =
-                core.iter().copied().chain(run).chain(inputs.iter().copied()).collect();
+                core.iter().copied().chain(run).chain(lamp).chain(inputs.iter().copied()).collect();
             let members: Vec<Vec<EntId>> =
                 nets.iter().map(|n| n.members.iter().map(|(e, _)| *e).filter(|e| known.contains(e)).collect()).collect();
             // Limits are for the whole blueprint: leave room for the ports at the edges.

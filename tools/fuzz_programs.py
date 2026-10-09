@@ -6,6 +6,10 @@ variables a, b, c and inputs x, y; runs them with Python's exec (skipping progra
 value leaves 32 bits or divides by zero) and with the compiled circuit in the simulator, and
 compares the final values.
 
+With CHECKS=1 the programs are built with `--checks`: where Python raises
+ZeroDivisionError, the circuit must report an error (any code); elsewhere the error output
+must stay 0 and the values must match.
+
 usage: tools/fuzz_programs.py [COUNT] [SEED]
 """
 import os
@@ -123,15 +127,21 @@ class Gen:
         return []
 
 
-def run_python(body, x, y):
-    """Final (a, b, c) under Python semantics, or None if the program leaves 32 bits."""
+CHECKS = bool(os.environ.get("CHECKS"))
+
+
+def run_python(body, x, y, zero_ok=False):
+    """Final (a, b, c) under Python semantics, or None if the program leaves 32 bits (or
+    divides by zero; with `zero_ok`, that gives "div0")."""
     src = "\n".join(re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line) for line in body)
     env = {"_c": check, "min": min, "max": max, "x": x, "y": y, "a": 0, "b": 1, "c": 2}
     try:
         exec(src, env)  # pylint: disable=exec-used
         return tuple(check(env[v]) for v in VARS)
-    except (Overflow, ZeroDivisionError):
+    except Overflow:
         return None
+    except ZeroDivisionError:
+        return "div0" if zero_ok else None
 
 
 def main():  # pylint: disable=too-many-locals
@@ -144,7 +154,7 @@ def main():  # pylint: disable=too-many-locals
         g = Gen(r)
         body = g.block("", 3, r.randint(2, 6))
         x, y = r.randint(-20, 20), r.randint(-20, 20)
-        want = run_python(body, x, y)
+        want = run_python(body, x, y, CHECKS)
         if want is None:
             continue
         tested += 1
@@ -155,7 +165,7 @@ def main():  # pylint: disable=too-many-locals
         with tempfile.NamedTemporaryFile("w", suffix=".ticky", delete=False) as f:
             f.write(src)
             path = f.name
-        cmd = [TICKY, "sim", path, "--ticks", "20000", f"--set=x={x}", f"--set=y={y}"]
+        cmd = [TICKY, "sim", path, "--ticks", "20000", f"--set=x={x}", f"--set=y={y}"] + (["--checks"] if CHECKS else [])
         out = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if out.returncode != 0:
             failed += 1
@@ -163,6 +173,12 @@ def main():  # pylint: disable=too-many-locals
             continue
         last = [int(v) for v in out.stdout.strip().splitlines()[-1].split()[1:]]
         got = tuple(last[:3])
+        if CHECKS:
+            err = last[4]
+            if (want == "div0") != (err != 0) or (want != "div0" and (last[3] != 1 or got != want)):
+                failed += 1
+                print(f"MISMATCH ({path}) x={x} y={y}: python {want}, ticky {got} done={last[3]} error={err}")
+            continue
         if last[3] != 1 or got != want:
             failed += 1
             print(f"MISMATCH ({path}) x={x} y={y}: python {want}, ticky {got} done={last[3]}")

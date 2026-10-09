@@ -84,6 +84,8 @@ pub enum Kind {
     Selector(Selector),
     Constant(ConstComb),
     Pole,
+    /// A small lamp lit (red) while its circuit condition holds.
+    Lamp(Cond),
 }
 
 impl Kind {
@@ -94,6 +96,7 @@ impl Kind {
             Kind::Selector(_) => "selector-combinator",
             Kind::Constant(_) => "constant-combinator",
             Kind::Pole => "medium-electric-pole",
+            Kind::Lamp(_) => "small-lamp",
         }
     }
 
@@ -120,6 +123,8 @@ pub enum Role {
     /// line of poles to the output port.
     OutputGate { name: String },
     RunSwitch,
+    /// With `--checks`: lit while the error code is nonzero.
+    ErrorLamp,
     Power,
 }
 

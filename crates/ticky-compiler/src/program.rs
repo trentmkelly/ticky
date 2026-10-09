@@ -20,6 +20,16 @@ use ticky_factorio::ArOp;
 /// Owner id of the `main` process (every blocks are numbered from 0).
 pub const MAIN: usize = usize::MAX;
 
+/// Owner id of the `k`-th `process` (counting down from `MAIN`).
+pub fn proc_owner(k: usize) -> usize {
+    MAIN - 1 - k
+}
+
+/// Whether an owner id is a sequential process (`main` or a `process`), not an `every` block.
+pub fn is_proc(owner: usize) -> bool {
+    owner > usize::MAX / 2
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Ty {
     Int,
@@ -95,8 +105,27 @@ pub enum SrcKind {
     LiveTicks,
 }
 
+/// A runtime check (`--checks`): fails when `fail` is true; reported as `code`.
+#[derive(Clone, Debug)]
+pub struct Check {
+    pub fail: V,
+    pub code: i32,
+    pub span: Span,
+    pub what: &'static str,
+}
+
+/// A check's source location and kind, for the build report (`Program::checks[code - 1]`).
+pub struct CheckSite {
+    pub span: Span,
+    pub what: &'static str,
+    /// `main`, the process's name or `every`.
+    pub owner: String,
+}
+
 pub struct Block {
     pub span: Span,
+    /// Runtime checks (`--checks`).
+    pub checks: Vec<Check>,
     /// `every N ticks:`; `None` for `every tick:`.
     pub requested: Option<u32>,
     pub srcs: Vec<SrcKind>,
@@ -148,6 +177,8 @@ pub struct Step {
     pub depth: u32,
     /// For waits: ticks after the step starts until the wait condition can be checked.
     pub wait_ready: u32,
+    /// Runtime checks (`--checks`) in this step.
+    pub checks: Vec<Check>,
 }
 
 /// Nodes a condition needs: its condition lists' operands, or the node itself.
@@ -162,6 +193,7 @@ pub fn cond_operands(c: &CondPlan, both: bool) -> Vec<V> {
 impl Step {
     pub fn roots(&self) -> Vec<V> {
         let mut r: Vec<V> = self.plans.iter().flat_map(|(_, p)| p.operands()).collect();
+        r.extend(self.checks.iter().map(|c| c.fail));
         match &self.kind {
             StepKind::Run(Next::Branch(c, ..)) => r.extend(cond_operands(c, true)),
             StepKind::WaitUntil(c, _) => r.extend(cond_operands(c, false)),
@@ -183,6 +215,10 @@ impl Step {
 }
 
 pub struct MainProc {
+    /// `main` or the process's name.
+    pub name: String,
+    /// Owner id of its variables (`MAIN` or [`proc_owner`]).
+    pub owner: usize,
     pub srcs: Vec<SrcKind>,
     pub graph: Graph,
     pub steps: Vec<Step>,
@@ -204,9 +240,15 @@ pub struct Program {
     pub states: Vec<State>,
     pub consts: HashMap<String, Cv>,
     pub blocks: Vec<Block>,
-    pub main: Option<MainProc>,
+    /// Sequential processes: `main` (if there are top-level statements) first, then each
+    /// `process` in file order.
+    pub procs: Vec<MainProc>,
     pub tests: Vec<TestDef>,
     pub warnings: Vec<Diag>,
+    /// Runtime checks (`--checks`), by code - 1.
+    pub checks: Vec<CheckSite>,
+    /// With `--checks`: the `error` output port (signal-E) carrying the first failed check's code.
+    pub error_port: Option<usize>,
 }
 
 impl Program {
@@ -220,7 +262,7 @@ impl Program {
 
     pub fn uses_ticks(&self) -> bool {
         let uses = |srcs: &[SrcKind]| srcs.iter().any(|s| matches!(s, SrcKind::Ticks | SrcKind::LiveTicks));
-        self.blocks.iter().any(|b| uses(&b.srcs)) || self.main.as_ref().is_some_and(|m| uses(&m.srcs))
+        self.blocks.iter().any(|b| uses(&b.srcs)) || self.procs.iter().any(|m| uses(&m.srcs))
     }
 }
 
@@ -253,6 +295,94 @@ fn assigned_names(body: &[Stmt], out: &mut BTreeMap<String, Span>, errs: &mut Ve
             }
             StmtKind::While { body, .. } | StmtKind::Block { body, .. } => assigned_names(body, out, errs),
             _ => {}
+        }
+    }
+}
+
+/// Renames variables (wherever they are read or assigned) by `f`.
+fn rename_stmts(body: &mut [Stmt], f: &dyn Fn(&str) -> Option<String>) {
+    for s in body {
+        match &mut s.kind {
+            StmtKind::Assign { targets, value } => {
+                targets.iter_mut().for_each(|t| rename_expr(t, f));
+                rename_expr(value, f);
+            }
+            StmtKind::AugAssign { target, value, .. } => {
+                rename_expr(target, f);
+                rename_expr(value, f);
+            }
+            StmtKind::AnnAssign { target, value, .. } => {
+                rename_expr(target, f);
+                if let Some(v) = value {
+                    rename_expr(v, f);
+                }
+            }
+            StmtKind::Expr(e) | StmtKind::Assert(e) | StmtKind::WaitUntil(e) | StmtKind::WaitTicks(e) | StmtKind::Return(Some(e)) => {
+                rename_expr(e, f)
+            }
+            StmtKind::If { cond, body, orelse } => {
+                rename_expr(cond, f);
+                rename_stmts(body, f);
+                rename_stmts(orelse, f);
+            }
+            StmtKind::While { cond, body } => {
+                rename_expr(cond, f);
+                rename_stmts(body, f);
+            }
+            StmtKind::For { target, iter, body } => {
+                rename_expr(target, f);
+                rename_expr(iter, f);
+                rename_stmts(body, f);
+            }
+            StmtKind::Block { body, .. } => rename_stmts(body, f),
+            _ => {}
+        }
+    }
+}
+
+fn rename_expr(e: &mut Expr, f: &dyn Fn(&str) -> Option<String>) {
+    match &mut e.kind {
+        ExprKind::Name(n) => {
+            if let Some(m) = f(n) {
+                *n = m;
+            }
+        }
+        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) => {}
+        ExprKind::Unary(_, a) | ExprKind::Not(a) | ExprKind::Attr(a, _) => rename_expr(a, f),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+            rename_expr(a, f);
+            rename_expr(b, f);
+        }
+        ExprKind::Compare(a, rest) => {
+            rename_expr(a, f);
+            rest.iter_mut().for_each(|(_, x)| rename_expr(x, f));
+        }
+        ExprKind::BoolOp(_, items) | ExprKind::Tuple(items) | ExprKind::List(items) => items.iter_mut().for_each(|x| rename_expr(x, f)),
+        ExprKind::IfExp { cond, then, orelse } => {
+            rename_expr(cond, f);
+            rename_expr(then, f);
+            rename_expr(orelse, f);
+        }
+        // The function itself is not a variable.
+        ExprKind::Call { args, kwargs, .. } => {
+            args.iter_mut().for_each(|x| rename_expr(x, f));
+            kwargs.iter_mut().for_each(|(_, x)| rename_expr(x, f));
+        }
+        ExprKind::ListComp { elt, target, iter, conds } => {
+            for x in [elt, target, iter] {
+                rename_expr(x, f);
+            }
+            conds.iter_mut().for_each(|x| rename_expr(x, f));
+        }
+        ExprKind::Dict(items) => items.iter_mut().for_each(|(k, v)| {
+            rename_expr(k, f);
+            rename_expr(v, f);
+        }),
+        ExprKind::DictComp { key, value, target, iter, conds } => {
+            for x in [key, value, target, iter] {
+                rename_expr(x, f);
+            }
+            conds.iter_mut().for_each(|x| rename_expr(x, f));
         }
     }
 }
@@ -442,6 +572,10 @@ impl Names for ConstNames<'_> {
 pub fn eval_const(e: &Expr, consts: &HashMap<String, Cv>, ports: &[Port]) -> Result<Cv, Diag> {
     let mut g = Graph::default();
     let v = lower::expr(&mut g, &mut ConstNames { consts, ports }, e)?;
+    // With `--checks`, a failing check (division by zero) leaves it to run time.
+    if let Some((_, span, what)) = g.checks.first() {
+        return Err(Diag::error(*span, format!("{what} in a constant expression")));
+    }
     g.as_cv(v).ok_or_else(|| Diag::error(e.span, "expected a constant expression"))
 }
 
@@ -513,6 +647,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mut tests = Vec::new();
     let mut top: Vec<&Stmt> = Vec::new();
     let mut subs: Vec<cfg::SubDef> = Vec::new();
+    let mut procs_src: Vec<(String, Vec<Stmt>)> = Vec::new();
 
     for s in &m.body {
         match &s.kind {
@@ -528,12 +663,31 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             }
             StmtKind::Every { period, body } => every.push((s, period.as_ref(), body)),
             StmtKind::Test { name, body } => tests.push(TestDef { name: name.clone(), span: s.span, body: body.clone() }),
-            StmtKind::Process { .. } => errs.push(not_yet(s.span, "`process`", 5)),
+            StmtKind::Process { name, body } => procs_src.push((name.clone(), body.clone())),
             StmtKind::Expr(Expr { kind: ExprKind::Str(_), .. }) => {} // docstring
             StmtKind::Sub { name, label, body } => subs.push((name.clone(), *label, body.clone())),
             _ => top.push(s),
         }
     }
+
+    // `--checks`: a dedicated output for the error code.
+    let error_port = if crate::checks_on() {
+        if let Some(p) = ports.iter().find(|p| p.name == "error") {
+            errs.push(Diag::error(p.span, "with `--checks`, the port name `error` is reserved for the error code"));
+        }
+        let table = SignalTable::base();
+        ports.push(Port {
+            name: "error".into(),
+            dir: PortDir::Output,
+            ty: Ty::Int,
+            sig: table.lookup("signal-E").unwrap(),
+            label: Some("error code (--checks)".into()),
+            span: Span::default(),
+        });
+        Some(ports.len() - 1)
+    } else {
+        None
+    };
 
     // Prologue: the leading top-level statements that can run entirely at compile time (no
     // ports, no waits) are executed now; the names they assign become constants, or initial
@@ -563,6 +717,28 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     timing("prologue", t0);
     let main_stmts: Vec<Stmt> = pending.into_iter().collect();
 
+    // A process's variables are its own (renamed `P:x`), except those with an initial value
+    // at the top of the file and ports: only those can be shared (anything else can't be read
+    // by another process, which might not have assigned it yet).
+    for (pname, body) in &mut procs_src {
+        let ns = format!("{pname}:");
+        let mut names = BTreeMap::new();
+        let mut ignore = Vec::new();
+        assigned_names(body, &mut names, &mut ignore);
+        for (_, _, b) in subs.iter().filter(|(n, _, _)| n.starts_with(&ns)) {
+            assigned_names(b, &mut names, &mut ignore);
+        }
+        let own: HashSet<String> =
+            names.into_keys().filter(|n| !pro.contains_key(n) && !ports.iter().any(|p| &p.name == n) && !n.starts_with(&ns)).collect();
+        let f = |n: &str| own.contains(n).then(|| format!("{ns}{n}"));
+        rename_stmts(body, &f);
+        for (n, _, b) in subs.iter_mut() {
+            if n.starts_with(&ns) {
+                rename_stmts(b, &f);
+            }
+        }
+    }
+
     // Who assigns what.
     let mut block_assigns: Vec<BTreeMap<String, Span>> = Vec::new();
     for (_, _, body) in &every {
@@ -570,10 +746,23 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         assigned_names(body, &mut names, &mut errs);
         block_assigns.push(names);
     }
+    // Subroutines belong to the process that calls them (`P:f` in process `P`).
+    let subs_of = |proc: Option<&str>| -> Vec<cfg::SubDef> {
+        subs.iter().filter(|(n, _, _)| n.split_once(':').map(|(p, _)| p) == proc).cloned().collect()
+    };
     let mut main_assigns = BTreeMap::new();
     assigned_names(&main_stmts, &mut main_assigns, &mut errs);
-    for (_, _, body) in &subs {
+    for (_, _, body) in &subs_of(None) {
         assigned_names(body, &mut main_assigns, &mut errs);
+    }
+    let mut proc_assigns: Vec<BTreeMap<String, Span>> = Vec::new();
+    for (name, body) in &procs_src {
+        let mut names = BTreeMap::new();
+        assigned_names(body, &mut names, &mut errs);
+        for (_, _, b) in &subs_of(Some(name)) {
+            assigned_names(b, &mut names, &mut errs);
+        }
+        proc_assigns.push(names);
     }
 
     let mut consts: HashMap<String, Cv> = HashMap::new();
@@ -584,7 +773,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             }
             continue;
         }
-        if !main_assigns.contains_key(n) && !block_assigns.iter().any(|b| b.contains_key(n)) {
+        if !main_assigns.contains_key(n) && !block_assigns.iter().any(|b| b.contains_key(n)) && !proc_assigns.iter().any(|b| b.contains_key(n)) {
             consts.insert(n.clone(), pro[n].clone());
         }
     }
@@ -593,7 +782,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let main_cfg = if main_stmts.is_empty() {
         None
     } else {
-        match cfg::build(&main_stmts, &subs, &konst) {
+        match cfg::build(&main_stmts, &subs_of(None), &konst) {
             Ok(c) => {
                 for h in &c.hidden {
                     main_assigns.insert(h.clone(), main_stmts[0].span);
@@ -606,12 +795,29 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             }
         }
     };
+    let mut proc_cfgs = Vec::new();
+    for (k, (name, body)) in procs_src.iter().enumerate() {
+        let span = body.first().map(|s| s.span).unwrap_or_default();
+        match cfg::build(body, &subs_of(Some(name)), &konst) {
+            Ok(c) => {
+                for h in &c.hidden {
+                    proc_assigns[k].insert(h.clone(), span);
+                }
+                proc_cfgs.push(Some(c));
+            }
+            Err(d) => {
+                errs.push(d);
+                proc_cfgs.push(None);
+            }
+        }
+    }
 
     // Which names hold bundles.
     let mut seed: HashSet<String> = ports.iter().filter(|p| p.ty == Ty::Bundle).map(|p| p.name.clone()).collect();
     seed.extend(pro.iter().filter(|(_, v)| matches!(v, Cv::Bun(_))).map(|(n, _)| n.clone()));
     let mut bodies: Vec<&[Stmt]> = vec![&main_stmts];
     bodies.extend(every.iter().map(|(_, _, b)| *b));
+    bodies.extend(procs_src.iter().map(|(_, b)| b.as_slice()));
     bodies.extend(subs.iter().map(|(_, _, b)| b.as_slice()));
     let bundles = bundle_names(&bodies, seed);
     let mut nonbool = HashSet::new();
@@ -622,11 +828,14 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     // States: anything assigned by a process, plus outputs.
     let mut states: Vec<State> = Vec::new();
     let mut names: Vec<String> = main_assigns.keys().cloned().collect();
+    for b in &proc_assigns {
+        names.extend(b.keys().cloned());
+    }
     for b in &block_assigns {
         for n in b.keys() {
             // Names assigned only inside one block with no prologue value are block temporaries.
             let is_port = ports.iter().any(|p| &p.name == n);
-            if pro.contains_key(n) || is_port || main_assigns.contains_key(n) {
+            if pro.contains_key(n) || is_port || main_assigns.contains_key(n) || proc_assigns.iter().any(|b| b.contains_key(n)) {
                 names.push(n.clone());
             }
         }
@@ -642,7 +851,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         if let Some(p) = ports.iter().find(|p| p.name == n && p.dir == PortDir::Input) {
             let span = main_assigns
                 .get(&n)
-                .or_else(|| block_assigns.iter().find_map(|b| b.get(&n)))
+                .or_else(|| block_assigns.iter().chain(&proc_assigns).find_map(|b| b.get(&n)))
                 .copied()
                 .unwrap_or(p.span);
             errs.push(Diag::error(span, format!("`{n}` is an input; inputs can't be assigned")));
@@ -652,6 +861,11 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         if let Some(sp) = main_assigns.get(&n) {
             writers.push((MAIN, *sp));
         }
+        for (k, b) in proc_assigns.iter().enumerate() {
+            if let Some(sp) = b.get(&n) {
+                writers.push((proc_owner(k), *sp));
+            }
+        }
         for (bi, b) in block_assigns.iter().enumerate() {
             if let Some(sp) = b.get(&n) {
                 writers.push((bi, *sp));
@@ -659,7 +873,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         }
         if writers.len() > 1 {
             errs.push(Diag::error(writers[1].1, format!("{} is assigned by more than one process", crate::expand::quoted(&n)))
-                .with_help("each variable may only be written by one `every` block or by the main program (the single-writer rule); give each its own variable and combine them"));
+                .with_help("each variable may only be written by one process or `every` block (the single-writer rule); give each its own variable and combine them in the reader"));
         }
         let port = ports.iter().position(|p| p.name == n);
         let pro_entry = pro_order.iter().find(|(name, ..)| *name == n);
@@ -728,6 +942,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         match lower_block(&ctx, body) {
             Ok((srcs, mut graph, next)) => {
                 let mut plans = Vec::new();
+                let raw = std::mem::take(&mut graph.checks);
                 let mut fz = Fuser::new(&mut graph);
                 for (si, v) in next {
                     let own = srcs.iter().position(|k| *k == SrcKind::Own(si)).map(|id| fz.g.src(id as u32));
@@ -735,9 +950,16 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                         plans.push((si, p));
                     }
                 }
-                let pipe = if pipeline && requested.is_none() { crate::pipeline::plan(&mut graph, &srcs, &mut plans) } else { None };
+                let checks = fused_checks(&mut fz, raw);
+                // A block with runtime checks runs multi-cycle, so a check is read on the
+                // commit pulse with the rest of its iteration.
+                let pipe = if pipeline && requested.is_none() && checks.is_empty() {
+                    crate::pipeline::plan(&mut graph, &srcs, &mut plans)
+                } else {
+                    None
+                };
                 let depths = graph.depths();
-                let depth = plans.iter().map(|(_, p)| p.ready(&depths)).max().unwrap_or(0);
+                let depth = plans.iter().map(|(_, p)| p.ready(&depths)).chain(checks.iter().map(|c| depths[c.fail as usize] + 1)).max().unwrap_or(0);
                 let needed = if pipe.is_some() { 1 } else { depth + 1 };
                 let header = Span::new(stmt.span.start, stmt.span.start + 5);
                 let period = match requested {
@@ -759,31 +981,49 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                         needed
                     }
                 };
-                blocks.push(Block { span: stmt.span, requested, srcs, graph, plans, depth, period, pipe });
+                blocks.push(Block { span: stmt.span, checks, requested, srcs, graph, plans, depth, period, pipe });
             }
             Err(d) => errs.push(d),
         }
     }
 
     timing("blocks", t0);
-    let main = match main_cfg {
-        Some(c) => {
-            let ctx = Ctx { owner: MAIN, ports: &ports, states: &states, consts: &consts };
-            match lower_main(&ctx, &c) {
-                Ok(m) => Some(m),
-                Err(d) => {
-                    errs.push(d);
-                    None
-                }
+    let mut procs = Vec::new();
+    let all = std::iter::once((MAIN, "main".to_string(), main_cfg))
+        .chain(proc_cfgs.into_iter().enumerate().map(|(k, c)| (proc_owner(k), procs_src[k].0.clone(), c)));
+    for (owner, name, c) in all {
+        let Some(c) = c else { continue };
+        let ctx = Ctx { owner, ports: &ports, states: &states, consts: &consts };
+        match lower_main(&ctx, &c) {
+            Ok(mut m) => {
+                m.name = name;
+                m.owner = owner;
+                procs.push(m);
             }
+            Err(d) => errs.push(d),
         }
-        None => None,
-    };
+    }
     if !errs.is_empty() {
         return Err(errs);
     }
+    // Error codes, in order: `every` blocks, then each process's steps.
+    let mut sites = Vec::new();
+    for b in &mut blocks {
+        for c in &mut b.checks {
+            sites.push(CheckSite { span: c.span, what: c.what, owner: "every".into() });
+            c.code = sites.len() as i32;
+        }
+    }
+    for m in &mut procs {
+        for st in &mut m.steps {
+            for c in &mut st.checks {
+                sites.push(CheckSite { span: c.span, what: c.what, owner: m.name.clone() });
+                c.code = sites.len() as i32;
+            }
+        }
+    }
     warnings.extend(crate::bundle::take_warnings());
-    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, main, tests, warnings })
+    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, checks: sites, error_port })
 }
 
 /// What a process can see.
@@ -856,14 +1096,16 @@ impl Names for ProcNames<'_> {
         }
         if let Some(si) = self.ctx.states.iter().position(|s| s.name == name) {
             let s = &self.ctx.states[si];
-            let unassigned_main = s.owner == Some(MAIN) && !s.has_init;
-            if unassigned_main && self.ctx.owner != MAIN {
-                return Err(Diag::error(span, format!("{} is set by the main program, which might not have run yet", crate::expand::quoted(name)))
+            let unassigned_main = s.owner.is_some_and(is_proc) && !s.has_init;
+            if unassigned_main && s.owner != Some(self.ctx.owner) {
+                let who = if s.owner == Some(MAIN) { "the main program" } else { "another process" };
+                return Err(Diag::error(span, format!("{} is set by {who}, which might not have run yet", crate::expand::quoted(name)))
                     .with_help(format!("give it an initial value at the top of the file, e.g. `{name} = 0`")));
             }
             if unassigned_main && !self.defined.is_some_and(|d| d.contains(name)) {
+                let plain = name.split_once(':').map_or(name, |(_, n)| n);
                 return Err(Diag::error(span, format!("{} might be used before it's assigned", crate::expand::quoted(name)))
-                    .with_help(format!("assign it first on every path, or give it an initial value at the top of the file, e.g. `{name} = 0`")));
+                    .with_help(format!("assign it first on every path, or give it an initial value at the top of the file, e.g. `{plain} = 0`")));
             }
             return Ok(match s.owner {
                 Some(o) if o == self.ctx.owner => self.src_for(g, SrcKind::Own(si)),
@@ -872,6 +1114,11 @@ impl Names for ProcNames<'_> {
                 None if s.ty == Ty::Bundle => g.bconst(s.binit.iter().copied()),
                 None => g.konst(s.init),
             });
+        }
+        if let Some(s) = self.ctx.states.iter().find(|s| s.name.split_once(':').is_some_and(|(_, own)| own == name)) {
+            let owner = s.name.split_once(':').map_or("", |(p, _)| p);
+            return Err(Diag::error(span, format!("{} is not defined here: it belongs to process `{owner}`", crate::expand::quoted(name)))
+                .with_help(format!("a variable a process assigns is its own unless the top level assigns it too; to share it, give it an initial value at the top of the file, e.g. `{name} = 0`")));
         }
         if let Some(pi) = self.ctx.ports.iter().position(|p| p.name == name) {
             let v = self.src_for(g, if self.live { SrcKind::LiveInput(pi) } else { SrcKind::Input(pi) });
@@ -923,6 +1170,9 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 } else {
                     let cur = crate::bundle::int(g, cur, target.span)?;
                     let rhs = crate::bundle::int(g, rhs, value.span)?;
+                    if matches!(op, ticky_syntax::ast::BinOp::FloorDiv | ticky_syntax::ast::BinOp::Mod) {
+                        lower::div_check(g, rhs, s.span);
+                    }
                     lower::binop(g, *op, cur, rhs)
                 };
                 assign(g, n, target, &[v], s.span)?;
@@ -931,9 +1181,16 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 let c = lower::expr(g, n, cond)?;
                 let c = g.truth(c);
                 let before = n.env.clone();
-                exec(g, n, body)?;
+                g.path.push(c);
+                let r = exec(g, n, body);
+                g.path.pop();
+                r?;
                 let then_env = std::mem::replace(&mut n.env, before.clone());
-                exec(g, n, orelse)?;
+                let nc = g.not(c);
+                g.path.push(nc);
+                let r = exec(g, n, orelse);
+                g.path.pop();
+                r?;
                 let else_env = std::mem::take(&mut n.env);
                 let mut merged = before.clone();
                 let keys: BTreeSet<&String> = then_env.keys().chain(else_env.keys()).collect();
@@ -977,7 +1234,17 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 return Err(Diag::error(s.span, "`wait` can't be used in an `every` block")
                     .with_help("`every` blocks run continuously; waiting belongs in the main program"))
             }
-            StmtKind::Assert(_) => return Err(not_yet(s.span, "`assert` in programs", 5)),
+            // Only present with `--checks` (the expansion drops asserts otherwise).
+            StmtKind::Assert(e) => {
+                let what = match &e.kind {
+                    ExprKind::Call { func, .. } if matches!(&func.kind, ExprKind::Name(f) if f == "#ixok") => "index out of range",
+                    _ => "assertion failed",
+                };
+                let v = lower::expr(g, n, e)?;
+                let ok = g.truth(v);
+                let fail = g.not(ok);
+                g.check(fail, s.span, what);
+            }
             _ => return Err(Diag::error(s.span, "this statement can't be used here")),
         }
     }
@@ -1032,6 +1299,18 @@ fn assign(g: &mut Graph, n: &mut ProcNames, target: &Expr, vals: &[V], vspan: Sp
 }
 
 type Lowered = (Vec<SrcKind>, Graph, Vec<(usize, V)>);
+
+/// Checks with their conditions fused into deciders; checks that can't fail are dropped.
+fn fused_checks(fz: &mut Fuser, raw: Vec<(V, Span, &'static str)>) -> Vec<Check> {
+    let mut out = Vec::new();
+    for (v, span, what) in raw {
+        let fail = fz.rebuild(v);
+        if fz.g.as_const(fail) != Some(0) {
+            out.push(Check { fail, code: 0, span, what });
+        }
+    }
+    out
+}
 
 /// Initial intervals for a process's own state.
 fn initial_ivs(ctx: &Ctx) -> HashMap<usize, Iv> {
@@ -1196,6 +1475,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                 live: false,
                 defined: Some(&defined[i]),
             };
+            let first_check = g.checks.len();
             exec(&mut g, &mut n, &d.stmts)?;
             let mut writes = Vec::new();
             for (name, b) in &n.env {
@@ -1238,7 +1518,8 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                 }
             };
             srcs = n.srcs;
-            steps.push(Step { span: d.span, writes, plans: Vec::new(), kind, depth: 0, wait_ready: 0 });
+            let checks = g.checks[first_check..].iter().map(|&(fail, span, what)| Check { fail, code: 0, span, what }).collect();
+            steps.push(Step { span: d.span, writes, plans: Vec::new(), kind, depth: 0, wait_ready: 0, checks });
         }
         let ivs: Vec<(usize, Iv)> =
             steps.iter().flat_map(|s| s.writes.iter().map(|(si, v)| (*si, g.iv(*v))).collect::<Vec<_>>()).collect();
@@ -1255,6 +1536,8 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                         s.plans.push((si, p));
                     }
                 }
+                let raw = s.checks.iter().map(|c| (c.fail, c.span, c.what)).collect();
+                s.checks = fused_checks(&mut fz, raw);
                 s.kind = match s.kind.clone() {
                     StepKind::Run(Next::Branch(c, a, b)) => StepKind::Run(Next::Branch(fz.cond(c.node), a, b)),
                     StepKind::WaitUntil(c, t) => StepKind::WaitUntil(fz.cond(c.node), t),
@@ -1267,12 +1550,18 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
         let ready = |nodes: Vec<V>| nodes.iter().map(|v| depths[*v as usize]).max().unwrap_or(0);
         for s in &mut steps {
             let mut d = s.plans.iter().map(|(_, p)| p.ready(&depths)).max().unwrap_or(0);
+            // Checks are read by the commit decider (and the error deciders), one tick before
+            // the commit.
+            let checks = ready(s.checks.iter().map(|c| c.fail).collect());
+            if !s.checks.is_empty() {
+                d = d.max(checks + 1);
+            }
             match &s.kind {
                 // Branch conditions are read by the next-step deciders on the commit tick.
                 StepKind::Run(Next::Branch(c, ..)) => d = d.max(ready(cond_operands(c, true))),
                 // Wait conditions are read by the commit decider itself.
-                StepKind::WaitUntil(c, _) => s.wait_ready = ready(cond_operands(c, false)),
-                StepKind::WaitTicks(WaitN::Dyn(m), _) => s.wait_ready = depths[*m as usize],
+                StepKind::WaitUntil(c, _) => s.wait_ready = ready(cond_operands(c, false)).max(checks),
+                StepKind::WaitTicks(WaitN::Dyn(m), _) => s.wait_ready = depths[*m as usize].max(checks),
                 _ => {}
             }
             s.depth = d;
@@ -1345,7 +1634,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                 StepKind::WaitTicks(n, t) => StepKind::WaitTicks(n, remap(t)),
             };
         }
-        return Ok(MainProc { srcs, graph: g, steps: out, entry: new_id[entry] });
+        return Ok(MainProc { name: String::new(), owner: ctx.owner, srcs, graph: g, steps: out, entry: new_id[entry] });
     }
     unreachable!()
 }

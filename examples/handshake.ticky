@@ -1,0 +1,46 @@
+# Two processes and a handshake (SPEC §15.10): `watch` counts how long ore has been low and
+# raises `ready`; `main` reports it, acknowledges, and keeps the alarm on for a while.
+input  ore: int @ O
+output alarm: bool @ A
+output report: int @ R
+
+low_ticks = 0           # written only by `watch`
+ready = False           # written only by `watch`
+
+process watch:
+    while True:
+        if ore < 1000:
+            low_ticks += 1
+        if low_ticks >= 60:
+            ready = True
+            wait until ready_ack
+            ready = False
+            low_ticks = 0
+        wait 1
+
+ready_ack = False       # written only by main
+while True:
+    wait until ready
+    alarm = True
+    report = low_ticks
+    ready_ack = True
+    wait until not ready
+    ready_ack = False
+    wait 30
+    alarm = False
+
+test "no alarm while ore is plentiful":
+    set ore = 5000
+    run 300 ticks
+    assert not alarm
+    assert report == 0
+
+test "alarm after ore stays low":
+    set ore = 10
+    run until alarm, max 1000 ticks
+    assert report == 60
+    run 10 ticks
+    assert alarm
+    set ore = 5000
+    run 60 ticks
+    assert not alarm

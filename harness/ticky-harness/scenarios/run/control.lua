@@ -162,6 +162,14 @@ script.on_event(defines.events.on_tick, function(e)
         zoom = 1.6, path = "ticky/shot-ports.png", show_entity_info = true, daytime = 0}
     end
     helpers.write_file("ticky/trace.txt", table.concat(storage.lines, "\n") .. "\n")
+    -- Lamps (the --checks error lamp): lit or not at the end.
+    local lamps = {}
+    for _, ent in pairs(storage.ents) do
+      if ent.valid and ent.name == "small-lamp" then
+        lamps[#lamps + 1] = ent.get_control_behavior().disabled and "off" or "lit"
+      end
+    end
+    helpers.write_file("ticky/lamps.txt", table.concat(lamps, " ") .. "\n")
     helpers.write_file("ticky/done.txt", "ok")
   end
 end)

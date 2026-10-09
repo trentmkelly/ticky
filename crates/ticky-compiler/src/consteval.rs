@@ -191,6 +191,12 @@ fn run(
             }
             StmtKind::Break => return Ok(Flow::Break),
             StmtKind::Continue => return Ok(Flow::Continue),
+            // (With `--checks` only.) A constant assert is checked now.
+            StmtKind::Assert(e) => {
+                if int(e, env, ports)? == 0 {
+                    return Err(Stop::Error(Diag::error(s.span, "this assertion fails before the program starts")));
+                }
+            }
             _ => return Err(Stop::Runtime),
         }
     }

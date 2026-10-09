@@ -1,0 +1,58 @@
+# ticky: --checks
+# Runtime checks (SPEC §13). Build with `--checks`: a failed `assert`, an out-of-range
+# runtime index or a division by zero halts the process, lights the error lamp and puts the
+# check's code (listed in the build report) on the `error` output (signal-E).
+input  a: int @ A
+input  b: int @ B
+input  i: int @ I
+output q: int @ Q
+output r: int @ R
+output s: int @ S
+output count: int @ C
+
+xs = [10, 20, 30, 40]
+
+every 4 ticks:
+    s = 1000 // a       # code 1: an `every` block keeps running
+
+count = 0
+while True:
+    wait until b > 0
+    q = a // b           # code 2
+    r = xs[i]            # code 3
+    assert q < 100       # code 4
+    count += 1
+    wait until b == 0
+
+test "all is well":
+    set a = 10
+    set b = 2
+    set i = 1
+    run 20 ticks
+    assert q == 5 and r == 20 and count == 1 and error == 0
+
+test "division by zero in a block":
+    run 20 ticks
+    assert error == 1
+    set a = 4
+    run 20 ticks
+    assert s == 250 and error == 1
+
+test "index out of range halts main":
+    set a = 10
+    set b = 1
+    set i = 4
+    run 20 ticks
+    assert error == 3 and count == 0
+    set b = 0
+    run 10 ticks
+    set b = 1
+    set i = 0
+    run 20 ticks
+    assert count == 0
+
+test "assert":
+    set a = 500
+    set b = 1
+    run 20 ticks
+    assert error == 4 and q == 0

@@ -161,6 +161,17 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                 Kind::Selector(sel) => Some(selector_json(t, sel)),
                 Kind::Constant(c) => Some(constant_json(t, c)),
                 Kind::Pole => None,
+                Kind::Lamp(c) => {
+                    let mut cond = Map::new();
+                    cond.insert("first_signal".into(), signal_json(t, c.first));
+                    match c.second {
+                        Operand::Sig(s) => cond.insert("second_signal".into(), signal_json(t, s)),
+                        Operand::Const(k) => cond.insert("constant".into(), json!(k)),
+                    };
+                    cond.insert("comparator".into(), json!(c.cmp.symbol()));
+                    m.insert("color".into(), json!({ "r": 1, "g": 0, "b": 0, "a": 1 }));
+                    Some(json!({ "circuit_enabled": true, "circuit_condition": cond }))
+                }
             };
             if let Some(cb) = cb {
                 m.insert("control_behavior".into(), cb);

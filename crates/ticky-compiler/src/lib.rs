@@ -20,6 +20,20 @@ use ticky_syntax::ast::PortDir;
 use ticky_syntax::Diag;
 
 pub use codegen::Codegen;
+
+thread_local! {
+    static CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this compilation has runtime checks (`--checks`): set by [`compile`].
+pub fn checks_on() -> bool {
+    CHECKS.with(|c| c.get())
+}
+
+/// Turns runtime checks on or off for compilations on this thread.
+pub fn set_checks(on: bool) {
+    CHECKS.with(|c| c.set(on));
+}
 pub use layout::LayoutInfo;
 pub use program::Program;
 
@@ -51,11 +65,14 @@ pub struct Options {
     /// Internal wiring uses the quality variants (uncommon to legendary) of signals, leaving
     /// every normal signal to the program. Needs the Quality mod (Space Age) in the game.
     pub quality: bool,
+    /// Runtime checks (SPEC §13): failed `assert`s, out-of-range runtime indexes and
+    /// division by zero halt the process, light the error lamp and output a code.
+    pub checks: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false, quality: true }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false }
     }
 }
 
@@ -70,6 +87,7 @@ pub struct Compiled {
 
 pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     ticky_factorio::set_quality_pool(opts.quality);
+    set_checks(opts.checks);
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
     let fast = compile_module(&module, opts, true)?;
     if opts.opt == Opt::Speed {
@@ -141,12 +159,20 @@ impl Compiled {
             };
             out.push_str(&format!("  {header:<16} line {line:<4} {timing:<36} {:>4} combinators\n", b.combinators));
         }
-        if let Some(m) = &self.cg.main {
-            out.push_str(&format!("  main program     {} steps, {} combinators\n", m.steps.len(), m.combinators));
+        for m in &self.cg.procs {
+            let header = if m.name == "main" { "main program".to_string() } else { format!("process {}", m.name) };
+            out.push_str(&format!("  {header:<16} {} steps, {} combinators\n", m.steps.len(), m.combinators));
             for (i, s) in m.steps.iter().enumerate() {
                 let (line, _) = Diag::line_col(src, s.span.start);
                 let tag = if s.self_loop { "  (loop: per iteration)" } else { "" };
                 out.push_str(&format!("    step {:<3} line {line:<4} {}{tag}\n", i + 1, s.duration));
+            }
+        }
+        if !self.program.checks.is_empty() {
+            out.push_str("  error codes (--checks; shown on the `error` output, signal-E):\n");
+            for (i, c) in self.program.checks.iter().enumerate() {
+                let (line, col) = Diag::line_col(src, c.span.start);
+                out.push_str(&format!("    {:<4} line {line}:{col:<4} {} ({})\n", i + 1, c.what, c.owner));
             }
         }
         if !self.program.calls.is_empty() {

@@ -120,6 +120,8 @@ pub struct Expander<'a> {
     mem_keys: HashSet<String>,
     /// Arrays found to need a signal array (indexed at runtime, or given one).
     found_mem: HashSet<String>,
+    /// Inside a `process`: its name (it gets its own copies of subroutines).
+    proc: Option<String>,
 }
 
 /// Elements per bank of a signal array: one signal table.
@@ -374,6 +376,7 @@ impl<'a> Expander<'a> {
             mem_keys: HashSet::new(),
             found_mem: HashSet::new(),
             impure: HashSet::new(),
+            proc: None,
         }
     }
 
@@ -469,6 +472,23 @@ impl<'a> Expander<'a> {
         Ok(k as usize)
     }
 
+    /// With `--checks`: a statement checking that runtime index `i` is in range for `n`.
+    fn index_check(&mut self, i: &Expr, n: usize, out: &mut Vec<Stmt>) {
+        if crate::checks_on() {
+            let span = i.span;
+            out.push(stmt(StmtKind::Assert(call("#ixok", vec![i.clone(), int(n as i64, span)], span)), span));
+        }
+    }
+
+    /// With `--checks`: `read` (an element at runtime index `i`), checking the index first.
+    fn checked_read(&mut self, i: &Expr, n: usize, read: Expr) -> Expr {
+        if !crate::checks_on() {
+            return read;
+        }
+        let span = i.span;
+        call("#chk", vec![i.clone(), int(n as i64, span), read], span)
+    }
+
     /// Element `i` of a signal array.
     fn mem_read(&mut self, banks: &[Expr], n: usize, i: Expr, ispan: Span, out: &mut Vec<Stmt>) -> Result<Expr, Diag> {
         let span = i.span;
@@ -503,6 +523,7 @@ impl<'a> Expander<'a> {
             return Ok(());
         }
         let (i, e) = if ranges.len() > 1 { (self.bind(i, out), self.bind(e, out)) } else { (i, e) };
+        self.index_check(&i, n, out);
         for (b, (off, nb)) in ranges.into_iter().enumerate() {
             let bn = bank_name(arr, b);
             out.push(assign(&bn, call(f, vec![name(&bn, span), minus(&i, off, span), e.clone(), int(nb as i64, span)], span), span));
@@ -610,6 +631,14 @@ impl<'a> Expander<'a> {
         match self.frames.last() {
             Some(f) if f.locals.contains(n) => format!("{}{n}", f.prefix),
             _ => n.to_string(),
+        }
+    }
+
+    /// Subroutines are compiled once per process: `f` in main, `P:f` in process `P`.
+    fn sub_key(&self, f: &str) -> String {
+        match &self.proc {
+            Some(p) => format!("{p}:{f}"),
+            None => f.to_string(),
         }
     }
 
@@ -838,7 +867,12 @@ impl<'a> Expander<'a> {
                     Val::Array(items) => items,
                     Val::Mem(banks, n) => {
                         let i = self.expr_scalar(idx, out)?;
-                        return Ok(Val::Scalar(self.mem_read(&banks, n, i, idx.span, out)?));
+                        if self.fold(&i).is_some() {
+                            return Ok(Val::Scalar(self.mem_read(&banks, n, i, idx.span, out)?));
+                        }
+                        let i = if crate::checks_on() { self.bind(i, out) } else { i };
+                        let read = self.mem_read(&banks, n, i.clone(), idx.span, out)?;
+                        return Ok(Val::Scalar(self.checked_read(&i, n, read)));
                     }
                     // A bundle: `b[sig]`, checked when lowering.
                     Val::Scalar(b) => {
@@ -866,15 +900,18 @@ impl<'a> Expander<'a> {
                                 self.want_mem(&r);
                             }
                         }
+                        let n = items.len();
+                        let i = if crate::checks_on() { self.bind(i, out) } else { i };
                         // A table of constants: one bundle constant and one read.
                         if items.len() >= 3 && items.len() <= bank_size() && items.iter().all(|x| self.fold(x).is_some()) {
-                            let n = items.len() as i64;
-                            return Ok(Val::Scalar(call("#aget", vec![call("#arr", items, span), i, int(n, span)], span)));
+                            let read = call("#aget", vec![call("#arr", items, span), i.clone(), int(n as i64, span)], span);
+                            return Ok(Val::Scalar(self.checked_read(&i, n, read)));
                         }
                         // Runtime index: a select over all elements (0 if out of range).
-                        let mut args = vec![i];
+                        let mut args = vec![i.clone()];
                         args.extend(items);
-                        rebuild(ExprKind::Call { func: Box::new(name("#select", span)), args, kwargs: vec![] })
+                        let read = Expr { kind: ExprKind::Call { func: Box::new(name("#select", span)), args, kwargs: vec![] }, span };
+                        Val::Scalar(self.checked_read(&i, n, read))
                     }
                 }
             }
@@ -1351,13 +1388,14 @@ impl<'a> Expander<'a> {
     /// A call to a subroutine: assign its (shared) parameters, `Call`, then copy the result
     /// out before anything can call it again.
     fn sub_call(&mut self, f: &str, params: &[Param], bound: Vec<Option<Val>>, span: Span, out: &mut Vec<Stmt>) -> Result<Val, Diag> {
+        let key = self.sub_key(f);
         for (p, v) in params.iter().zip(bound) {
-            self.assign_to(&name(&format!("{f}.{}", p.name), p.span), v.unwrap(), p.span, out)?;
+            self.assign_to(&name(&format!("{key}.{}", p.name), p.span), v.unwrap(), p.span, out)?;
         }
-        if !self.sub_bodies.contains_key(f) {
+        if !self.sub_bodies.contains_key(&key) {
             let exit = self.fresh();
             let def = &self.fns[f];
-            self.frames.push(Frame { prefix: format!("{f}."), locals: def.locals.clone(), exit, ret: None, name: f.to_string() });
+            self.frames.push(Frame { prefix: format!("{key}."), locals: def.locals.clone(), exit, ret: None, name: f.to_string() });
             self.stack.push(f.to_string());
             let saved_loops = std::mem::take(&mut self.loops);
             let saved_aliases = std::mem::take(&mut self.aliases);
@@ -1367,14 +1405,14 @@ impl<'a> Expander<'a> {
             self.aliases = saved_aliases;
             self.stack.pop();
             let frame = self.frames.pop().unwrap();
-            self.sub_bodies.insert(f.to_string(), (exit, body?, frame.ret));
+            self.sub_bodies.insert(key.clone(), (exit, body?, frame.ret));
         } else if self.stack.iter().any(|s| s == f) {
             return Err(Diag::error(span, format!("`{f}` calls itself (recursion isn't supported yet)")));
         }
         *self.calls.entry(f.to_string()).or_default() += 1;
-        out.push(stmt(StmtKind::Call(f.to_string()), span));
-        let ret = self.sub_bodies[f].2.clone();
-        let slot = |s: &str| format!("{f}.#ret{s}");
+        out.push(stmt(StmtKind::Call(key.clone()), span));
+        let ret = self.sub_bodies[&key].2.clone();
+        let slot = |s: &str| format!("{key}.#ret{s}");
         let copy = |this: &mut Self, shape: Shape, from: &str, out: &mut Vec<Stmt>| -> Result<Val, Diag> {
             let t = this.temp();
             let v = match shape {
@@ -1580,6 +1618,7 @@ impl<'a> Expander<'a> {
                         // Runtime index: each element takes the value if the index matches.
                         let i = self.bind(i, out);
                         let e = self.bind(e, out);
+                        self.index_check(&i, len, out);
                         for k in 0..len {
                             let el = element(&arr, k);
                             let hit = Expr {
@@ -1748,6 +1787,7 @@ impl<'a> Expander<'a> {
                             None => {
                                 let i = self.bind(i, out);
                                 let v = self.bind(v, out);
+                                self.index_check(&i, len, out);
                                 for k in 0..len {
                                     let el = element(&arr, k);
                                     let hit = Expr {
@@ -1916,6 +1956,13 @@ impl<'a> Expander<'a> {
                 out.push(stmt(StmtKind::WaitTicks(n), span));
             }
             StmtKind::Def { .. } => return Err(Diag::error(span, "functions must be defined at the top level of the file")),
+            // Without `--checks`, asserts are left out entirely (like `python -O`).
+            StmtKind::Assert(e) => {
+                if crate::checks_on() {
+                    let c = self.expr_scalar(e, out)?;
+                    out.push(stmt(StmtKind::Assert(c), span));
+                }
+            }
             _ => out.push(s.clone()),
         }
         Ok(())
@@ -2033,6 +2080,12 @@ pub fn display(n: &str) -> String {
     }
     if n.starts_with("#t") {
         return "a temporary value".into();
+    }
+    // A process's own variable (`P:x`) or subroutine (`P:f.x`).
+    if let Some((p, rest)) = n.split_once(':') {
+        if !p.is_empty() && !p.contains(['.', '#']) {
+            return format!("{} in process `{p}`", quoted(rest));
+        }
     }
     // A comprehension's own names: `#s4.s` → `s`.
     if n.starts_with("#s") || n.starts_with("#v") {
@@ -2171,6 +2224,17 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
         })
         .collect();
     let mut mem_keys: HashSet<String> = HashSet::new();
+    let mut procs: HashMap<String, Span> = HashMap::new();
+    for s in &m.body {
+        if let StmtKind::Process { name, .. } = &s.kind {
+            if name == "main" || fns.contains_key(name) || procs.insert(name.clone(), s.span).is_some() {
+                errs.push(Diag::error(s.span, format!("`{name}` is already the name of a process or function")));
+            }
+        }
+    }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
     const ROUNDS: usize = 6;
     for round in 0..ROUNDS {
         let mut ex = Expander::new(&fns, &consts, shapes.clone());
@@ -2185,6 +2249,12 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
                 match &s.kind {
                     StmtKind::Def { .. } => {}
                     StmtKind::Port { .. } | StmtKind::Test { .. } => body.push(s.clone()),
+                    StmtKind::Process { name: pname, body: b } => {
+                        ex.proc = Some(pname.clone());
+                        let r = ex.stmts(b);
+                        ex.proc = None;
+                        body.push(stmt(StmtKind::Process { name: pname.clone(), body: r? }, s.span));
+                    }
                     StmtKind::Every { period, body: b } => {
                         let expanded = ex.every_block(b)?;
                         let mut budget = 200_000;
@@ -2402,7 +2472,7 @@ fn module_consts(m: &Module, fns: &HashMap<String, FnDef>) -> HashMap<String, cr
     };
     for s in &m.body {
         match &s.kind {
-            StmtKind::Every { body, .. } => count(&mut counts, body),
+            StmtKind::Every { body, .. } | StmtKind::Process { body, .. } => count(&mut counts, body),
             StmtKind::Def { body, .. } => {
                 let mut g = HashSet::new();
                 globals_of(body, &mut g);
