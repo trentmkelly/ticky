@@ -539,4 +539,43 @@ mod wildcard_tests {
         let d = Decider { conds: vec![cond("signal-everything", r, CmpOp::Gt, k(-10), b, true)], outputs: vec![out("signal-X", false, 1, b)] };
         assert_eq!(probe(Kind::Decider(d), BUNDLE, SCAL), v(&[("signal-X", 1)]));
     }
+
+    /// The level 4 probes (signal arrays), same scenario.
+    #[test]
+    fn arrays_match_the_game() {
+        let (r, g, b) = (Nets::RED, Nets::GREEN, Nets::BOTH);
+        let k = Operand::Const;
+        let arr: &[(&str, i32)] = &[("iron-plate", 5), ("copper-plate", -3), ("coal", 9)];
+        let pos: &[(&str, i32)] = &[("iron-plate", 1), ("copper-plate", 2), ("coal", 3)];
+        let pos_i: &[(&str, i32)] = &[("iron-plate", 1), ("copper-plate", 2), ("coal", 3), ("signal-I", 2)];
+        // L1 read: each(green) = I(green) -> X copied from red
+        let d = Decider { conds: vec![cond("signal-each", g, CmpOp::Eq, s("signal-I"), g, true)], outputs: vec![out("signal-X", true, 1, r)] };
+        assert_eq!(probe(Kind::Decider(d), arr, pos_i), v(&[("signal-X", -3)]));
+        // L2 one-hot: each(red) = I(green) -> each = 1
+        let d = Decider { conds: vec![cond("signal-each", r, CmpOp::Eq, s("signal-I"), g, true)], outputs: vec![out("signal-each", false, 1, b)] };
+        assert_eq!(probe(Kind::Decider(d), pos, &[("signal-I", 2)]), v(&[("copper-plate", 1)]));
+        // L3 mask: each(red) != 0 and each(green) = 0 -> each copied from red
+        let d = Decider {
+            conds: vec![cond("signal-each", r, CmpOp::Ne, k(0), b, true), cond("signal-each", g, CmpOp::Eq, k(0), b, true)],
+            outputs: vec![out("signal-each", true, 1, r)],
+        };
+        assert_eq!(probe(Kind::Decider(d), arr, &[("copper-plate", 1)]), v(&[("coal", 9), ("iron-plate", 5)]));
+        // L4/L5 each >> 1 -> X: arithmetic shift, summed
+        let shr = || ar(s("signal-each"), r, ArOp::Shr, k(1), b, "signal-X");
+        assert_eq!(probe(shr(), &[("iron-plate", -5)], &[]), v(&[("signal-X", -3)]));
+        // (The game lists `signal-X=0` for the combinator, but a 0 is nothing on the wire.)
+        assert_eq!(probe(shr(), &[("iron-plate", 7), ("copper-plate", -5)], &[]), v(&[]));
+        // L6/L7 selector ranks (ties: equal values, either signal); L8 out of range
+        let ties: &[(&str, i32)] = &[("iron-plate", 3), ("copper-plate", 3), ("coal", 1), ("stone", -7)];
+        let sel = |max: bool, index: i32| Kind::Selector(Selector::Select { max, index });
+        let value = |o: Vec<(String, i32)>| o.iter().map(|x| x.1).collect::<Vec<_>>();
+        for (i, want) in [3, 3, 1, -7].into_iter().enumerate() {
+            assert_eq!(value(probe(sel(true, i as i32), ties, &[])), vec![want]);
+            assert_eq!(value(probe(sel(false, 3 - i as i32), ties, &[])), vec![want]);
+        }
+        assert_eq!(probe(sel(true, 0), ties, &[]), v(&[("iron-plate", 3)]));
+        assert_eq!(probe(sel(true, 9), ties, &[]), v(&[]));
+        // L9 the selector sums both wires
+        assert_eq!(probe(sel(true, 0), &[("iron-plate", 3)], &[("iron-plate", 4), ("coal", 5)]), v(&[("iron-plate", 7)]));
+    }
 }

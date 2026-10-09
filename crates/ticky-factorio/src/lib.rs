@@ -8,4 +8,4 @@ pub mod signals;
 
 pub use netlist::*;
 pub use ops::{ArOp, CmpOp};
-pub use signals::{Sig, SignalKind, SignalTable};
+pub use signals::{quality_pool, set_quality_pool, Sig, SignalKind, SignalTable, QUALITIES};

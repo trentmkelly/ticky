@@ -368,6 +368,26 @@ impl Cg {
                             self.bprod(out, k);
                             continue;
                         }
+                        BTerm::Shift(sig, x, c) => {
+                            let a = arith(r(x).op(), ArOp::Add, Operand::Const(c), sig);
+                            (a, vec![], true, "index")
+                        }
+                        BTerm::Hot(t, ix, c) => {
+                            let idx = SignalTable::base().index_signal();
+                            let cond = Cond {
+                                first: each,
+                                first_nets: Nets::RED,
+                                second: Operand::Sig(idx),
+                                second_nets: Nets::GREEN,
+                                cmp: CmpOp::Eq,
+                                and: true,
+                            };
+                            (dec(vec![cond], vec![out_const(each, c)]), vec![(t, false), (ix, true)], false, "one-hot")
+                        }
+                        BTerm::Fold(b, op, c, sig) => {
+                            let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Const(c), second_nets: Nets::BOTH, op, out: sig };
+                            (Kind::Arith(a), vec![(b, false)], false, "to one signal")
+                        }
                     };
                     let id = self.loose(kind, format!("{what}: {label}"));
                     for (b, on_green) in reads {
@@ -401,8 +421,14 @@ impl Cg {
                     self.bprod(out, id);
                 }
             }
-            Op::BSelect(b, max) => {
-                let id = self.loose(Kind::Selector(Selector::Select { max, index: 0 }), format!("{what}: {}", if max { "largest" } else { "smallest" }));
+            Op::BSelect(b, max, index) => {
+                let label = match (max, index) {
+                    (true, 0) => "largest".to_string(),
+                    (false, 0) => "smallest".to_string(),
+                    (true, k) => format!("rank {k} from the largest"),
+                    (false, k) => format!("rank {k} from the smallest"),
+                };
+                let id = self.loose(Kind::Selector(Selector::Select { max, index: index as i32 }), format!("{what}: {label}"));
                 let rb = r(b).bun();
                 self.bread(rb, id, false);
                 self.bprod(out, id);
@@ -414,6 +440,19 @@ impl Cg {
     /// Combinators for a scalar read from a bundle (`b[s]`, totals, counts), onto the bus.
     fn emit_from_bundle(&mut self, g: &Graph, v: V, out: Sig, r: &dyn Fn(V) -> Ref, what: &str) {
         let each = self.each;
+        if let Op::AGet(b, ix) = *g.op(v) {
+            // `each` iterates the positions and the index (green); the index matches itself
+            // too, but the array (red) never has the index signal.
+            let idx = SignalTable::base().index_signal();
+            let cond = Cond { first: each, first_nets: Nets::GREEN, second: Operand::Sig(idx), second_nets: Nets::GREEN, cmp: CmpOp::Eq, and: true };
+            let o = DOut { sig: out, copy: true, constant: 1, nets: Nets::RED };
+            let id = self.loose(dec(vec![cond], vec![o]), format!("{what}: array read"));
+            let (rb, ri) = (r(b).bun(), r(ix).bun());
+            self.bread(rb, id, false);
+            self.bread(ri, id, true);
+            self.nets[0].members.push((id, Conn::OutGreen));
+            return;
+        }
         let (kind, b, label) = match *g.op(v) {
             Op::BGet(b, s) => (arith(Operand::Sig(s), ArOp::Add, Operand::Const(0), out), b, "read one signal"),
             Op::BTotal(b) => (arith(Operand::Sig(each), ArOp::Add, Operand::Const(0), out), b, "total"),
@@ -458,7 +497,7 @@ impl Cg {
     fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Ref, what: &str) -> Result<HashMap<V, Ref>, Diag> {
         let live: Vec<V> = g.reachable(roots);
         let is_scalar_op = |v: V| matches!(g.op(v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_));
-        let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_));
+        let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..));
         let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..));
         let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
 
@@ -1188,7 +1227,7 @@ fn pipelined_block(
     let mut node_ref: HashMap<V, Ref> = HashMap::new();
     for &v in &nodes {
         match g.op(v) {
-            Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) => {
+            Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) => {
                 node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
             }
             Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) => {
@@ -1246,7 +1285,7 @@ fn pipelined_block(
             continue;
         }
         let t = tau(v).unwrap() - 1;
-        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) = g.op(v) {
+        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) = g.op(v) {
             // Operands as of this node's input tick, then the combinators.
             let mut ops: HashMap<V, Ref> = HashMap::new();
             for u in g.operands(v) {

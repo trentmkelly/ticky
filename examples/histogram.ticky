@@ -1,0 +1,75 @@
+# Level 4: histograms in signal arrays (SPEC §15.12). Each pulse of `strobe` counts
+# `sample` in its bin: a write at a runtime index, a few combinators however many bins.
+input  sample: int @ V      # values 0..63
+input  strobe: bool @ S     # pulse to count `sample`
+input  ask: int @ Q         # a bin to read
+output bins: Bundle         # bin i on the i-th signal of the array table
+output count: int @ C       # hist[ask]
+output peak: int @ P        # the fullest bin's count
+output modal: int @ M       # the first bin holding `peak`
+output threes: bool @ T     # whether some bin holds exactly 3
+output empty: int @ E       # bins still at 0
+output far: int @ F         # wide[ask * 6]
+
+hist = [0] * 64
+wide = [0] * 400            # longer than one signal table: two banks
+
+every tick:
+    count = hist[ask]
+    peak = max(hist)
+    modal = hist.index(peak)
+    threes = 3 in hist
+    empty = sum([h == 0 for h in hist])
+    far = wide[ask * 6]
+    bins = hist.as_bundle()
+
+while True:
+    wait until strobe
+    hist[clamp(sample, 0, 63)] += 1
+    wide[sample * 6] += 10
+    wait until not strobe
+
+test "counts samples":
+    set ask = 5
+    run 10 ticks
+    assert count == 0 and peak == 0 and modal == 0 and empty == 64 and not threes
+    set sample = 5
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 9
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 5
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 63
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 5
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 70
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    set sample = 9
+    set strobe = True
+    run 10 ticks
+    set strobe = False
+    run 10 ticks
+    run 20 ticks
+    assert count == 3 and peak == 3 and modal == 5 and threes and empty == 61 and far == 30
+    set ask = 63
+    run 20 ticks
+    assert count == 2 and far == 10      # wide[378] is in the second bank

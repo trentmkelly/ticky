@@ -63,6 +63,7 @@ ticky build prog.ticky --outputs=west   # output ports at the top left, each fed
 ticky build prog.ticky --place=anneal   # experimental: smaller footprint by simulated annealing
 ticky build prog.ticky --place=anneal --max-width 30   # ... at most 30 tiles wide (or --max-height)
 ticky build prog.ticky --allow-unknown-signals         # no warnings for modded item/recipe names
+ticky build prog.ticky --no-quality    # for games without the Quality mod (see below)
 ticky check prog.ticky                  # errors, warnings and the cost report
 ticky test  prog.ticky                  # run the program's `test` blocks in the simulator
 ticky sim   prog.ticky --ticks 300 --set charge=10 --set charge=90@100   # print output changes
@@ -90,6 +91,10 @@ off and on.
   northernmost), facing west; each is fed by its own line of poles (red wire) from a gate on the
   east edge. This costs one combinator and one tick per output. Wire from a port's output
   (right) side to whatever should react. Hovering over a port shows its current value.
+- **Quality:** by default the circuit carries its internal values on *quality* signals
+  (uncommon to legendary), so it needs the Quality mod (part of Space Age), and every normal
+  signal is yours: nothing a program reads or writes collides with the internals. Build with
+  `--no-quality` for a game without it.
 - Every port's in-game description names it, e.g. *"Ticky output `half` (int): sends signal-H…"*.
 
 ## Layout of this directory

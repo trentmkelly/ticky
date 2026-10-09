@@ -5,9 +5,11 @@
 //!   exits the block. Calls inside expressions are hoisted into statements in evaluation
 //!   order; `and`/`or`/`x if c else y` containing calls become real `if`s so short-circuiting
 //!   is kept.
-//! * **Arrays become scalars.** An array `xs` of length N is the variables `xs[0]` …
-//!   `xs[N-1]`. Constant indexes name an element directly; a runtime index reads through a
-//!   select and writes through one conditional assignment per element.
+//! * **Arrays become scalars or signal arrays.** An array indexed only by constants (a
+//!   *register array*) is the variables `xs[0]` … `xs[N-1]`. An array indexed at runtime, or
+//!   too long for registers, is a *signal array*: bundles `xs#0`, `xs#1`, … (banks of up to
+//!   one signal table each) with element `k` on signal `Graph::slot(k)`, read and written by
+//!   the `#a…` builtins. Which arrays are which is found by expanding again until it settles.
 //! * **Comprehensions** over constant ranges or arrays become list literals.
 //! * In `every` blocks, `for` loops are unrolled (their ranges must be constant).
 //!
@@ -25,6 +27,8 @@ use crate::program::eval_const;
 pub enum Shape {
     Scalar,
     Array(usize),
+    /// A signal array of this length.
+    Mem(usize),
 }
 
 /// The value of an expanded expression.
@@ -34,6 +38,8 @@ enum Val {
     None,
     Scalar(Expr),
     Array(Vec<Expr>),
+    /// A signal array: its banks (bundle expressions) and its length.
+    Mem(Vec<Expr>, usize),
     Tuple(Vec<Val>),
 }
 
@@ -41,6 +47,7 @@ enum Val {
 enum RetShape {
     Scalar,
     Array(usize),
+    Mem(usize),
     Tuple(Vec<Shape>),
 }
 
@@ -68,8 +75,24 @@ enum Loop {
     Unrolled { brk: usize, cont: usize },
 }
 
-/// Largest array the compiler accepts (every element is a register).
+/// Largest register array (every element is a register); longer arrays are signal arrays.
 const MAX_ARRAY: usize = 256;
+/// Largest array of any kind.
+const MAX_MEM: usize = 4096;
+/// Return shapes are compatible when they only differ in array representation.
+fn same_shape(a: &RetShape, b: &RetShape) -> bool {
+    let len = |s: &Shape| match s {
+        Shape::Scalar => None,
+        Shape::Array(n) | Shape::Mem(n) => Some(*n),
+    };
+    match (a, b) {
+        (RetShape::Scalar, RetShape::Scalar) => true,
+        (RetShape::Array(x) | RetShape::Mem(x), RetShape::Array(y) | RetShape::Mem(y)) => x == y,
+        (RetShape::Tuple(x), RetShape::Tuple(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| len(p) == len(q)),
+        _ => false,
+    }
+}
+
 /// Largest number of iterations an unrolled loop may have.
 const MAX_UNROLL: usize = 1024;
 
@@ -88,8 +111,108 @@ pub struct Expander<'a> {
     /// Functions compiled once and called as subroutines from sequential code (those with
     /// loops or waits); everything else is inlined.
     subs: HashSet<String>,
+    /// Functions that change module variables (directly or through calls): a call to one
+    /// can change values read earlier in the same expression.
+    impure: HashSet<String>,
     /// Expanded subroutine bodies: exit label, body and result shape.
     sub_bodies: BTreeMap<String, (usize, Vec<Stmt>, Option<RetShape>)>,
+    /// Arrays (by [`mem_key`]) that are signal arrays in this round.
+    mem_keys: HashSet<String>,
+    /// Arrays found to need a signal array (indexed at runtime, or given one).
+    found_mem: HashSet<String>,
+}
+
+/// Elements per bank of a signal array: one signal table.
+fn bank_size() -> usize {
+    ticky_factorio::SignalTable::base().array_signals().len()
+}
+
+/// `(offset, length)` of each bank of an `n`-element signal array.
+fn bank_ranges(n: usize) -> Vec<(usize, usize)> {
+    let s = bank_size();
+    (0..n.div_ceil(s)).map(|b| (b * s, s.min(n - b * s))).collect()
+}
+
+fn bank_name(r: &str, b: usize) -> String {
+    format!("{r}#{b}")
+}
+
+/// The value of signal array variable `r`.
+fn mem_names(r: &str, n: usize, span: Span) -> Val {
+    Val::Mem((0..bank_ranges(n).len()).map(|b| name(&bank_name(r, b), span)).collect(), n)
+}
+
+/// A name without the call numbers of inlined calls (`f.3.xs` → `f.xs`): the same for every
+/// call and every expansion round.
+fn mem_key(r: &str) -> String {
+    r.split('.').filter(|p| p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit())).collect::<Vec<_>>().join(".")
+}
+
+fn call(f: &str, args: Vec<Expr>, span: Span) -> Expr {
+    Expr { kind: ExprKind::Call { func: Box::new(name(f, span)), args, kwargs: vec![] }, span }
+}
+
+fn method_call(base: Expr, m: &str, span: Span) -> Expr {
+    let f = Expr { kind: ExprKind::Attr(Box::new(base), m.to_string()), span };
+    Expr { kind: ExprKind::Call { func: Box::new(f), args: vec![], kwargs: vec![] }, span }
+}
+
+fn bin(op: BinOp, a: Expr, b: Expr, span: Span) -> Expr {
+    Expr { kind: ExprKind::Binary(op, Box::new(a), Box::new(b)), span }
+}
+
+fn compare(a: Expr, op: CmpOp, b: Expr, span: Span) -> Expr {
+    Expr { kind: ExprKind::Compare(Box::new(a), vec![(op, b)]), span }
+}
+
+fn if_exp(c: Expr, a: Expr, b: Expr, span: Span) -> Expr {
+    Expr { kind: ExprKind::IfExp { cond: Box::new(c), then: Box::new(a), orelse: Box::new(b) }, span }
+}
+
+/// `i - off`.
+fn minus(i: &Expr, off: usize, span: Span) -> Expr {
+    if off == 0 {
+        i.clone()
+    } else {
+        bin(BinOp::Sub, i.clone(), int(off as i64, span), span)
+    }
+}
+
+/// Whether `e` mentions the name `var`.
+fn mentions(e: &Expr, var: &str) -> bool {
+    let mut found = false;
+    visit(e, &mut |x| {
+        if matches!(&x.kind, ExprKind::Name(n) if n == var) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether an element expression of `var` can run on all elements at once (bundle
+/// operations), with the same result as element by element. Floor division and modulo
+/// can't: per-signal arithmetic truncates.
+fn per_element(e: &Expr, var: &str) -> bool {
+    if !mentions(e, var) {
+        return true;
+    }
+    let ok = |x: &Expr| per_element(x, var);
+    match &e.kind {
+        ExprKind::Name(_) => true,
+        ExprKind::Unary(_, a) | ExprKind::Not(a) => ok(a),
+        ExprKind::Binary(op, a, b) => !matches!(op, BinOp::Pow | BinOp::Div | BinOp::FloorDiv | BinOp::Mod) && ok(a) && ok(b),
+        ExprKind::Compare(a, rest) => {
+            rest.len() == 1 && !matches!(rest[0].0, CmpOp::In | CmpOp::NotIn) && ok(a) && ok(&rest[0].1)
+        }
+        ExprKind::BoolOp(_, items) => items.iter().all(ok),
+        ExprKind::IfExp { cond, then, orelse } => ok(cond) && ok(then) && ok(orelse),
+        ExprKind::Call { func, args, kwargs } => {
+            matches!(&func.kind, ExprKind::Name(f) if matches!(f.as_str(), "min" | "max" | "abs"))
+                && kwargs.is_empty()
+                && args.iter().all(ok)
+        }
+        _ => false,
+    }
 }
 
 fn name(n: &str, span: Span) -> Expr {
@@ -110,6 +233,10 @@ fn assign(n: &str, value: Expr, span: Span) -> Stmt {
 
 fn element(base: &str, k: usize) -> String {
     format!("{base}[{k}]")
+}
+
+fn is_range(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Call { func, .. } if matches!(&func.kind, ExprKind::Name(n) if n == "range"))
 }
 
 fn is_literal(e: &Expr) -> bool {
@@ -244,7 +371,226 @@ impl<'a> Expander<'a> {
             calls: BTreeMap::new(),
             subs: HashSet::new(),
             sub_bodies: BTreeMap::new(),
+            mem_keys: HashSet::new(),
+            found_mem: HashSet::new(),
+            impure: HashSet::new(),
         }
+    }
+
+    /// Whether evaluating `e` can change module variables.
+    fn impure(&self, e: &Expr) -> bool {
+        let mut found = false;
+        visit(e, &mut |x| {
+            if let ExprKind::Call { func, .. } = &x.kind {
+                if matches!(&func.kind, ExprKind::Name(n) if self.impure.contains(n) && self.alias(n).is_none()) {
+                    found = true;
+                }
+            }
+        });
+        found
+    }
+
+    /// A value as it is now, when something evaluated after it (a call) might change it:
+    /// single values are copied (arrays aren't: Python sees changes to them too).
+    fn freeze(&mut self, v: Val, out: &mut Vec<Stmt>) -> Val {
+        match v {
+            Val::Scalar(e) if !matches!(e.kind, ExprKind::Int(_) | ExprKind::Bool(_)) && self.fold(&e).is_none() => {
+                let t = self.temp();
+                let span = e.span;
+                out.push(assign(&t, e, span));
+                Val::Scalar(name(&t, span))
+            }
+            Val::Tuple(parts) => Val::Tuple(parts.into_iter().map(|p| self.freeze(p, out)).collect()),
+            v => v,
+        }
+    }
+
+    /// Evaluates `items` left to right, freezing each value that a later item could change.
+    fn exprs_in_order<'e>(&mut self, items: impl IntoIterator<Item = &'e Expr>, out: &mut Vec<Stmt>) -> Result<Vec<Val>, Diag> {
+        let items: Vec<&Expr> = items.into_iter().collect();
+        let mut vals = Vec::new();
+        for (i, e) in items.iter().enumerate() {
+            let v = self.expr(e, out)?;
+            let later = items[i + 1..].iter().any(|x| self.impure(x));
+            vals.push(if later { self.freeze(v, out) } else { v });
+        }
+        Ok(vals)
+    }
+
+    /// Marks an array as needing a signal array (from the next round on).
+    fn want_mem(&mut self, r: &str) {
+        self.found_mem.insert(mem_key(r));
+    }
+
+    fn decide_mem(&self, r: &str, n: usize) -> bool {
+        n > MAX_ARRAY || self.mem_keys.contains(&mem_key(r))
+    }
+
+    /// The elements of an array value, as scalar expressions (signal arrays: one read each).
+    fn items(&mut self, v: Val, span: Span) -> Result<Vec<Expr>, Diag> {
+        match v {
+            Val::Array(items) => Ok(items),
+            Val::Mem(banks, n) => {
+                let mut items = Vec::new();
+                for (b, (_, nb)) in banks.iter().zip(bank_ranges(n)) {
+                    for k in 0..nb {
+                        items.push(call("#aget", vec![b.clone(), int(k as i64, span), int(nb as i64, span)], span));
+                    }
+                }
+                Ok(items)
+            }
+            v => Err(self.scalar(v, span).err().unwrap_or_else(|| Diag::error(span, "expected an array"))),
+        }
+    }
+
+    /// The banks of an array value (register arrays are built into bundles).
+    fn banks_of(&mut self, v: Val, span: Span) -> Result<(Vec<Expr>, usize), Diag> {
+        match v {
+            Val::Mem(banks, n) => Ok((banks, n)),
+            Val::Array(items) => {
+                let n = items.len();
+                if n > MAX_MEM {
+                    return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
+                }
+                let banks = bank_ranges(n).into_iter().map(|(off, nb)| call("#arr", items[off..off + nb].to_vec(), span)).collect();
+                Ok((banks, n))
+            }
+            v => Err(self.scalar(v, span).err().unwrap_or_else(|| Diag::error(span, "expected an array"))),
+        }
+    }
+
+    /// Python's constant index `k` (negative counts from the end), checked.
+    fn index_of(&self, k: i32, n: usize, span: Span) -> Result<usize, Diag> {
+        let k = k as i64;
+        let k = if k < 0 { k + n as i64 } else { k };
+        if !(0..n as i64).contains(&k) {
+            return Err(Diag::error(span, format!("index {k} is out of range for an array of {n}")));
+        }
+        Ok(k as usize)
+    }
+
+    /// Element `i` of a signal array.
+    fn mem_read(&mut self, banks: &[Expr], n: usize, i: Expr, ispan: Span, out: &mut Vec<Stmt>) -> Result<Expr, Diag> {
+        let span = i.span;
+        let ranges = bank_ranges(n);
+        if let Some(k) = self.fold(&i) {
+            let k = self.index_of(k, n, ispan)?;
+            let b = k / bank_size();
+            let (off, nb) = ranges[b];
+            return Ok(call("#aget", vec![banks[b].clone(), int((k - off) as i64, span), int(nb as i64, span)], span));
+        }
+        let i = if ranges.len() > 1 { self.bind(i, out) } else { i };
+        // Every bank reads with its own offset; out of range gives 0.
+        let reads: Vec<Expr> = banks
+            .iter()
+            .zip(ranges)
+            .map(|(b, (off, nb))| call("#aget", vec![b.clone(), minus(&i, off, span), int(nb as i64, span)], span))
+            .collect();
+        Ok(reads.into_iter().reduce(|a, b| bin(BinOp::Add, a, b, span)).unwrap_or_else(|| int(0, span)))
+    }
+
+    /// `arr[i] = e` (or `arr[i] += e`) on signal array `arr` of length `n`.
+    fn mem_write(&mut self, arr: &str, i: Expr, e: Expr, add: bool, span: Span, out: &mut Vec<Stmt>) -> Result<(), Diag> {
+        let Shape::Mem(n) = self.shape(arr) else { unreachable!("not a signal array") };
+        let f = if add { "#aadd" } else { "#aset" };
+        let ranges = bank_ranges(n);
+        if let Some(k) = self.fold(&i) {
+            let k = self.index_of(k, n, i.span)?;
+            let b = k / bank_size();
+            let (off, nb) = ranges[b];
+            let bn = bank_name(arr, b);
+            out.push(assign(&bn, call(f, vec![name(&bn, span), int((k - off) as i64, span), e, int(nb as i64, span)], span), span));
+            return Ok(());
+        }
+        let (i, e) = if ranges.len() > 1 { (self.bind(i, out), self.bind(e, out)) } else { (i, e) };
+        for (b, (off, nb)) in ranges.into_iter().enumerate() {
+            let bn = bank_name(arr, b);
+            out.push(assign(&bn, call(f, vec![name(&bn, span), minus(&i, off, span), e.clone(), int(nb as i64, span)], span), span));
+        }
+        Ok(())
+    }
+
+    /// Assigns a signal array's banks to array variable `r`.
+    fn assign_banks(&mut self, r: &str, banks: Vec<Expr>, span: Span, out: &mut Vec<Stmt>) {
+        let names = (0..banks.len()).map(|b| bank_name(r, b)).collect();
+        self.parallel_assign(names, banks, span, out);
+    }
+
+    /// `x in arr` for a signal array.
+    fn mem_in(&mut self, banks: &[Expr], n: usize, x: Expr, span: Span, out: &mut Vec<Stmt>) -> Expr {
+        let x = self.bind(x, out);
+        let k = self.fold(&x);
+        let mut tests = Vec::new();
+        for (b, (_, nb)) in banks.iter().zip(bank_ranges(n)) {
+            if k != Some(0) {
+                let m = self.matches(b, &x, span);
+                tests.push(compare(call("len", vec![m], span), CmpOp::Ne, int(0, span), span));
+            }
+            if k.is_none() || k == Some(0) {
+                // Zeros aren't on the wire: a bank has one when it has fewer signals.
+                let short = compare(call("len", vec![b.clone()], span), CmpOp::Lt, int(nb as i64, span), span);
+                let zero = compare(x.clone(), CmpOp::Eq, int(0, span), span);
+                tests.push(Expr { kind: ExprKind::BoolOp(BoolOp::And, vec![zero, short]), span });
+            }
+        }
+        match tests.len() {
+            0 => Expr { kind: ExprKind::Bool(false), span },
+            1 => tests.pop().unwrap(),
+            _ => Expr { kind: ExprKind::BoolOp(BoolOp::Or, tests), span },
+        }
+    }
+
+    /// `{s: 1 for s, v in bank.items() if v == x}` (already expanded).
+    fn matches(&mut self, bank: &Expr, x: &Expr, span: Span) -> Expr {
+        let id = self.fresh();
+        let (sn, vn) = (format!("#s{id}.s"), format!("#v{id}.v"));
+        Expr {
+            kind: ExprKind::DictComp {
+                key: Box::new(name(&sn, span)),
+                value: Box::new(int(1, span)),
+                target: Box::new(Expr { kind: ExprKind::Tuple(vec![name(&sn, span), name(&vn, span)]), span }),
+                iter: Box::new(method_call(bank.clone(), "items", span)),
+                conds: vec![compare(name(&vn, span), CmpOp::Eq, x.clone(), span)],
+            },
+            span,
+        }
+    }
+
+    /// `arr.index(x)` for a signal array: the first position holding `x`, or -1.
+    fn mem_index(&mut self, banks: &[Expr], n: usize, x: Expr, span: Span, out: &mut Vec<Stmt>) -> Expr {
+        let x = self.bind(x, out);
+        let k = self.fold(&x);
+        let mut firsts = Vec::new();
+        for (b, (off, nb)) in banks.iter().zip(bank_ranges(n)) {
+            // The matching slots (zeros too, when `x` is 0), times their positions; the
+            // smallest is the first.
+            let mut parts = Vec::new();
+            if k != Some(0) {
+                parts.push(self.matches(b, &x, span));
+            }
+            if k.is_none() || k == Some(0) {
+                let is_zero = compare(x.clone(), CmpOp::Eq, int(0, span), span);
+                parts.push(call("#azeros", vec![b.clone(), is_zero, int(nb as i64, span)], span));
+            }
+            let m = parts.into_iter().reduce(|a, b| bin(BinOp::Add, a, b, span)).unwrap();
+            let at = bin(BinOp::Mul, m, call("#aidx", vec![int(nb as i64, span)], span), span);
+            let first = call("min", vec![method_call(at, "values", span)], span);
+            let first = self.bind(bin(BinOp::Sub, first, int(1, span), span), out);
+            firsts.push((first, off));
+        }
+        // The first bank with a match (each bank's result is already -1 without one).
+        let mut acc: Option<Expr> = None;
+        for (f, off) in firsts.into_iter().rev() {
+            let at = if off == 0 { f.clone() } else { bin(BinOp::Add, f.clone(), int(off as i64, span), span) };
+            acc = Some(match acc {
+                None if off == 0 => f,
+                rest => {
+                    let found = compare(f, CmpOp::Ge, int(0, span), span);
+                    if_exp(found, at, rest.unwrap_or_else(|| int(-1, span)), span)
+                }
+            });
+        }
+        acc.unwrap_or_else(|| int(-1, span))
     }
 
     pub fn shapes(&self) -> &HashMap<String, Shape> {
@@ -280,7 +626,7 @@ impl<'a> Expander<'a> {
             Some(old) if *old != s => {
                 let show = |s: Shape| match s {
                     Shape::Scalar => "a single value".to_string(),
-                    Shape::Array(n) => format!("an array of {n}"),
+                    Shape::Array(n) | Shape::Mem(n) => format!("an array of {n}"),
                 };
                 Err(Diag::error(span, format!("`{}` is {} here but {} elsewhere", display(resolved), show(s), show(*old)))
                     .with_help("a variable keeps one shape: a single value, or an array of one length"))
@@ -300,6 +646,8 @@ impl<'a> Expander<'a> {
         match v {
             Val::Scalar(e) => Ok(e),
             Val::Array(es) => Err(Diag::error(span, format!("expected a single value, but this is an array of {}", es.len()))
+                .with_help("index it, e.g. `xs[0]`, or reduce it with `sum`, `min` or `max`")),
+            Val::Mem(_, n) => Err(Diag::error(span, format!("expected a single value, but this is an array of {n}"))
                 .with_help("index it, e.g. `xs[0]`, or reduce it with `sum`, `min` or `max`")),
             Val::Tuple(_) => Err(Diag::error(span, "expected a single value, but this is a tuple")),
             Val::None => Err(Diag::error(span, "this function doesn't return a value")),
@@ -321,6 +669,7 @@ impl<'a> Expander<'a> {
                 match self.shape(&r) {
                     Shape::Scalar => Val::Scalar(name(&r, span)),
                     Shape::Array(k) => Val::Array((0..k).map(|i| name(&element(&r, i), span)).collect()),
+                    Shape::Mem(k) => mem_names(&r, k, span),
                 }
             }
             ExprKind::Unary(op, a) => {
@@ -332,14 +681,29 @@ impl<'a> Expander<'a> {
                 rebuild(ExprKind::Not(Box::new(a)))
             }
             ExprKind::Binary(op, a, b) => {
-                let (va, vb) = (self.expr(a, out)?, self.expr(b, out)?);
+                let mut ab = self.exprs_in_order([&**a, &**b], out)?.into_iter();
+                let (va, vb) = (ab.next().unwrap(), ab.next().unwrap());
+                let is_arr = |v: &Val| matches!(v, Val::Array(_) | Val::Mem(..));
+                // Concatenating or repeating signal arrays goes element by element.
+                let (va, vb) = if is_arr(&va) && (is_arr(&vb) || *op == BinOp::Mul) || is_arr(&vb) && *op == BinOp::Mul {
+                    let va = if matches!(va, Val::Mem(..)) { Val::Array(self.items(va, a.span)?) } else { va };
+                    let vb = if matches!(vb, Val::Mem(..)) { Val::Array(self.items(vb, b.span)?) } else { vb };
+                    (va, vb)
+                } else {
+                    (va, vb)
+                };
                 match (op, va, vb) {
-                    (BinOp::Add, Val::Array(x), Val::Array(y)) => Val::Array(x.into_iter().chain(y).collect()),
+                    (BinOp::Add, Val::Array(x), Val::Array(y)) => {
+                        if x.len() + y.len() > MAX_MEM {
+                            return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
+                        }
+                        Val::Array(x.into_iter().chain(y).collect())
+                    }
                     (BinOp::Mul, Val::Array(x), Val::Scalar(k)) | (BinOp::Mul, Val::Scalar(k), Val::Array(x)) => {
                         let n = self.fold(&k).ok_or_else(|| Diag::error(k.span, "an array can only be repeated a constant number of times"))?;
                         let n = n.max(0) as usize;
-                        if x.len() * n > MAX_ARRAY {
-                            return Err(Diag::error(span, format!("arrays are limited to {MAX_ARRAY} elements")));
+                        if x.len() * n > MAX_MEM {
+                            return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
                         }
                         Val::Array((0..n).flat_map(|_| x.iter().cloned()).collect())
                     }
@@ -355,6 +719,10 @@ impl<'a> Expander<'a> {
                     let x = self.expr_scalar(first, out)?;
                     let items = match self.expr(rhs, out)? {
                         Val::Array(items) => items,
+                        Val::Mem(banks, n) => {
+                            let t = self.mem_in(&banks, n, x, span, out);
+                            return Ok(Val::Scalar(if *op == CmpOp::In { t } else { Expr { kind: ExprKind::Not(Box::new(t)), span } }));
+                        }
                         // A bundle: `sig in b`, checked when lowering.
                         Val::Scalar(b) => return Ok(rebuild(ExprKind::Compare(Box::new(x), vec![(*op, b)]))),
                         _ => return Err(Diag::error(rhs.span, "`in` needs an array or a bundle on the right")),
@@ -370,10 +738,14 @@ impl<'a> Expander<'a> {
                         .collect();
                     return Ok(rebuild(ExprKind::BoolOp(bop, tests)));
                 }
-                let f = self.expr_scalar(first, out)?;
+                let all = std::iter::once(&**first).chain(rest.iter().map(|(_, x)| x));
+                let vals = self.exprs_in_order(all, out)?;
+                let mut vals = vals.into_iter().zip(std::iter::once(first.span).chain(rest.iter().map(|(_, x)| x.span)));
+                let (v0, s0) = vals.next().unwrap();
+                let f = self.scalar(v0, s0)?;
                 let mut r = Vec::new();
-                for (op, x) in rest {
-                    r.push((*op, self.expr_scalar(x, out)?));
+                for ((op, _), (v, sp)) in rest.iter().zip(vals) {
+                    r.push((*op, self.scalar(v, sp)?));
                 }
                 rebuild(ExprKind::Compare(Box::new(f), r))
             }
@@ -405,6 +777,17 @@ impl<'a> Expander<'a> {
                     return Ok(Val::Scalar(name(&t, span)));
                 }
                 match (self.expr(then, out)?, self.expr(orelse, out)?) {
+                    (x @ (Val::Mem(..) | Val::Array(_)), y @ (Val::Mem(..) | Val::Array(_)))
+                        if matches!((&x, &y), (Val::Mem(..), _) | (_, Val::Mem(..))) =>
+                    {
+                        let (bx, nx) = self.banks_of(x, then.span)?;
+                        let (by, ny) = self.banks_of(y, orelse.span)?;
+                        if nx != ny {
+                            return Err(Diag::error(span, format!("the two arrays have different lengths ({nx} and {ny})")));
+                        }
+                        let c = self.bind(c, out);
+                        Val::Mem(bx.into_iter().zip(by).map(|(p, q)| if_exp(c.clone(), p, q, span)).collect(), nx)
+                    }
                     (Val::Array(x), Val::Array(y)) if x.len() == y.len() => {
                         let c = self.bind(c, out);
                         Val::Array(
@@ -425,8 +808,12 @@ impl<'a> Expander<'a> {
             }
             ExprKind::Call { func, args, kwargs } => {
                 if let ExprKind::Attr(base, m) = &func.kind {
+                    let bv = self.expr(base, out)?;
+                    if matches!(bv, Val::Array(_) | Val::Mem(..)) {
+                        return self.array_method(bv, m, args, kwargs, span, out);
+                    }
                     // A bundle method: `b.total()`, `b.items()`, …
-                    let b = self.expr_scalar(base, out)?;
+                    let b = self.scalar(bv, base.span)?;
                     let mut a = Vec::new();
                     for x in args {
                         a.push(self.expr_scalar(x, out)?);
@@ -449,6 +836,10 @@ impl<'a> Expander<'a> {
             ExprKind::Index(base, idx) => {
                 let items = match self.expr(base, out)? {
                     Val::Array(items) => items,
+                    Val::Mem(banks, n) => {
+                        let i = self.expr_scalar(idx, out)?;
+                        return Ok(Val::Scalar(self.mem_read(&banks, n, i, idx.span, out)?));
+                    }
                     // A bundle: `b[sig]`, checked when lowering.
                     Val::Scalar(b) => {
                         let i = self.expr_scalar(idx, out)?;
@@ -468,6 +859,18 @@ impl<'a> Expander<'a> {
                         Val::Scalar(items[k as usize].clone())
                     }
                     None => {
+                        // A named array indexed at runtime becomes a signal array (next round).
+                        if let ExprKind::Name(nm) = &base.kind {
+                            if self.alias(nm).is_none() {
+                                let r = self.resolve(nm);
+                                self.want_mem(&r);
+                            }
+                        }
+                        // A table of constants: one bundle constant and one read.
+                        if items.len() >= 3 && items.len() <= bank_size() && items.iter().all(|x| self.fold(x).is_some()) {
+                            let n = items.len() as i64;
+                            return Ok(Val::Scalar(call("#aget", vec![call("#arr", items, span), i, int(n, span)], span)));
+                        }
                         // Runtime index: a select over all elements (0 if out of range).
                         let mut args = vec![i];
                         args.extend(items);
@@ -544,8 +947,8 @@ impl<'a> Expander<'a> {
                 for i in items {
                     v.push(self.expr_scalar(i, out)?);
                 }
-                if v.len() > MAX_ARRAY {
-                    return Err(Diag::error(span, format!("arrays are limited to {MAX_ARRAY} elements")));
+                if v.len() > MAX_MEM {
+                    return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
                 }
                 Val::Array(v)
             }
@@ -553,7 +956,17 @@ impl<'a> Expander<'a> {
                 let ExprKind::Name(t) = &target.kind else {
                     return Err(Diag::error(target.span, "the comprehension variable must be a single name"));
                 };
-                let values = self.iteration_values(iter, out)?;
+                let values = if is_range(iter) {
+                    self.iteration_values(iter, out)?
+                } else {
+                    match self.expr(iter, out)? {
+                        // Element-wise over a signal array: bundle operations on every bank.
+                        Val::Mem(banks, n) if conds.is_empty() && per_element(elt, t) && !has_call(elt, self.fns) => {
+                            return self.mem_map(&banks, n, t, elt, out);
+                        }
+                        v => self.snapshot(v, iter.span, out)?,
+                    }
+                };
                 let mut items = Vec::new();
                 for v in values {
                     self.aliases.push(HashMap::from([(t.clone(), v)]));
@@ -651,20 +1064,80 @@ impl<'a> Expander<'a> {
                 return Ok(vals);
             }
         }
-        match self.expr(iter, out)? {
-            Val::Array(items) => {
-                // Elements might change during the loop; iterate over a snapshot.
+        let v = self.expr(iter, out)?;
+        self.snapshot(v, iter.span, out)
+    }
+
+    /// The elements of an array to iterate over. Elements might change during the loop, so
+    /// iterate over a snapshot.
+    fn snapshot(&mut self, v: Val, span: Span, out: &mut Vec<Stmt>) -> Result<Vec<Expr>, Diag> {
+        match v {
+            v @ (Val::Array(_) | Val::Mem(..)) => {
+                let items = self.items(v, span)?;
                 Ok(items.into_iter().map(|e| self.bind(e, out)).collect())
             }
-            _ => Err(Diag::error(iter.span, "can only iterate over `range(…)` or an array")),
+            _ => Err(Diag::error(span, "can only iterate over `range(…)` or an array")),
+        }
+    }
+
+    /// `[f(x) for x in arr]` on a signal array: a bundle comprehension per bank over the
+    /// elements that aren't 0, plus `f(0)` on those that are.
+    fn mem_map(&mut self, banks: &[Expr], n: usize, var: &str, elt: &Expr, out: &mut Vec<Stmt>) -> Result<Val, Diag> {
+        let span = elt.span;
+        let mut res = Vec::new();
+        for (b, (_, nb)) in banks.iter().zip(bank_ranges(n)) {
+            let id = self.fresh();
+            let (sn, vn) = (format!("#s{id}.s"), format!("#v{id}.v"));
+            self.aliases.push(HashMap::from([(var.to_string(), name(&vn, span))]));
+            let value = self.expr_scalar(elt, out);
+            self.aliases.pop();
+            self.aliases.push(HashMap::from([(var.to_string(), int(0, span))]));
+            let at_zero = self.expr_scalar(elt, out);
+            self.aliases.pop();
+            let (value, at_zero) = (value?, at_zero?);
+            let comp = Expr {
+                kind: ExprKind::DictComp {
+                    key: Box::new(name(&sn, span)),
+                    value: Box::new(value),
+                    target: Box::new(Expr { kind: ExprKind::Tuple(vec![name(&sn, span), name(&vn, span)]), span }),
+                    iter: Box::new(method_call(b.clone(), "items", span)),
+                    conds: vec![],
+                },
+                span,
+            };
+            res.push(match self.fold(&at_zero) {
+                Some(0) => comp,
+                _ => bin(BinOp::Add, comp, call("#azeros", vec![b.clone(), at_zero, int(nb as i64, span)], span), span),
+            });
+        }
+        Ok(Val::Mem(res, n))
+    }
+
+    /// Methods of arrays: `xs.index(v)`, `xs.as_bundle()`.
+    fn array_method(&mut self, v: Val, m: &str, args: &[Expr], kwargs: &[(String, Expr)], span: Span, out: &mut Vec<Stmt>) -> Result<Val, Diag> {
+        if let Some((k, _)) = kwargs.first() {
+            return Err(Diag::error(span, format!("`.{m}()` doesn't take a keyword argument `{k}`")));
+        }
+        match (m, args) {
+            ("index", [x]) => {
+                let x = self.expr_scalar(x, out)?;
+                let (banks, n) = self.banks_of(v, span)?;
+                Ok(Val::Scalar(self.mem_index(&banks, n, x, span, out)))
+            }
+            ("as_bundle", []) => {
+                let (banks, _) = self.banks_of(v, span)?;
+                if banks.len() > 1 {
+                    return Err(Diag::error(span, format!("`.as_bundle()` works on arrays of up to {} elements", bank_size())));
+                }
+                Ok(Val::Scalar(banks.into_iter().next().unwrap_or_else(|| call("Bundle", vec![], span))))
+            }
+            _ => Err(Diag::error(span, format!("arrays have no method `{m}` with {} argument(s)", args.len()))
+                .with_help("array methods: `.index(v)` and `.as_bundle()`; see also `len`, `sum`, `min`, `max`, `sorted`")),
         }
     }
 
     fn builtin(&mut self, f: &str, args: &[Expr], kwargs: &[(String, Expr)], span: Span, out: &mut Vec<Stmt>) -> Result<Val, Diag> {
-        let mut vals = Vec::new();
-        for a in args {
-            vals.push(self.expr(a, out)?);
-        }
+        let vals = self.exprs_in_order(args, out)?;
         let mut kw = Vec::new();
         for (k, a) in kwargs {
             kw.push((k.clone(), self.expr_scalar(a, out)?));
@@ -681,6 +1154,66 @@ impl<'a> Expander<'a> {
             let mut items = items;
             let right = items.split_off(items.len() / 2);
             join(tree(items, join), tree(right, join))
+        }
+        if let [v @ (Val::Mem(..) | Val::Array(_))] = vals.as_slice() {
+            if f == "sorted" {
+                let mut rev = false;
+                for (k, x) in &kw {
+                    match (k.as_str(), self.fold(x)) {
+                        ("reverse", Some(r)) => rev = r != 0,
+                        ("reverse", None) => return Err(Diag::error(x.span, "`reverse` must be constant")),
+                        _ => return Err(Diag::error(x.span, format!("`sorted` doesn't take a keyword argument `{k}`"))),
+                    }
+                }
+                let (banks, n) = self.banks_of(v.clone(), span)?;
+                if n == 0 {
+                    return Ok(Val::Array(vec![]));
+                }
+                if banks.len() > 1 {
+                    return Err(Diag::error(span, format!("`sorted` works on arrays of up to {} elements", bank_size())));
+                }
+                let b = banks.into_iter().next().unwrap();
+                return Ok(Val::Mem(vec![self::call("#asorted", vec![b, int(rev as i64, span), int(n as i64, span)], span)], n));
+            }
+            if f == "reversed" {
+                let mut items = self.items(v.clone(), span)?;
+                items.reverse();
+                return Ok(Val::Array(items));
+            }
+        }
+        if let [Val::Mem(banks, n)] = vals.as_slice() {
+            let (banks, n) = (banks.clone(), *n);
+            let ranges = bank_ranges(n);
+            let join = |op: BoolOp, tests: Vec<Expr>| Expr { kind: ExprKind::BoolOp(op, tests), span };
+            match f {
+                "len" => return Ok(Val::Scalar(int(n as i64, span))),
+                "sum" => {
+                    let totals = banks.into_iter().map(|b| method_call(b, "total", span));
+                    return Ok(Val::Scalar(totals.reduce(|a, b| bin(BinOp::Add, a, b, span)).unwrap()));
+                }
+                "any" | "all" => {
+                    // Zeros aren't on the wire: count the signals.
+                    let tests = banks
+                        .into_iter()
+                        .zip(ranges)
+                        .map(|(b, (_, nb))| {
+                            let len = self::call("len", vec![b], span);
+                            if f == "any" {
+                                compare(len, CmpOp::Ne, int(0, span), span)
+                            } else {
+                                compare(len, CmpOp::Eq, int(nb as i64, span), span)
+                            }
+                        })
+                        .collect();
+                    return Ok(Val::Scalar(join(if f == "any" { BoolOp::Or } else { BoolOp::And }, tests)));
+                }
+                "min" | "max" => {
+                    let fname = if f == "min" { "#amin" } else { "#amax" };
+                    let each: Vec<Expr> = banks.into_iter().zip(ranges).map(|(b, (_, nb))| self::call(fname, vec![b, int(nb as i64, span)], span)).collect();
+                    return Ok(Val::Scalar(tree(each, &|a, b| call(f, vec![a, b]))));
+                }
+                _ => {}
+            }
         }
         match (f, vals.as_slice()) {
             ("len", [Val::Array(xs)]) => return Ok(Val::Scalar(int(xs.len() as i64, span))),
@@ -705,7 +1238,7 @@ impl<'a> Expander<'a> {
                 return Ok(Val::Scalar(tree(xs.clone(), &|a, b| call(f, vec![a, b]))));
             }
             ("min" | "max", [Val::Array(_)]) => return Err(Diag::error(span, format!("`{f}` of an empty array"))),
-            ("sorted" | "reversed" | "enumerate" | "zip", _) => {
+            ("enumerate" | "zip", _) => {
                 return Err(Diag::error(span, format!("`{f}` isn't supported yet")));
             }
             _ => {}
@@ -738,8 +1271,10 @@ impl<'a> Expander<'a> {
         if args.len() > def.params.len() {
             return Err(Diag::error(span, format!("`{f}` takes {} argument(s), got {}", def.params.len(), args.len())));
         }
-        for (i, a) in args.iter().enumerate() {
-            bound[i] = Some(self.expr(a, out)?);
+        let all: Vec<&Expr> = args.iter().chain(kwargs.iter().map(|(_, a)| a)).collect();
+        let mut vals = self.exprs_in_order(all, out)?.into_iter();
+        for (i, _) in args.iter().enumerate() {
+            bound[i] = vals.next();
         }
         for (k, a) in kwargs {
             let Some(i) = def.params.iter().position(|p| &p.name == k) else {
@@ -748,7 +1283,7 @@ impl<'a> Expander<'a> {
             if bound[i].is_some() {
                 return Err(Diag::error(a.span, format!("`{k}` is given twice")));
             }
-            bound[i] = Some(self.expr(a, out)?);
+            bound[i] = vals.next();
         }
         let params = def.params.clone();
         for (i, p) in params.iter().enumerate() {
@@ -798,6 +1333,7 @@ impl<'a> Expander<'a> {
             None => Val::None,
             Some(RetShape::Scalar) => Val::Scalar(name(&slot(""), span)),
             Some(RetShape::Array(n)) => Val::Array((0..n).map(|k| name(&element(&slot(""), k), span)).collect()),
+            Some(RetShape::Mem(n)) => mem_names(&slot(""), n, span),
             Some(RetShape::Tuple(shapes)) => Val::Tuple(
                 shapes
                     .iter()
@@ -805,6 +1341,7 @@ impl<'a> Expander<'a> {
                     .map(|(i, s)| match s {
                         Shape::Scalar => Val::Scalar(name(&slot(&i.to_string()), span)),
                         Shape::Array(n) => Val::Array((0..*n).map(|k| name(&element(&slot(&i.to_string()), k), span)).collect()),
+                        Shape::Mem(n) => mem_names(&slot(&i.to_string()), *n, span),
                     })
                     .collect(),
             ),
@@ -843,6 +1380,7 @@ impl<'a> Expander<'a> {
             let v = match shape {
                 Shape::Scalar => Val::Scalar(name(from, span)),
                 Shape::Array(n) => Val::Array((0..n).map(|k| name(&element(from, k), span)).collect()),
+                Shape::Mem(n) => mem_names(from, n, span),
             };
             this.assign_to(&name(&t, span), v, span, out)?;
             this.expr(&name(&t, span), out)
@@ -851,6 +1389,7 @@ impl<'a> Expander<'a> {
             None => Val::None,
             Some(RetShape::Scalar) => copy(self, Shape::Scalar, &slot(""), out)?,
             Some(RetShape::Array(n)) => copy(self, Shape::Array(n), &slot(""), out)?,
+            Some(RetShape::Mem(n)) => copy(self, Shape::Mem(n), &slot(""), out)?,
             Some(RetShape::Tuple(shapes)) => {
                 let mut parts = Vec::new();
                 for (i, sh) in shapes.into_iter().enumerate() {
@@ -877,9 +1416,39 @@ impl<'a> Expander<'a> {
                         out.push(assign(&r, e, span));
                     }
                     Val::Array(items) => {
-                        self.set_shape(&r, Shape::Array(items.len()), target.span)?;
-                        let names: Vec<String> = (0..items.len()).map(|k| element(&r, k)).collect();
-                        self.parallel_assign(names, items, span, out);
+                        let n = items.len();
+                        let mem = match self.shapes.get(&r) {
+                            Some(Shape::Mem(_)) => true,
+                            Some(Shape::Array(_)) => false,
+                            _ => self.decide_mem(&r, n),
+                        };
+                        if mem {
+                            self.set_shape(&r, Shape::Mem(n), target.span)?;
+                            let (banks, _) = self.banks_of(Val::Array(items), span)?;
+                            self.assign_banks(&r, banks, span, out);
+                        } else {
+                            if n > MAX_ARRAY {
+                                return Err(Diag::error(span, format!("arrays indexed only by constants are limited to {MAX_ARRAY} elements")));
+                            }
+                            self.set_shape(&r, Shape::Array(n), target.span)?;
+                            let names: Vec<String> = (0..n).map(|k| element(&r, k)).collect();
+                            self.parallel_assign(names, items, span, out);
+                        }
+                    }
+                    Val::Mem(banks, n) => {
+                        let mem = match self.shapes.get(&r) {
+                            Some(Shape::Mem(_)) => true,
+                            Some(_) => false,
+                            None => self.decide_mem(&r, n),
+                        };
+                        if !mem {
+                            // Only arrays indexed at runtime are signal arrays (constant
+                            // indexes are cheaper on registers): copy element by element.
+                            let items = self.items(Val::Mem(banks, n), span)?;
+                            return self.assign_to(target, Val::Array(items), span, out);
+                        }
+                        self.set_shape(&r, Shape::Mem(n), target.span)?;
+                        self.assign_banks(&r, banks, span, out);
                     }
                     Val::Tuple(_) => {
                         return Err(Diag::error(span, "can't store a tuple in one variable")
@@ -892,10 +1461,56 @@ impl<'a> Expander<'a> {
                 let parts: Vec<Val> = match v {
                     Val::Tuple(p) => p,
                     Val::Array(items) => items.into_iter().map(Val::Scalar).collect(),
+                    v @ Val::Mem(..) => self.items(v, span)?.into_iter().map(Val::Scalar).collect(),
                     _ => return Err(Diag::error(span, "can only unpack a tuple or an array")),
                 };
                 if parts.len() != targets.len() {
                     return Err(Diag::error(span, format!("can't unpack {} value(s) into {} name(s)", parts.len(), targets.len())));
+                }
+                // Signal arrays involved (or runtime indexes): evaluate every value first, then
+                // assign left to right, like Python.
+                let mem_target = |this: &Self, t: &Expr| -> bool {
+                    match &t.kind {
+                        ExprKind::Index(base, idx) => match &base.kind {
+                            ExprKind::Name(n) => {
+                                let r = this.resolve(n);
+                                matches!(this.shapes.get(&r), Some(Shape::Mem(_))) || this.fold(idx).is_none()
+                            }
+                            _ => false,
+                        },
+                        ExprKind::Name(n) => {
+                            let r = this.resolve(n);
+                            matches!(this.shapes.get(&r), Some(Shape::Mem(_))) || this.mem_keys.contains(&mem_key(&r))
+                        }
+                        _ => false,
+                    }
+                };
+                if parts.iter().any(|p| matches!(p, Val::Mem(..))) || targets.iter().any(|t| mem_target(self, t)) {
+                    let mut held = Vec::new();
+                    for p in parts {
+                        held.push(match p {
+                            Val::Scalar(e) => Val::Scalar(self.bind(e, out)),
+                            Val::Mem(banks, n) => {
+                                let mut held = Vec::new();
+                                for b in banks {
+                                    let t = self.temp();
+                                    out.push(assign(&t, b, span));
+                                    held.push(name(&t, span));
+                                }
+                                Val::Mem(held, n)
+                            }
+                            p @ Val::Array(_) => {
+                                let t = self.temp();
+                                self.assign_to(&name(&t, span), p, span, out)?;
+                                self.expr(&name(&t, span), out)?
+                            }
+                            _ => return Err(Diag::error(span, "can't unpack this here")),
+                        });
+                    }
+                    for (t, p) in targets.iter().zip(held) {
+                        self.assign_to(t, p, span, out)?;
+                    }
+                    return Ok(());
                 }
                 // Everything on the right is evaluated before anything is assigned.
                 let mut names = Vec::new();
@@ -923,6 +1538,9 @@ impl<'a> Expander<'a> {
                         (ExprKind::Index(base, idx), Val::Scalar(e)) => {
                             let (arr, len) = self.array_name(base)?;
                             let i = self.expr_scalar(idx, out)?;
+                            if self.fold(&i).is_none() {
+                                self.want_mem(&arr);
+                            }
                             let k = self.const_index(&i, len, idx.span, "in a multiple assignment")?;
                             names.push(element(&arr, k));
                             values.push(e);
@@ -934,6 +1552,7 @@ impl<'a> Expander<'a> {
             }
             ExprKind::Index(base, idx) if self.is_bundle_name(base) => {
                 // `b[k] = e` is `b = #bset(b, k, e)`: only that signal changes.
+                let v = if self.impure(idx) { self.freeze(v, out) } else { v };
                 let b = self.expr_scalar(base, out)?;
                 let k = self.expr_scalar(idx, out)?;
                 let e = self.scalar(v, span)?;
@@ -942,8 +1561,16 @@ impl<'a> Expander<'a> {
             }
             ExprKind::Index(base, idx) => {
                 let (arr, len) = self.array_name(base)?;
+                // The value was evaluated first (as in Python); the index may change it.
+                let v = if self.impure(idx) { self.freeze(v, out) } else { v };
                 let i = self.expr_scalar(idx, out)?;
                 let e = self.scalar(v, span)?;
+                if let Some(Shape::Mem(_)) = self.shapes.get(&arr).copied() {
+                    return self.mem_write(&arr, i, e, false, span, out);
+                }
+                if self.fold(&i).is_none() {
+                    self.want_mem(&arr);
+                }
                 match self.fold(&i) {
                     Some(_) => {
                         let k = self.const_index(&i, len, idx.span, "")?;
@@ -1001,13 +1628,14 @@ impl<'a> Expander<'a> {
         }
     }
 
+    /// A named array: its resolved name and length (any representation).
     fn array_name(&self, base: &Expr) -> Result<(String, usize), Diag> {
         let ExprKind::Name(n) = &base.kind else {
             return Err(Diag::error(base.span, "can only assign to elements of a named array"));
         };
         let r = self.resolve(n);
         match self.shape(&r) {
-            Shape::Array(len) => Ok((r, len)),
+            Shape::Array(len) | Shape::Mem(len) => Ok((r, len)),
             Shape::Scalar => Err(Diag::error(base.span, format!("`{n}` isn't an array"))),
         }
     }
@@ -1075,11 +1703,16 @@ impl<'a> Expander<'a> {
                         return self.stmt(&stmt(StmtKind::Assign { targets: vec![target.clone()], value: rhs }, span), out);
                     }
                 }
+                if self.impure(value) {
+                    // `t op= f()` where f can change t: read t first, like Python.
+                    let rhs = Expr { kind: ExprKind::Binary(*op, Box::new(target.clone()), Box::new(value.clone())), span };
+                    return self.stmt(&stmt(StmtKind::Assign { targets: vec![target.clone()], value: rhs }, span), out);
+                }
                 let v = self.expr_scalar(value, out)?;
                 match &target.kind {
                     ExprKind::Name(n) => {
                         let r = self.resolve(n);
-                        if let Shape::Array(_) = self.shape(&r) {
+                        if let Shape::Array(_) | Shape::Mem(_) = self.shape(&r) {
                             return Err(Diag::error(target.span, format!("`{n}` is an array; `{}=` needs a single value", op.symbol())));
                         }
                         out.push(stmt(StmtKind::AugAssign { target: name(&r, target.span), op: *op, value: v }, span));
@@ -1087,6 +1720,26 @@ impl<'a> Expander<'a> {
                     ExprKind::Index(base, idx) => {
                         let (arr, len) = self.array_name(base)?;
                         let i = self.expr_scalar(idx, out)?;
+                        if let Shape::Mem(n) = self.shape(&arr) {
+                            return match op {
+                                // Adding needs no read: the one-hot index times the amount.
+                                BinOp::Add => self.mem_write(&arr, i, v, true, span, out),
+                                BinOp::Sub => {
+                                    let neg = Expr { kind: ExprKind::Unary(UnOp::Neg, Box::new(v)), span };
+                                    self.mem_write(&arr, i, neg, true, span, out)
+                                }
+                                _ => {
+                                    let i = self.bind(i, out);
+                                    let banks: Vec<Expr> = (0..bank_ranges(n).len()).map(|b| name(&bank_name(&arr, b), span)).collect();
+                                    let old = self.mem_read(&banks, n, i.clone(), idx.span, out)?;
+                                    let new = bin(*op, old, v, span);
+                                    self.mem_write(&arr, i, new, false, span, out)
+                                }
+                            };
+                        }
+                        if self.fold(&i).is_none() {
+                            self.want_mem(&arr);
+                        }
                         match self.fold(&i) {
                             Some(_) => {
                                 let k = self.const_index(&i, len, idx.span, "")?;
@@ -1165,11 +1818,13 @@ impl<'a> Expander<'a> {
                     let shape = match &val {
                         Val::Scalar(_) => RetShape::Scalar,
                         Val::Array(xs) => RetShape::Array(xs.len()),
+                        Val::Mem(_, n) => RetShape::Mem(*n),
                         Val::Tuple(parts) => RetShape::Tuple(
                             parts
                                 .iter()
                                 .map(|p| match p {
                                     Val::Array(xs) => Ok(Shape::Array(xs.len())),
+                                    Val::Mem(_, n) => Ok(Shape::Mem(*n)),
                                     Val::Scalar(_) => Ok(Shape::Scalar),
                                     _ => Err(Diag::error(v.span, "can't return nested tuples")),
                                 })
@@ -1179,13 +1834,26 @@ impl<'a> Expander<'a> {
                     };
                     let frame = self.frames.last_mut().unwrap();
                     match &frame.ret {
-                        Some(old) if *old != shape => {
+                        Some(old) if !same_shape(old, &shape) => {
                             return Err(Diag::error(v.span, format!("`{fname}` returns different kinds of values on different paths")))
                         }
-                        _ => frame.ret = Some(shape),
+                        Some(_) => {}
+                        None => frame.ret = Some(shape),
                     }
-                    // Assign the result slots (outside the function's local scope).
+                    // Assign the result slots (outside the function's local scope). A signal
+                    // array stays one.
                     let slot = |s: &str| format!("{prefix}#ret{s}");
+                    match &val {
+                        Val::Mem(..) => self.want_mem(&slot("")),
+                        Val::Tuple(parts) => {
+                            for (i, p) in parts.iter().enumerate() {
+                                if matches!(p, Val::Mem(..)) {
+                                    self.want_mem(&slot(&i.to_string()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     let saved = self.frames.pop();
                     let r = match val {
                         Val::Tuple(parts) => {
@@ -1199,6 +1867,27 @@ impl<'a> Expander<'a> {
                     };
                     self.frames.push(saved.unwrap());
                     r?;
+                    // The slots keep the representation of the first value they got.
+                    let fix = |shapes: &HashMap<String, Shape>, s: &str, sh: Shape| match (shapes.get(s), sh) {
+                        (Some(Shape::Mem(_)), Shape::Array(n)) => Shape::Mem(n),
+                        (Some(Shape::Array(_)), Shape::Mem(n)) => Shape::Array(n),
+                        _ => sh,
+                    };
+                    let frame = self.frames.last_mut().unwrap();
+                    frame.ret = match frame.ret.take() {
+                        Some(RetShape::Array(n)) => Some(match fix(&self.shapes, &slot(""), Shape::Array(n)) {
+                            Shape::Mem(n) => RetShape::Mem(n),
+                            _ => RetShape::Array(n),
+                        }),
+                        Some(RetShape::Mem(n)) => Some(match fix(&self.shapes, &slot(""), Shape::Mem(n)) {
+                            Shape::Array(n) => RetShape::Array(n),
+                            _ => RetShape::Mem(n),
+                        }),
+                        Some(RetShape::Tuple(parts)) => Some(RetShape::Tuple(
+                            parts.into_iter().enumerate().map(|(i, sh)| fix(&self.shapes, &slot(&i.to_string()), sh)).collect(),
+                        )),
+                        other => other,
+                    };
                 }
                 out.push(stmt(StmtKind::Exit(exit), span));
             }
@@ -1279,9 +1968,30 @@ impl<'a> Expander<'a> {
             out.push(stmt(StmtKind::For { target: name(&r, target.span), iter, body: b? }, span));
             return Ok(());
         }
-        // `for x in xs` in sequential code: loop over indexes, reading through a select.
-        let Val::Array(items) = self.expr(iter, out)? else {
-            return Err(Diag::error(iter.span, "can only iterate over `range(…)` or an array"));
+        // `for x in xs` in sequential code: loop over indexes, reading through a select (a
+        // signal array: from a snapshot of its banks).
+        let items = match self.expr(iter, out)? {
+            Val::Array(items) => items,
+            Val::Mem(banks, n) => {
+                let mut snap = Vec::new();
+                for b in banks {
+                    let t = self.temp();
+                    out.push(assign(&t, b, span));
+                    snap.push(name(&t, span));
+                }
+                let idx = self.temp();
+                let pick = self.mem_read(&snap, n, name(&idx, span), span, out)?;
+                let mut b = Vec::new();
+                self.assign_to(target, Val::Scalar(pick), span, &mut b)?;
+                self.loops.push(Loop::Real);
+                let rest = self.stmts(body);
+                self.loops.pop();
+                b.extend(rest?);
+                let range = call("range", vec![int(n as i64, span)], span);
+                out.push(stmt(StmtKind::For { target: name(&idx, span), iter: range, body: b }, span));
+                return Ok(());
+            }
+            _ => return Err(Diag::error(iter.span, "can only iterate over `range(…)` or an array")),
         };
         let items: Vec<Expr> = items.into_iter().map(|e| self.bind(e, out)).collect();
         let idx = self.temp();
@@ -1315,6 +2025,12 @@ pub fn quoted(n: &str) -> String {
 
 /// A readable form of an internal name: `f.3.x` → `x` in `f`, `#t5` → a temporary.
 pub fn display(n: &str) -> String {
+    // A bank of a signal array: `xs#0` → `xs`.
+    if let Some((base, b)) = n.rsplit_once('#') {
+        if !base.is_empty() && !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()) && !base.ends_with('.') {
+            return display(base);
+        }
+    }
     if n.starts_with("#t") {
         return "a temporary value".into();
     }
@@ -1442,8 +2158,10 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
         return Err(errs);
     }
     let consts = module_consts(m, &fns);
-    // Two passes: the first discovers the shape of every module-level variable (which may be
-    // assigned after it is used), the second expands with that knowledge. Ports are scalars.
+    // Several passes: the first discovers the shape of every module-level variable (which may
+    // be assigned after it is used) and which arrays are indexed at runtime; the next ones
+    // expand with that knowledge, until no more arrays become signal arrays. Ports are
+    // scalars.
     let mut shapes: HashMap<String, Shape> = m
         .body
         .iter()
@@ -1452,9 +2170,13 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
             _ => None,
         })
         .collect();
-    for round in 0..2 {
+    let mut mem_keys: HashSet<String> = HashSet::new();
+    const ROUNDS: usize = 6;
+    for round in 0..ROUNDS {
         let mut ex = Expander::new(&fns, &consts, shapes.clone());
         ex.subs = sequential_fns(&fns);
+        ex.impure = impure_fns(&fns);
+        ex.mem_keys = mem_keys.clone();
         let mut body = Vec::new();
         let mut errs = Vec::new();
         let mut main = Vec::new();
@@ -1479,8 +2201,23 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
                 errs.push(d);
             }
         }
-        if round == 0 {
-            shapes = ex.shapes().clone();
+        let new: Vec<String> = ex.found_mem.difference(&mem_keys).cloned().collect();
+        if round == 0 || (!new.is_empty() && round + 1 < ROUNDS) {
+            mem_keys.extend(new);
+            // Carry over the shapes of names that are the same every round (inlined calls'
+            // locals are renumbered when the expansion changes).
+            shapes = ex
+                .shapes()
+                .iter()
+                .filter(|(r, _)| !r.starts_with('#') && mem_key(r) == **r)
+                .map(|(r, sh)| {
+                    let sh = match *sh {
+                        Shape::Array(n) if mem_keys.contains(r.as_str()) => Shape::Mem(n),
+                        sh => sh,
+                    };
+                    (r.clone(), sh)
+                })
+                .collect();
             continue;
         }
         if !errs.is_empty() {
@@ -1495,6 +2232,95 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
         return Ok((Module { body }, (ex.calls, sub_names)));
     }
     unreachable!()
+}
+
+/// Functions that assign module variables (declared `global`, or elements of arrays that
+/// aren't their own), directly or through the functions they call.
+fn impure_fns(fns: &HashMap<String, FnDef>) -> HashSet<String> {
+    fn writes_global(body: &[Stmt], locals: &HashSet<String>) -> bool {
+        let global_target = |t: &Expr| -> bool {
+            let mut hit = false;
+            let mut check = |e: &Expr| match &e.kind {
+                ExprKind::Name(n) => hit |= !locals.contains(n),
+                ExprKind::Index(b, _) => {
+                    if let ExprKind::Name(n) = &b.kind {
+                        hit |= !locals.contains(n);
+                    }
+                }
+                _ => {}
+            };
+            match &t.kind {
+                ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().for_each(&mut check),
+                _ => check(t),
+            }
+            hit
+        };
+        body.iter().any(|s| match &s.kind {
+            StmtKind::Assign { targets, .. } => targets.iter().any(global_target),
+            StmtKind::AugAssign { target, .. } | StmtKind::AnnAssign { target, .. } => global_target(target),
+            StmtKind::For { target, body, .. } => global_target(target) || writes_global(body, locals),
+            StmtKind::If { body, orelse, .. } => writes_global(body, locals) || writes_global(orelse, locals),
+            StmtKind::While { body, .. } => writes_global(body, locals),
+            _ => false,
+        })
+    }
+    let mut out: HashSet<String> = fns.iter().filter(|(_, d)| writes_global(&d.body, &d.locals)).map(|(n, _)| n.clone()).collect();
+    loop {
+        let more: Vec<String> = fns
+            .iter()
+            .filter(|(n, d)| {
+                !out.contains(*n) && {
+                    let mut calls = false;
+                    let mut f = |e: &Expr| {
+                        if let ExprKind::Call { func, .. } = &e.kind {
+                            if matches!(&func.kind, ExprKind::Name(c) if out.contains(c)) {
+                                calls = true;
+                            }
+                        }
+                    };
+                    stmt_exprs(&d.body, &mut f);
+                    calls
+                }
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if more.is_empty() {
+            return out;
+        }
+        out.extend(more);
+    }
+}
+
+/// Calls `f` on every expression in `body` (recursively, including nested statements).
+fn stmt_exprs(body: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { targets, value } => {
+                targets.iter().for_each(|t| visit(t, f));
+                visit(value, f);
+            }
+            StmtKind::AugAssign { target, value, .. } => {
+                visit(target, f);
+                visit(value, f);
+            }
+            StmtKind::AnnAssign { value: Some(v), .. } | StmtKind::Expr(v) | StmtKind::WaitUntil(v) | StmtKind::WaitTicks(v) => visit(v, f),
+            StmtKind::Return(Some(v)) => visit(v, f),
+            StmtKind::If { cond, body, orelse } => {
+                visit(cond, f);
+                stmt_exprs(body, f);
+                stmt_exprs(orelse, f);
+            }
+            StmtKind::While { cond, body } => {
+                visit(cond, f);
+                stmt_exprs(body, f);
+            }
+            StmtKind::For { iter, body, .. } => {
+                visit(iter, f);
+                stmt_exprs(body, f);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Functions with loops or waits (directly or through the functions they call): these become

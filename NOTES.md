@@ -275,3 +275,46 @@ stats 35×26 → 36×22, arrays 28×20 → 29×16, inventory 21×9 → 17×10. T
 without poles. Bigger wins now need: rotated (2×1) combinators, filling the return-line
 region north of the blueprint, and packing the return lines themselves. Difftested in-game
 (calculator, inventory with west outputs, stats with --max-width 24): all match.
+
+## 2026-10-09 — Level 4: signal arrays; quality signals inside
+
+### Verified first (probe scenario, `L*` and `Q*` rows; simulator test `arrays_match_the_game`)
+- Read: `each(green) == I(green)` with the output copying red onto one signal sums the one
+  match; the index signal itself also matches (`I == I`) but the array has no `I`.
+- One-hot `each(red) == I(green) → each = 1`; mask `each(red) != 0 ∧ each(green) == 0`.
+- `each >> 1 → X` is an arithmetic shift, summed; the selector ranks by index (nothing past
+  the end) and sums both wires.
+- Quality (`TICKY_SPACE_AGE=1`): every quality of a signal is a separate signal for `each`,
+  `everything`, selectors, conditions, outputs and constant combinators; blueprints add
+  `"quality": "…"` to signal IDs.
+
+### Signal arrays (expand.rs `Shape::Mem`, ir.rs `aget/aset/aadd/azeros/amax/asorted`)
+- An array indexed at runtime anywhere (or longer than 256) is a bundle per bank, element `k`
+  on `Graph::slot(k)` (the internal pool minus the index signal). The expander records runtime
+  indexes per name (call numbers stripped: `f.3.xs` → `f.xs`) and re-expands until nothing
+  new turns up (≤ 6 rounds); only names, never values, decide: a signal array assigned to an
+  unmarked name is read out element by element (an early version spread signal arrays into
+  `stats`' sort function and serialised its swaps: 117 ticks deep).
+- New IR: terms `Shift` (`x + k → sig`, index wires), `Hot` (one-hot), `Fold`
+  (`each op k → sig`); ops `AGet` (array read), `BSelect` with a rank. A read is 2 ticks; a
+  write 3; `+=` 3 without reading.
+- `sorted`: keys `2x + 1` (a Map plus a constant on one wire), N ranked selectors, N
+  `each >> 1 → T[k]`. `min`/`max` use the selector on the nonzero elements and fix up zeros.
+- `index`/`in` count matches with a comprehension, plus zeros (`azeros`) when the value may
+  be 0.
+- Bundle `a + b` of small computed bundles merges their terms onto one wire (no combinator).
+- Results (combinators): arrays 179 → 59, stats 307 → 184. New examples `sorting` (§15.9)
+  and `histogram` (§15.12, includes a two-bank array).
+
+### Quality signals inside (default; `--no-quality` to turn off)
+The internal pool is the base pool × uncommon…legendary (1432 signals), set per compilation
+(thread-local `set_quality_pool`). Quality variants are separate `Sig`s (`with_quality`,
+`display` → `signal-A@rare`). The harness loads the Quality mod (`TICKY_QUALITY=1`, set by
+`difftest`). All 22 examples difftest-match the game with quality inside.
+
+### Fixed: evaluation order around calls that change globals (pre-existing)
+`b = a + f()` where `f` sets global `a` gave 11 instead of 2: calls are hoisted before the
+expression but earlier operands were read after them. Now values are frozen into temporaries
+when a later operand calls a function that writes module variables (`impure_fns`,
+transitively); `t op= f()` reads `t` first; `xs[f()] = v` evaluates `v` first. Found by
+`fuzz_level2.py` after the array changes, reduced with the new `tools/reduce_level2.py`.

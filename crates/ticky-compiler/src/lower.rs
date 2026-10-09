@@ -197,6 +197,42 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     return Ok(g.bset(b, k, x));
                 }
                 "Bundle" => return bundle::construct(g, names, args, kwargs, e.span),
+                // Internal: signal arrays (from the expansion pass). A bank of an array is a
+                // bundle with element `k` on `Graph::slot(k)`; the last argument (a literal) is
+                // the bank's length.
+                "#arr" => {
+                    let mut terms = Vec::new();
+                    for (k, a) in args.iter().enumerate() {
+                        let x = expr(g, names, a)?;
+                        let x = bundle::int(g, x, a.span)?;
+                        terms.push(BTerm::One(Graph::slot(k), x));
+                    }
+                    return Ok(g.bun(terms));
+                }
+                "#aget" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#amax" | "#amin" | "#aidx" => {
+                    let n = match args.last().map(|a| &a.kind) {
+                        Some(ExprKind::Int(n)) => *n as usize,
+                        _ => unreachable!("array builtins end with the length"),
+                    };
+                    let mut vals = Vec::new();
+                    for a in &args[..args.len() - 1] {
+                        vals.push(expr(g, names, a)?);
+                    }
+                    let b = vals.first().copied().unwrap_or(0);
+                    return Ok(match fname.as_str() {
+                        "#aget" => g.aget(b, vals[1], n),
+                        "#aset" => g.aset(b, vals[1], vals[2], n),
+                        "#aadd" => g.aadd(b, vals[1], vals[2], n),
+                        "#azeros" => g.azeros(b, vals[1], n),
+                        "#asorted" => {
+                            let rev = g.as_const(vals[1]).unwrap_or(0) != 0;
+                            g.asorted(b, n, rev)
+                        }
+                        "#amax" => g.amax(b, n, true),
+                        "#amin" => g.amax(b, n, false),
+                        _ => g.positions(n),
+                    });
+                }
                 "len" if args.len() == 1 => {
                     let b = expr(g, names, &args[0])?;
                     let b = bundle::bundle(g, b, args[0].span)?;

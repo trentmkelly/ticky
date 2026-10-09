@@ -1,3 +1,10 @@
+-- "@quality" for a signal of a quality other than normal, else "".
+local function qname(sig)
+  local q = sig.quality
+  if q and type(q) ~= "string" then q = q.name end
+  return (q and q ~= "normal") and ("@" .. q) or ""
+end
+
 -- Ticky in-game harness. Builds the blueprint from job.lua on a lab-tile surface, powers it,
 -- then on each tick applies scheduled input changes and records every output port, writing
 -- script-output/ticky/trace.txt (one line per tick: "<tick> <out1> <out2> ...").
@@ -100,7 +107,7 @@ script.on_event(defines.events.on_tick, function(e)
       local section = storage.injectors[st.port].get_control_behavior().get_section(1)
       for k = 1, section.filters_count do section.clear_slot(k) end
       for k, v in ipairs(st.values) do
-        section.set_slot(k, {value = {type = v.type, name = v.name, quality = "normal"}, min = v.value})
+        section.set_slot(k, {value = {type = v.type, name = v.name, quality = v.quality or "normal"}, min = v.value})
       end
     elseif st.t == i then
       local p = job.ports[st.port]
@@ -121,14 +128,14 @@ script.on_event(defines.events.on_tick, function(e)
     if p.dir == "out" and p.pole and not p.bundle then
       local v = 0
       for _, sg in pairs(signals) do
-        if sg.signal.name == p.signal.name then v = v + sg.count end
+        if sg.signal.name == p.signal.name and qname(sg.signal) == "" then v = v + sg.count end
       end
       row[#row + 1] = tostring(v)
     elseif p.dir == "out" and p.bundle then
       -- Every signal the port outputs, as {name=value,...} sorted by name.
       local parts = {}
       for _, sg in pairs(signals) do
-        if sg.count ~= 0 then parts[#parts + 1] = {n = sg.signal.name, v = sg.count} end
+        if sg.count ~= 0 then parts[#parts + 1] = {n = sg.signal.name .. qname(sg.signal), v = sg.count} end
       end
       table.sort(parts, function(a, b) return a.n < b.n end)
       local strs = {}

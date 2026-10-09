@@ -244,7 +244,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         let mut prev_pos = net.entities[*gate].pos;
         for &p in pts {
             // The climb can be longer than one wire: relay through free tiles on the way.
-            for t in route(&used, prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
+            for t in route(&|t| !used.contains(&t), prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
                 used.insert(t);
                 let pos = (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
                 let id = net.add(Kind::Pole, Role::Power);
@@ -262,6 +262,23 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
         net.wire(prev, (*port, Conn::InRed));
     }
+    // Poles (power, output lines) by tile, with whether their red and green connectors are
+    // taken: a relay can use a pole whose connector of the wire's colour is free.
+    let mut pole_at: std::collections::HashMap<(i64, i64), (EntId, [bool; 2])> = std::collections::HashMap::new();
+    for (i, e) in net.entities.iter().enumerate() {
+        if matches!(e.kind, Kind::Pole) {
+            pole_at.insert(tile(e.pos), (i, [false, false]));
+        }
+    }
+    for w in &net.wires {
+        for (e, c) in [w.a, w.b] {
+            if matches!(net.entities[e].kind, Kind::Pole) {
+                if let Some(p) = pole_at.get_mut(&tile(net.entities[e].pos)) {
+                    p.1[(c == Conn::Green) as usize] = true;
+                }
+            }
+        }
+    }
     for spec in nets {
         let points: Vec<(f64, f64)> = spec.members.iter().map(|(e, _)| net.entities[*e].pos).collect();
         for (a, b) in mst(&points) {
@@ -273,15 +290,29 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             // Too far for one wire: relay through the fewest medium poles on free tiles.
             let conn = if spec.red { Conn::Red } else { Conn::Green };
             let mut prev = spec.members[a];
-            for tile in route(&used, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))? {
-                used.insert(tile);
-                let pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
-                let id = net.add(Kind::Pole, Role::Power);
-                net.entities[id].pos = pos;
-                net.entities[id].description = Some("Ticky wire relay".into());
+            let ci = (conn == Conn::Green) as usize;
+            let free = |t: (i64, i64)| !used.contains(&t) || pole_at.get(&t).is_some_and(|p| !p.1[ci]);
+            let path = route(&free, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))?;
+            for tile in path {
+                let id = match pole_at.get_mut(&tile) {
+                    Some(p) => {
+                        p.1[ci] = true;
+                        p.0
+                    }
+                    None => {
+                        used.insert(tile);
+                        let id = net.add(Kind::Pole, Role::Power);
+                        net.entities[id].pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
+                        net.entities[id].description = Some("Ticky wire relay".into());
+                        relays += 1;
+                        let mut taken = [false, false];
+                        taken[ci] = true;
+                        pole_at.insert(tile, (id, taken));
+                        id
+                    }
+                };
                 net.wire(prev, (id, conn));
                 prev = (id, conn);
-                relays += 1;
             }
             net.wire(prev, spec.members[b]);
         }
@@ -295,7 +326,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
 /// Relay tiles for a wire from `from` to `to`: the fewest free tiles such that every hop is
 /// within reach (breadth-first over free tiles, going around occupied areas if needed).
 /// Empty if `to` is already in reach; `None` if there's no way through.
-fn route(used: &std::collections::HashSet<(i64, i64)>, from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
+fn route(free: &dyn Fn((i64, i64)) -> bool, from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
     if dist(from, to) <= MAX_WIRE {
         return Some(vec![]);
     }
@@ -312,7 +343,7 @@ fn route(used: &std::collections::HashSet<(i64, i64)>, from: (f64, f64), to: (f6
         (-r..=r).flat_map(move |dx| (-r..=r).map(move |dy| (px + dx, py + dy)))
     };
     for t in near(from) {
-        if !used.contains(&t) && dist(centre(t), from) <= MAX_WIRE && !prev.contains_key(&t) {
+        if free(t) && dist(centre(t), from) <= MAX_WIRE && !prev.contains_key(&t) {
             prev.insert(t, None);
             queue.push_back(t);
         }
@@ -329,7 +360,7 @@ fn route(used: &std::collections::HashSet<(i64, i64)>, from: (f64, f64), to: (f6
             return Some(path);
         }
         for u in near(centre(t)) {
-            if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || used.contains(&u) || prev.contains_key(&u) {
+            if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || !free(u) || prev.contains_key(&u) {
                 continue;
             }
             if dist(centre(u), centre(t)) <= MAX_WIRE {

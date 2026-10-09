@@ -34,7 +34,7 @@ impl std::fmt::Display for PVal {
             PVal::Int(k) => write!(f, "{k}"),
             PVal::Bun(b) => {
                 let t = ticky_factorio::SignalTable::base();
-                let parts: Vec<String> = b.iter().map(|(s, v)| format!("{}={v}", t.name(*s))).collect();
+                let parts: Vec<String> = b.iter().map(|(s, v)| format!("{}={v}", t.display(*s))).collect();
                 write!(f, "{{{}}}", parts.join(","))
             }
         }

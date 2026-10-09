@@ -1,0 +1,43 @@
+# Level 4: sorting the slow way and the fast way (SPEC §15.9), on signal arrays.
+# Pulse `go` to sort N numbers made from `seed`: `sorted` is about 2N combinators and a few
+# ticks; the bubble sort below is N²/2 compare-and-swaps, each a step of the main program.
+input  seed: int @ X
+input  go: bool @ G
+output fast_max: int @ M
+output fast_min: int @ N
+output slow_median: int @ S
+output slow_done: bool @ D
+output agree: bool @ A        # both sorts give the same order
+
+N = 16
+slow_done = False
+
+while True:
+    wait until go
+    slow_done = False
+    xs = [(k * seed) % 41 - 20 for k in range(N)]
+    zs = sorted(xs)
+    fast_max = zs[-1]
+    fast_min = zs[0]
+    ys = xs
+    for i in range(N):
+        for j in range(N - 1 - i):
+            if ys[j] > ys[j + 1]:
+                ys[j], ys[j + 1] = ys[j + 1], ys[j]
+    slow_median = ys[N // 2]
+    agree = all([ys[k] == zs[k] for k in range(N)])
+    slow_done = True
+    wait until not go
+
+test "sorts":
+    set seed = 7
+    set go = True
+    run 1500 ticks
+    assert slow_done and agree
+    assert fast_max == 16 and fast_min == -20 and slow_median == -4
+    set go = False
+    run 20 ticks
+    set seed = 3
+    set go = True
+    run 1500 ticks
+    assert slow_done and agree and fast_max == 19 and fast_min == -20 and slow_median == -2

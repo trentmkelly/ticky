@@ -1,5 +1,25 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+
+/// Quality levels, by index (0 = normal). With the Quality mod, each quality of a signal is a
+/// separate signal on a wire.
+pub const QUALITIES: [&str; 5] = ["normal", "uncommon", "rare", "epic", "legendary"];
+
+thread_local! {
+    static QUALITY_POOL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether internal wiring (and signal arrays) on this thread use the quality variants
+/// (uncommon to legendary) of the base signals, leaving every normal signal to the program.
+/// Needs the Quality mod in the game. Set by the compiler for each compilation.
+pub fn set_quality_pool(on: bool) {
+    QUALITY_POOL.with(|q| q.set(on));
+}
+
+pub fn quality_pool() -> bool {
+    QUALITY_POOL.with(|q| q.get())
+}
 
 /// Index into the [`SignalTable`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -53,12 +73,14 @@ pub struct SignalInfo {
     pub base: bool,
     /// Known to the game data Ticky ships with; `false` for names a program made up (mods).
     pub known: bool,
+    /// Index into [`QUALITIES`].
+    pub quality: u8,
 }
 
 #[derive(Default)]
 struct Inner {
     sigs: Vec<&'static SignalInfo>,
-    by_key: HashMap<(SignalKind, String), Sig>,
+    by_key: HashMap<(SignalKind, String, u8), Sig>,
     /// First signal with each name: base game before the expansion, items before recipes.
     by_name: HashMap<String, Sig>,
 }
@@ -93,15 +115,17 @@ impl SignalTable {
             let f: Vec<&str> = line.split('\t').collect();
             let Some(kind) = SignalKind::parse(f[0]) else { continue };
             let usable = f[2] == "false" && f[3] == "false" && f[4] == "false";
-            self.add(SignalInfo { kind, name: f[1].to_string(), usable, base, known: true });
+            self.add(SignalInfo { kind, name: f[1].to_string(), usable, base, known: true, quality: 0 });
         }
     }
 
     fn add(&self, info: SignalInfo) -> Sig {
         let mut g = self.inner.write().unwrap();
         let sig = Sig(g.sigs.len() as u16);
-        g.by_key.insert((info.kind, info.name.clone()), sig);
-        g.by_name.entry(info.name.clone()).or_insert(sig);
+        g.by_key.insert((info.kind, info.name.clone(), info.quality), sig);
+        if info.quality == 0 {
+            g.by_name.entry(info.name.clone()).or_insert(sig);
+        }
         g.sigs.push(Box::leak(Box::new(info)));
         sig
     }
@@ -122,6 +146,38 @@ impl SignalTable {
         &self.info(s).name
     }
 
+    /// The name with its quality, when not normal: `signal-A@rare`.
+    pub fn display(&self, s: Sig) -> String {
+        let i = self.info(s);
+        match i.quality {
+            0 => i.name.clone(),
+            q => format!("{}@{}", i.name, QUALITIES[q as usize]),
+        }
+    }
+
+    /// A signal written as `name` or `name@quality`.
+    pub fn lookup_display(&self, text: &str) -> Option<Sig> {
+        match text.split_once('@') {
+            None => self.lookup(text),
+            Some((n, q)) => {
+                let q = QUALITIES.iter().position(|x| *x == q)? as u8;
+                Some(self.with_quality(self.lookup(n)?, q))
+            }
+        }
+    }
+
+    /// The same signal with another quality.
+    pub fn with_quality(&self, s: Sig, q: u8) -> Sig {
+        let i = self.info(s);
+        if i.quality == q {
+            return s;
+        }
+        if let Some(v) = self.inner.read().unwrap().by_key.get(&(i.kind, i.name.clone(), q)).copied() {
+            return v;
+        }
+        self.add(SignalInfo { quality: q, base: false, ..i.clone() })
+    }
+
     /// A usable signal by exact name (any type; items win over recipes of the same name).
     pub fn lookup(&self, exact: &str) -> Option<Sig> {
         let s = *self.inner.read().unwrap().by_name.get(exact)?;
@@ -130,7 +186,7 @@ impl SignalTable {
 
     /// A signal by type and exact name, whether or not it's usable.
     pub fn lookup_kind(&self, kind: SignalKind, exact: &str) -> Option<Sig> {
-        self.inner.read().unwrap().by_key.get(&(kind, exact.to_string())).copied()
+        self.inner.read().unwrap().by_key.get(&(kind, exact.to_string(), 0)).copied()
     }
 
     /// The signal with this type and name, adding it if the game data doesn't have it
@@ -139,7 +195,7 @@ impl SignalTable {
         if let Some(s) = self.lookup_kind(kind, exact) {
             return s;
         }
-        self.add(SignalInfo { kind, name: exact.to_string(), usable: true, base: false, known: false })
+        self.add(SignalInfo { kind, name: exact.to_string(), usable: true, base: false, known: false, quality: 0 })
     }
 
     /// Resolves a signal written as a Ticky identifier: `iron_plate` → `iron-plate`,
@@ -156,8 +212,17 @@ impl SignalTable {
 
     /// Signals available for internal wiring, most readable first: letters, digits, colours,
     /// other virtual signals, then items and fluids. Base game only, so blueprints work
-    /// with or without the expansion.
+    /// with or without the expansion; with [`quality_pool`], their uncommon to legendary
+    /// variants instead (four times as many, and no normal signal is used).
     pub fn internal_pool(&self) -> Vec<Sig> {
+        let base = self.base_pool();
+        if !quality_pool() {
+            return base;
+        }
+        (1..QUALITIES.len() as u8).flat_map(|q| base.iter().map(move |s| (*s, q))).map(|(s, q)| self.with_quality(s, q)).collect()
+    }
+
+    fn base_pool(&self) -> Vec<Sig> {
         let rank = |i: &SignalInfo| -> u8 {
             let n = i.name.as_str();
             match i.kind {
@@ -189,6 +254,23 @@ impl SignalTable {
         v.sort_by_key(|s| (rank(g.sigs[s.0 as usize]), s.0));
         v
     }
+
+    /// Signal arrays store element `k` on `array_signals()[k]`: the internal pool except
+    /// its last signal, which [`SignalTable::index_signal`] keeps for index wires.
+    pub fn array_signals(&self) -> &'static [Sig] {
+        static A: [OnceLock<Vec<Sig>>; 2] = [OnceLock::new(), OnceLock::new()];
+        A[quality_pool() as usize].get_or_init(|| {
+            let mut p = self.internal_pool();
+            p.pop();
+            p
+        })
+    }
+
+    /// The signal carrying an index next to an array's position table (never an element).
+    pub fn index_signal(&self) -> Sig {
+        static I: [OnceLock<Sig>; 2] = [OnceLock::new(), OnceLock::new()];
+        *I[quality_pool() as usize].get_or_init(|| *self.internal_pool().last().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +288,18 @@ mod tests {
         assert!(t.resolve_ident("everything").is_none());
         assert_eq!(t.internal_pool().len(), 358);
         assert_eq!(t.name(t.internal_pool()[0]), "signal-A");
+        assert_eq!(t.array_signals().len(), 357);
+        assert!(!t.array_signals().contains(&t.index_signal()));
+        // Quality variants: separate signals; the quality pool has no normal signal.
+        set_quality_pool(true);
+        let p = t.internal_pool();
+        assert_eq!(p.len(), 358 * 4);
+        assert_eq!(t.display(p[0]), "signal-A@uncommon");
+        assert!(p.iter().all(|s| t.info(*s).quality > 0));
+        assert_eq!(t.array_signals().len(), 358 * 4 - 1);
+        assert_eq!(t.lookup_display("signal-A@uncommon"), Some(p[0]));
+        assert_eq!(t.lookup("signal-A").map(|s| t.info(s).quality), Some(0));
+        set_quality_pool(false);
         // Space Age names are known; items win over recipes with the same name.
         let y = t.resolve_ident("yumako").unwrap();
         assert_eq!(t.info(y).kind, SignalKind::Item);

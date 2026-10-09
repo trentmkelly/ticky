@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use ticky_compiler::program::Ty;
 use ticky_compiler::testrun::{run_tests, Harness, PVal};
 use ticky_compiler::{compile, Compiled, Opt, Options};
-use ticky_factorio::{blueprint, SignalTable};
+use ticky_factorio::{blueprint, SignalTable, QUALITIES};
 use ticky_syntax::ast::PortDir;
 use ticky_syntax::{Diag, Severity};
 
@@ -113,6 +113,10 @@ struct Placement {
     /// Don't warn about item/recipe/signal names Ticky doesn't know (modded names).
     #[arg(long)]
     allow_unknown_signals: bool,
+    /// Don't use quality signals (uncommon to legendary) for internal wiring, for games
+    /// without the Quality mod (Space Age). Internal wiring then uses normal signals.
+    #[arg(long)]
+    no_quality: bool,
 }
 
 impl Placement {
@@ -171,7 +175,7 @@ fn print_diags(diags: &[Diag], file: &str, src: &str) {
 fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(String, String, Compiled), ExitCode> {
     let (name, src) = load(file)?;
     let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west: place.outputs == Side::West, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -194,7 +198,7 @@ fn parse_bundle(val: &str) -> Result<PVal, String> {
         let (n, v) = part.rsplit_once([':', '=']).ok_or(format!("expected signal:value in `{part}`"))?;
         let n = n.trim();
         let sig = t
-            .lookup(n)
+            .lookup_display(n)
             .or_else(|| t.resolve_ident(n))
             .unwrap_or_else(|| t.intern(ticky_factorio::SignalKind::Item, n));
         vals.push((sig, v.trim().parse::<i32>().map_err(|e| format!("bad value in `{part}`: {e}"))?));
@@ -207,9 +211,10 @@ fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, PVal)>, 
     let mut out = Vec::new();
     for s in sets {
         let (name, rest) = s.split_once('=').ok_or(format!("expected name=value, got `{s}`"))?;
+        // `@tick` at the end (a bundle's signals may have `@quality` too).
         let (val, tick) = match rest.rsplit_once('@') {
-            Some((v, t)) => (v, t.parse::<u64>().map_err(|e| format!("bad tick in `{s}`: {e}"))?),
-            None => (rest, 0),
+            Some((v, t)) if t.bytes().all(|c| c.is_ascii_digit()) => (v, t.parse::<u64>().map_err(|e| format!("bad tick in `{s}`: {e}"))?),
+            _ => (rest, 0),
         };
         let int = |val: &str| -> Result<i32, String> {
             match val {
@@ -241,7 +246,7 @@ fn canonical(v: &PVal) -> String {
         PVal::Int(k) => k.to_string(),
         PVal::Bun(b) => {
             let t = SignalTable::base();
-            let mut parts: Vec<(&str, i32)> = b.iter().map(|(s, v)| (t.name(*s), *v)).collect();
+            let mut parts: Vec<(String, i32)> = b.iter().map(|(s, v)| (t.display(*s), *v)).collect();
             parts.sort();
             let parts: Vec<String> = parts.iter().map(|(n, v)| format!("{n}={v}")).collect();
             format!("{{{}}}", parts.join(","))
@@ -283,7 +288,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
     let t = SignalTable::base();
     let sig = |s| {
         let info = t.info(s);
-        format!("{{type={}, name={}}}", lua_str(info.kind.as_str()), lua_str(&info.name))
+        format!("{{type={}, name={}, quality={}}}", lua_str(info.kind.as_str()), lua_str(&info.name), lua_str(QUALITIES[info.quality as usize]))
     };
     let mut ports = Vec::new();
     for (i, p) in c.program.ports.iter().enumerate() {
@@ -305,7 +310,8 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
                     .iter()
                     .map(|(s, k)| {
                         let info = t.info(*s);
-                        format!("{{type={}, name={}, value={k}}}", lua_str(info.kind.as_str()), lua_str(&info.name))
+                        let q = lua_str(QUALITIES[info.quality as usize]);
+                        format!("{{type={}, name={}, quality={q}, value={k}}}", lua_str(info.kind.as_str()), lua_str(&info.name))
                     })
                     .collect();
                 format!("{{t={tk}, port={}, values={{{}}}}}", pi + 1, vals.join(", "))
@@ -322,7 +328,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false }
+    Placement { no_poles: false, outputs: Side::East, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false }
 }
 
 fn main() -> ExitCode {
@@ -396,7 +402,11 @@ fn main() -> ExitCode {
             let job = std::env::temp_dir().join("ticky-job.lua");
             std::fs::write(&job, job_lua(&c, &sets, ticks)).unwrap();
             let script = harness_dir().join("run.sh");
-            let status = std::process::Command::new(&script).arg(&job).status();
+            let mut cmd = std::process::Command::new(&script);
+            if c.quality {
+                cmd.env("TICKY_QUALITY", "1");
+            }
+            let status = cmd.arg(&job).status();
             if !matches!(status, Ok(s) if s.success()) {
                 eprintln!("error: harness failed ({})", script.display());
                 return Err(ExitCode::FAILURE);

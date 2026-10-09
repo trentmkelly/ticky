@@ -2,9 +2,11 @@
 
 > A Python-like language that compiles to Factorio 2.0 combinator blueprints.
 
-- **Status:** Levels 0–3 implemented (Level 3: the bundle core, §4.3.5), plus the first
-  optimisation passes (see NOTES.md); later levels are design
-- **Target:** Factorio 2.0 base game (Space Age optional, never required)
+- **Status:** Levels 0–4 implemented (Level 3: the bundle core, §4.3.5; Level 4: signal
+  arrays, §4.4), plus the first optimisation passes (see NOTES.md); later levels are design
+- **Target:** Factorio 2.0. By default the compiler wires its internals with *quality*
+  variants of signals (uncommon to legendary), which needs the Quality mod (part of Space
+  Age); `--no-quality` builds for the base game alone, with normal signals inside.
 - **Compiler:** Rust, single binary `ticky`
 - **File extension:** `.ticky`
 - **Name:** Ticky (decided 2026-10-08)
@@ -26,7 +28,14 @@ signals of every `each` operand's networks, so a signal missing on one colour is
 there; outputting `each` copies or sets each passing signal, a single output sums over them
 (constant 1 → a count). `everything`-output copies all signals of the chosen networks. The
 selector combinator's `select` mode outputs the largest/smallest signal, `count` the number of
-signals.
+signals; with an index `k` it outputs the signal ranked `k` (nothing past the end); it reads the
+sum of both wires.
+
+**Quality (verified, Quality mod):** each quality of a signal is a separate signal everywhere:
+`each`, `everything`, selectors, specific signals in conditions and outputs, constant
+combinators. In blueprints a signal ID gets `"quality": "uncommon"` etc. So the compiler's
+internal pool is the 358 base signals × 4 qualities = 1432 signals, and every normal-quality
+signal is left to the program (ports, bundles).
 
 ---
 
@@ -287,13 +296,29 @@ n  = len(xs)           # compile-time constant 16
 program halts and lights its error lamp (§13). Negative *runtime* indices are out of range;
 Python's wrap-around applies to constant indices only.
 
-**Implemented so far (level 2): register arrays only.** Every element is its own variable
-(`xs[3]` in messages). Constant indexes are free. A runtime index reads through a select
-(one comparison and one gate per element, 2 ticks) and writes through one conditional load per
-element. Also implemented: list literals, `[x] * n`, `+` (concatenation), `len`, `sum`, `min`,
-`max`, `any`, `all`, `x in xs`, `for x in xs`, and comprehensions over constant ranges or arrays
-(filters must be constant). Arrays are limited to 256 elements. `sorted`, `zip`, `enumerate`,
-`index` and the signal/RAM representations below come later.
+**Implemented (levels 2 and 4).** An array indexed only by constants is a *register array*:
+every element is its own variable (`xs[3]` in messages), constant indexes are free, up to 256
+elements. An array indexed at runtime anywhere (or longer than 256) is a *signal array*: a
+bundle with element `k` on the `k`-th signal of the internal pool, split into banks of one pool
+each (1431 elements with quality signals, 357 without), up to 4096 elements. The compiler finds
+which arrays need it by expanding until the choice settles; arrays copied into a register array
+are read out element by element. On signal arrays (verified in-game, harness probe `L*`):
+- `xs[i]` (runtime): `I = i + 1` onto a private wire carrying the position table `T[k] = k+1`,
+  then one decider `each(green) == I(green)` copying the array (red) onto one signal: 2 ticks,
+  3 entities, any length. Constant indexes read one signal (1 combinator).
+- `xs[i] = v`: a one-hot decider (positions red, index green) marks slot `i`; a decider keeps
+  every other element; `onehot * v` writes the new one: 3 ticks. `xs[i] += d` needs no read
+  (the array copied plus `onehot * d`).
+- `[f(x) for x in xs]` (no filter, `f` without `//`, `%`, `**` or calls): one bundle
+  comprehension per bank, plus `f(0)` on the slots holding 0 (zeros aren't on the wire).
+- `sum` (total), `any`/`all` (signal counts), `min`/`max` (selector, corrected for zeros),
+  `x in xs`, `xs.index(x)` (first matching position by selector), `xs.as_bundle()`.
+- `sorted(xs)`, `sorted(xs, reverse=True)` (any array up to one bank): N selectors (rank `k`)
+  on the keys `2x + 1` (never 0, so zeros sort too), each followed by `each >> 1 → T[k]`:
+  2N + 1 combinators, 3 ticks. Values must be within ±2^30.
+- Constant tables indexed at runtime (`[3, 1, 4, 1, 5][i]`) are one constant combinator and
+  one read. Other unnamed arrays indexed at runtime still use a select.
+Not yet: `zip`, `enumerate`, slices.
 
 **Representation.** The compiler picks one per array:
 - **Register array.** Every index is a compile-time constant, so each element is ordinary state.
@@ -648,6 +673,8 @@ Each item is deliberate, and the compiler gives a specific error or warning wher
 | `/` gives a float | Compile error | No floats |
 | `IndexError` | Read 0 / drop write; `--checks` halts | No exceptions |
 | Lists grow | Fixed size | Hardware is fixed |
+| Negative runtime indexes count from the end | Out of range (read 0, write dropped); constant negative indexes count from the end | One table lookup |
+| `sorted` of any ints | Values within ±2^30 | Sort keys `2x + 1` must not wrap |
 | Lists are shared references (`ys = xs` aliases) | Arrays are values: assignment and argument passing copy | Each array is its own set of registers |
 | `list * 2` repeats | Same, but only with constants (`[0] * 16`); arrays have no element-wise operators, so use comprehensions | Avoids ambiguity with bundles |
 | Dicts | Only `Bundle`, signal → int | Wire semantics |
@@ -995,7 +1022,7 @@ source ─parse→ AST ─sema→ typed AST ─lower→ CFG IR ─sched→ FSM +
    small runtime indexes), comprehensions, compile-time execution of setup code.
 4. ✅ **Level 3:** `Bundle`: element-wise operations, comprehensions, reductions, selector
    combinator queries (§4.3.5; `argmax`/`nth` move to level 6).
-5. **Level 4:** signal arrays and banked RAM, runtime indexing, `sorted`.
+5. ✅ **Level 4:** signal arrays and banked RAM, runtime indexing, `sorted` (§4.4).
 6. **Level 5:** `process` concurrency, single-writer rule, `--checks`.
 7. **Level 6:** bundle iteration, runtime `Signal` values.
 8. **Optimisation passes:** ✅ decider fusion, guarded loads, loop rotation, one-tick

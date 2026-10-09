@@ -26,7 +26,7 @@ fn examples_compile_and_pass() {
         });
         assert!(c.cg.netlist.validate(true).is_empty());
         // The placement options give valid layouts too.
-        let other = Options { poles: false, outputs_west: true, ..opts() };
+        let other = Options { poles: false, outputs_west: true, quality: false, ..opts() };
         let c2 = compile(&src, &other).unwrap_or_else(|d| panic!("{name} (no poles, west outputs): {}", d[0].message));
         assert!(c2.cg.netlist.validate(false).is_empty());
         assert_eq!(c2.layout.poles, 0);

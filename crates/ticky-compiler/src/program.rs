@@ -298,7 +298,8 @@ fn is_bundle_expr(e: &Expr, bundles: &HashSet<String>) -> bool {
     match &e.kind {
         ExprKind::Dict(_) | ExprKind::DictComp { .. } => true,
         ExprKind::Name(n) => bundles.contains(n),
-        ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n) if n == "Bundle" || n == "#bset"),
+        ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n)
+            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx")),
         ExprKind::Binary(_, a, b) => is_bundle_expr(a, bundles) || is_bundle_expr(b, bundles),
         ExprKind::Unary(_, a) => is_bundle_expr(a, bundles),
         ExprKind::IfExp { then, orelse, .. } => is_bundle_expr(then, bundles) || is_bundle_expr(orelse, bundles),

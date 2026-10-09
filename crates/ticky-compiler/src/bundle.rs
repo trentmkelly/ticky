@@ -163,6 +163,9 @@ pub fn binop(g: &mut Graph, op: BinOp, a: V, b: V, span: Span) -> Result<V, Diag
     }
     let o = arop(op);
     Ok(match (ka, kb) {
+        // Sums of small computed bundles share one wire: no extra combinator or tick (the
+        // terms are duplicated if a part is also used elsewhere, so only small ones).
+        (Kind::Bundle, Kind::Bundle) if o == ArOp::Add && terms_len(g, a) + terms_len(g, b) <= 4 => merge(g, a, b),
         (Kind::Bundle, Kind::Bundle) => g.bun(vec![BTerm::Zip(o, a, b)]),
         (Kind::Bundle, _) => {
             each_scalar_warning(g, o, b, span);
@@ -551,12 +554,24 @@ impl Conv {
     }
 }
 
+fn terms_len(g: &Graph, v: V) -> usize {
+    match g.op(v) {
+        Op::Bun(t) => t.len(),
+        Op::BConst(_) => 1,
+        _ => 99,
+    }
+}
+
 /// The sum of two bundles; two single-wire results share one wire without an extra tick.
 fn merge(g: &mut Graph, a: V, b: V) -> V {
-    if let (Op::Bun(x), Op::Bun(y)) = (g.op(a).clone(), g.op(b).clone()) {
-        let mut terms = x;
-        terms.extend(y);
-        return g.bun(terms);
+    let terms = |g: &Graph, v: V| match g.op(v) {
+        Op::Bun(t) => Some(t.clone()),
+        Op::BConst(k) => Some(vec![BTerm::K(k.clone())]),
+        _ => None,
+    };
+    if let (Some(mut x), Some(y)) = (terms(g, a), terms(g, b)) {
+        x.extend(y);
+        return g.bun(x);
     }
     if g.as_bconst(a).is_some_and(|x| x.is_empty()) {
         return b;

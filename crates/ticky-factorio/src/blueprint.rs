@@ -13,11 +13,15 @@ pub const VERSION: u64 = 562949958467584;
 
 fn signal_json(t: &SignalTable, s: Sig) -> Value {
     let info = t.info(s);
-    match info.kind {
+    let mut v = match info.kind {
         // The game omits the type for items.
         SignalKind::Item => json!({ "name": info.name }),
         k => json!({ "type": k.as_str(), "name": info.name }),
+    };
+    if info.quality > 0 {
+        v["quality"] = json!(crate::signals::QUALITIES[info.quality as usize]);
     }
+    v
 }
 
 fn nets_json(n: Nets) -> Option<Value> {
@@ -118,7 +122,7 @@ fn constant_json(t: &SignalTable, c: &ConstComb) -> Value {
                 _ => unreachable!(),
             };
             f.insert("index".into(), json!(i + 1));
-            f.insert("quality".into(), json!("normal"));
+            f.insert("quality".into(), json!(crate::signals::QUALITIES[t.info(*s).quality as usize]));
             f.insert("comparator".into(), json!("="));
             f.insert("count".into(), json!(v));
             Value::Object(f)

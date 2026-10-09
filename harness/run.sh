@@ -13,18 +13,15 @@ write-data=/tmp/ticky-harness
 INI
 [ -n "${TICKY_SCREENSHOT:-}" ] && printf '[graphics]\nfull-screen=false\n' >> "$T/config/config.ini"
 # TICKY_SPACE_AGE=1 also loads the Space Age expansion (used to dump its signals).
+# TICKY_QUALITY=1 loads just the Quality mod (blueprints whose internal signals use quality).
 SA=$([ -n "${TICKY_SPACE_AGE:-}" ] && echo true || echo false)
+Q=$([ -n "${TICKY_SPACE_AGE:-}${TICKY_QUALITY:-}" ] && echo true || echo false)
 echo '{"mods": [{"name": "base", "enabled": true}, {"name": "space-age", "enabled": '$SA'},
- {"name": "quality", "enabled": '$SA'}, {"name": "elevated-rails", "enabled": '$SA'},
+ {"name": "quality", "enabled": '$Q'}, {"name": "elevated-rails", "enabled": '$SA'},
  {"name": "ticky-harness", "enabled": true}]}' > "$T/mods/mod-list.json"
 # Only the harness (and TICKY_EXTRA_MODS) are loaded: mod folders left from earlier runs go.
 find "$T/mods" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
 cp -r "$H/ticky-harness" "$T/mods/ticky-harness"
-# TICKY_EXTRA_MODS="name=path ...": extra mod folders to load (copied in under their names).
-for m in ${TICKY_EXTRA_MODS:-}; do
-  rm -rf "$T/mods/${m%%=*}"; cp -r "${m#*=}" "$T/mods/${m%%=*}"
-  python3 -c "import json,sys; f='$T/mods/mod-list.json'; d=json.load(open(f)); d['mods'].append({'name': sys.argv[1], 'enabled': True}); json.dump(d, open(f,'w'))" "${m%%=*}"
-done
 # TICKY_EXTRA_MODS="name=path ...": extra mod folders to load (copied in under their names).
 for m in ${TICKY_EXTRA_MODS:-}; do
   rm -rf "$T/mods/${m%%=*}"; cp -r "${m#*=}" "$T/mods/${m%%=*}"

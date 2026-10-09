@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Shrinks a failing tools/fuzz_level2.py program: removes statements and replaces
+expressions with a child or 0/1 while Ticky still disagrees with Python.
+
+usage: tools/reduce_level2.py PROGRAM.ticky X Y      (TICKY=./target/debug/ticky)
+Prints the reduced program; the last candidate is left in /tmp/reduce-cur.ticky.
+"""
+import ast
+import copy
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fuzz_level2 import run_python  # pylint: disable=wrong-import-position
+
+T = os.environ.get("TICKY", "./target/debug/ticky")
+path, x, y = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+lines = open(path).read().splitlines()
+head = [l for l in lines if l.startswith(('input', 'output'))]
+tail = [l for l in lines if re.match(r'^(o\d = |done = )', l)]
+body = "\n".join(l for l in lines if l not in head and l not in tail)
+
+def legal(src):
+    try:
+        ast.parse(src)
+    except SyntaxError:
+        return False
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, ast.Subscript):
+            sl = n.slice
+            if isinstance(sl, ast.Constant) or (isinstance(sl, ast.UnaryOp) and isinstance(sl.operand, ast.Constant)):
+                continue
+            if not (isinstance(sl, ast.BinOp) and isinstance(sl.op, ast.Mod) and isinstance(sl.right, ast.Constant) and sl.right.value == 4):
+                return False
+    return True
+
+def bad(src):
+    if not legal(src):
+        return False
+    b = src.splitlines()
+    try:
+        want = run_python([f"x = {x}", f"y = {y}"] + b)
+    except Exception:
+        return False
+    if want is None:
+        return False
+    open('/tmp/reduce-cur.ticky', 'w').write("\n".join(head + b + tail) + "\n")
+    out = subprocess.run([T, 'sim', '/tmp/reduce-cur.ticky', '--ticks', '30000', f'--set=x={x}', f'--set=y={y}'], capture_output=True, text=True)
+    if out.returncode != 0:
+        return False
+    last = [int(v) for v in out.stdout.strip().splitlines()[-1].split()[1:]]
+    return tuple(last[:7]) != want
+
+def variants(tree):
+    """Yield modified copies: each expression node replaced by a child or 0/1; statements removed."""
+    nodes = [n for n in ast.walk(tree)]
+    for i, n in enumerate(nodes):
+        if isinstance(n, ast.expr) and not isinstance(n, (ast.Name, ast.Constant)):
+            subs = [c for c in ast.iter_child_nodes(n) if isinstance(c, ast.expr)] + [ast.Constant(0), ast.Constant(1)]
+            for s in subs:
+                t2 = copy.deepcopy(tree)
+                target = [m for m in ast.walk(t2)][i]
+                for parent in ast.walk(t2):
+                    for field, val in ast.iter_fields(parent):
+                        if val is target:
+                            setattr(parent, field, copy.deepcopy(s) if not isinstance(s, ast.Constant) else ast.Constant(s.value))
+                            yield t2
+                        elif isinstance(val, list) and any(v is target for v in val):
+                            setattr(parent, field, [copy.deepcopy(s) if v is target else v for v in val])
+                            yield t2
+
+src = ast.unparse(ast.parse(body))
+assert bad(src), "not reproducible after unparse"
+changed = True
+while changed:
+    changed = False
+    # statements
+    ls = src.splitlines()
+    for i in range(len(ls)):
+        if i < len(ls):
+            cand = "\n".join(ls[:i] + ls[i+1:])
+            if bad(cand):
+                ls = cand.splitlines(); src = cand; changed = True
+    for v in variants(ast.parse(src)):
+        cand = ast.unparse(v)
+        if len(cand) < len(src) and bad(cand):
+            src = cand; changed = True
+            break
+print(src)
+bad(src)
+print("python:", run_python([f"x = {x}", f"y = {y}"] + src.splitlines()))

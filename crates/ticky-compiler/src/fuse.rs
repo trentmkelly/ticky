@@ -247,9 +247,13 @@ impl<'g> Fuser<'g> {
                 let (a, b) = (self.rebuild(a), self.rebuild(b));
                 self.g.bmux_tf(t, f, a, b)
             }
-            Op::BSelect(b, max) => {
+            Op::BSelect(b, max, index) => {
                 let b = self.rebuild(b);
-                self.g.bselect(b, max)
+                self.g.brank(b, max, index)
+            }
+            Op::AGet(b, ix) => {
+                let (b, ix) = (self.rebuild(b), self.rebuild(ix));
+                self.g.aget_ix(b, ix)
             }
             Op::BGet(b, sig) => {
                 let b = self.rebuild(b);
@@ -325,6 +329,9 @@ impl<'g> Fuser<'g> {
             }
             BTerm::DFilter(d, b, conds, out) => BTerm::DFilter(self.rebuild(d), self.rebuild(b), conds, out),
             BTerm::K(vals) => BTerm::K(vals),
+            BTerm::Shift(s, x, c) => BTerm::Shift(s, self.rebuild(x), c),
+            BTerm::Hot(t, ix, c) => BTerm::Hot(self.rebuild(t), self.rebuild(ix), c),
+            BTerm::Fold(b, op, c, s) => BTerm::Fold(self.rebuild(b), op, c, s),
         }
     }
 

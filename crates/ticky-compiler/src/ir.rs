@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ticky_factorio::{ArOp, CmpOp, Sig};
+use ticky_factorio::{ArOp, CmpOp, Sig, SignalTable};
 
 pub type V = u32;
 
@@ -88,6 +88,13 @@ pub enum BTerm {
     DFilter(V, V, BDnf, FOut),
     /// Constant signals (a constant combinator on the bundle's wire).
     K(BVals),
+    /// A scalar plus a constant, on one signal (`x + k → s`): index wires.
+    Shift(Sig, V, i32),
+    /// One-hot: the signals of the constant bundle `table` (red) whose value equals the index
+    /// signal on bundle `ix` (green), each set to the constant.
+    Hot(V, V, i32),
+    /// `each(b) op k`, summed onto one signal.
+    Fold(V, ArOp, i32, Sig),
 }
 
 /// Index of a block-level source (own state register or sampled input).
@@ -124,14 +131,18 @@ pub enum Op {
     Bun(Vec<BTerm>),
     /// Bundle select: `t ? a : b` with complementary boolean conditions.
     BMux { t: V, f: V, a: V, b: V },
-    /// The single signal of a bundle with the largest (`true`) or smallest value.
-    BSelect(V, bool),
+    /// The single signal of a bundle ranked `index` (0-based) from the largest (`true`) or
+    /// the smallest value.
+    BSelect(V, bool, u32),
     /// Scalar: one signal of a bundle.
     BGet(V, Sig),
     /// Scalar: the sum of a bundle's values.
     BTotal(V),
     /// Scalar: how many signals a bundle has.
     BCount(V),
+    /// Scalar: the value in bundle `b` (first) of the signal whose value in `ix` equals the
+    /// index signal's (array reads: `ix` is a position table plus the index).
+    AGet(V, V),
     /// Placeholder for the value variable while lowering a bundle comprehension.
     Each,
     /// A signal constant (`S("iron-plate")`): used as a bundle key, never computed.
@@ -169,6 +180,9 @@ impl BTerm {
                 v
             }
             BTerm::K(_) => vec![],
+            BTerm::Shift(_, x, _) => vec![*x],
+            BTerm::Hot(t, ix, _) => vec![*t, *ix],
+            BTerm::Fold(b, ..) => vec![*b],
         }
     }
 }
@@ -239,7 +253,7 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
         Op::Src(s) => src_iv[s as usize],
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
-        Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::Each | Op::SigK(_) => Iv::FULL,
+        Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::AGet(..) | Op::Each | Op::SigK(_) => Iv::FULL,
         Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
@@ -706,6 +720,16 @@ impl Graph {
                 normalize(res)
             }
             BTerm::K(vals) => vals.clone(),
+            BTerm::Shift(s, x, c) => normalize([(*s, k(*x)?.wrapping_add(*c))]),
+            BTerm::Hot(t, ix, c) => {
+                let (t, ix) = (b(*t)?, b(*ix)?);
+                let i = bval(ix, SignalTable::base().index_signal());
+                normalize(t.iter().filter(|(_, v)| *v == i).map(|(s, _)| (*s, *c)))
+            }
+            BTerm::Fold(x, op, c, s) => {
+                let x = b(*x)?;
+                normalize([(*s, x.iter().fold(0i32, |acc, (_, v)| acc.wrapping_add(op.apply(*v, *c))))])
+            }
         })
     }
 
@@ -722,6 +746,7 @@ impl Graph {
         let konst = normalize(konst);
         // A filter that never passes contributes nothing.
         rest.retain(|t| !matches!(t, BTerm::Filter(_, d, _) | BTerm::DFilter(_, _, d, _) if d.is_empty()));
+        rest.retain(|t| !matches!(t, BTerm::Hot(_, _, 0) | BTerm::DFilter(_, _, _, FOut::Const(0)) | BTerm::Filter(_, _, FOut::Const(0))));
         if rest.is_empty() {
             return self.bconst(konst);
         }
@@ -846,16 +871,173 @@ impl Graph {
     }
 
     pub fn bselect(&mut self, b: V, max: bool) -> V {
+        self.brank(b, max, 0)
+    }
+
+    /// The signal ranked `index` by value (from the largest if `max`); nothing if there are
+    /// fewer signals.
+    pub fn brank(&mut self, b: V, max: bool, index: u32) -> V {
         if let Some(vals) = self.as_bconst(b) {
-            let best = if max {
-                vals.iter().max_by_key(|(s, v)| (*v, std::cmp::Reverse(*s)))
+            let mut v = vals.clone();
+            if max {
+                v.sort_by_key(|(s, x)| (std::cmp::Reverse(*x), *s));
             } else {
-                vals.iter().min_by_key(|(s, v)| (*v, *s))
-            };
-            let one: BVals = best.into_iter().copied().collect();
+                v.sort_by_key(|(s, x)| (*x, *s));
+            }
+            let one: BVals = v.get(index as usize).into_iter().copied().collect();
             return self.bconst(one);
         }
-        self.intern(Op::BSelect(b, max))
+        self.intern(Op::BSelect(b, max, index))
+    }
+
+    // ------------------------------------------------------------------ signal arrays
+
+    /// Element `k` of a signal array is on this signal.
+    pub fn slot(k: usize) -> Sig {
+        SignalTable::base().array_signals()[k]
+    }
+
+    /// `T[k] = k + 1` for the first `n` slots: positions, never 0.
+    pub fn positions(&mut self, n: usize) -> V {
+        self.bconst((0..n).map(|k| (Graph::slot(k), k as i32 + 1)))
+    }
+
+    /// `i + c` as `(x, c')` with constant offsets folded in.
+    fn offset(&self, i: V, c: i32) -> (V, i32) {
+        if let Op::Ar(op @ (ArOp::Add | ArOp::Sub), x, k) = *self.op(i) {
+            if let Some(k) = self.as_const(k) {
+                let k = if op == ArOp::Add { k } else { k.wrapping_neg() };
+                return (x, c.wrapping_add(k));
+            }
+        }
+        (i, c)
+    }
+
+    /// Element `i` of an `n`-element array bundle; 0 when `i` is out of range.
+    pub fn aget(&mut self, b: V, i: V, n: usize) -> V {
+        if let Some(k) = self.as_const(i) {
+            return if (0..n as i64).contains(&(k as i64)) { self.bget(b, Graph::slot(k as usize)) } else { self.konst(0) };
+        }
+        let (x, c) = self.offset(i, 1);
+        let r = SignalTable::base().index_signal();
+        let pos = (0..n).map(|k| (Graph::slot(k), k as i32 + 1)).collect();
+        let ix = self.bun(vec![BTerm::K(pos), BTerm::Shift(r, x, c)]);
+        self.aget_ix(b, ix)
+    }
+
+    /// [`Op::AGet`] from its index bundle.
+    pub fn aget_ix(&mut self, b: V, ix: V) -> V {
+        if let (Some(bv), Some(iv)) = (self.as_bconst(b), self.as_bconst(ix)) {
+            let r = SignalTable::base().index_signal();
+            let i = bval(iv, r);
+            let k = iv.iter().filter(|(s, v)| *s != r && *v == i).fold(0i32, |acc, (s, _)| acc.wrapping_add(bval(bv, *s)));
+            return self.konst(k);
+        }
+        self.intern(Op::AGet(b, ix))
+    }
+
+    /// The one-hot bundle of index `i`: slot `i` set to `val`, or nothing out of range.
+    pub fn ahot(&mut self, i: V, n: usize, val: i32) -> V {
+        if let Some(k) = self.as_const(i) {
+            let one = (0..n as i64).contains(&(k as i64)).then(|| (Graph::slot(k as usize), val));
+            return self.bconst(one);
+        }
+        let (x, c) = self.offset(i, 1);
+        let r = SignalTable::base().index_signal();
+        let t = self.positions(n);
+        let ix = self.bun(vec![BTerm::Shift(r, x, c)]);
+        self.bun(vec![BTerm::Hot(t, ix, val)])
+    }
+
+    /// The terms of a bundle, to sum it with others on one wire.
+    fn terms_of(&self, b: V) -> Vec<BTerm> {
+        match self.op(b) {
+            Op::Bun(t) => t.clone(),
+            Op::BConst(vals) => vec![BTerm::K(vals.clone())],
+            _ => unreachable!("a one-hot bundle is a constant or a bundle of terms"),
+        }
+    }
+
+    /// `ahot(i) * x`.
+    fn ahot_times(&mut self, i: V, n: usize, x: V) -> Vec<BTerm> {
+        match self.as_const(x) {
+            Some(k) => {
+                let h = self.ahot(i, n, k);
+                self.terms_of(h)
+            }
+            None => {
+                let h = self.ahot(i, n, 1);
+                vec![BTerm::Map(ArOp::Mul, h, x)]
+            }
+        }
+    }
+
+    /// Array bundle `b` with element `i` set to `x` (unchanged when `i` is out of range).
+    pub fn aset(&mut self, b: V, i: V, x: V, n: usize) -> V {
+        if let Some(k) = self.as_const(i) {
+            if !(0..n as i64).contains(&(k as i64)) {
+                return b;
+            }
+            return self.bset(b, Graph::slot(k as usize), x);
+        }
+        let h = self.ahot(i, n, 1);
+        let z = self.konst(0);
+        let keep = BTerm::DFilter(b, h, vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]], FOut::Copy);
+        let mut terms = vec![keep];
+        terms.extend(self.ahot_times(i, n, x));
+        self.bun(terms)
+    }
+
+    /// Array bundle `b` with `d` added to element `i`.
+    pub fn aadd(&mut self, b: V, i: V, d: V, n: usize) -> V {
+        let z = self.konst(0);
+        let mut terms = vec![BTerm::Map(ArOp::Add, b, z)];
+        terms.extend(self.ahot_times(i, n, d));
+        if terms.len() == 1 {
+            return b;
+        }
+        self.bun(terms)
+    }
+
+    /// `x` on every slot of an `n`-element array bundle that holds 0.
+    pub fn azeros(&mut self, b: V, x: V, n: usize) -> V {
+        let ones = self.bconst((0..n).map(|k| (Graph::slot(k), 1)));
+        let z = self.konst(0);
+        let zero = vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]];
+        match self.as_const(x) {
+            Some(c) => self.bun(vec![BTerm::DFilter(ones, b, zero, FOut::Const(c))]),
+            None => {
+                let at = self.bun(vec![BTerm::DFilter(ones, b, zero, FOut::Copy)]);
+                self.bun(vec![BTerm::Map(ArOp::Mul, at, x)])
+            }
+        }
+    }
+
+    /// The largest (or smallest) element of an `n`-element array bundle, zeros included.
+    pub fn amax(&mut self, b: V, n: usize, max: bool) -> V {
+        let best = self.bselect(b, max);
+        let best = self.btotal(best);
+        let count = self.bcount(b);
+        let nk = self.konst(n as i32);
+        let z = self.konst(0);
+        let has_zero = self.cmp(CmpOp::Lt, count, nk);
+        let beats = self.cmp(if max { CmpOp::Lt } else { CmpOp::Gt }, best, z);
+        let zero = self.ar(ArOp::And, has_zero, beats);
+        self.mux(zero, z, best)
+    }
+
+    /// An `n`-element array bundle sorted ascending (descending if `rev`). Sorts the keys
+    /// `2x + 1`, which are never 0, so zeros take part; values must be within ±2^30.
+    pub fn asorted(&mut self, b: V, n: usize, rev: bool) -> V {
+        let two = self.konst(2);
+        let ones = (0..n).map(|k| (Graph::slot(k), 1)).collect();
+        let keys = self.bun(vec![BTerm::Map(ArOp::Mul, b, two), BTerm::K(ones)]);
+        let mut terms = Vec::new();
+        for k in 0..n {
+            let r = self.brank(keys, rev, k as u32);
+            terms.push(BTerm::Fold(r, ArOp::Shr, 1, Graph::slot(k)));
+        }
+        self.bun(terms)
     }
 
     /// Bundle select from complementary conditions.
@@ -926,7 +1108,8 @@ impl Graph {
             Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],
-            Op::BSelect(b, _) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) => vec![b],
+            Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) => vec![b],
+            Op::AGet(b, ix) => vec![b, ix],
         }
     }
 

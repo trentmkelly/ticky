@@ -48,11 +48,14 @@ pub struct Options {
     pub anneal: Option<place::AnnealOpts>,
     /// Don't warn about signal names the compiler doesn't know (e.g. from mods).
     pub allow_unknown_signals: bool,
+    /// Internal wiring uses the quality variants (uncommon to legendary) of signals, leaving
+    /// every normal signal to the program. Needs the Quality mod (Space Age) in the game.
+    pub quality: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, anneal: None, allow_unknown_signals: false, quality: true }
     }
 }
 
@@ -61,9 +64,12 @@ pub struct Compiled {
     pub cg: Codegen,
     pub layout: LayoutInfo,
     pub warnings: Vec<Diag>,
+    /// Built with quality signals inside (the game needs the Quality mod).
+    pub quality: bool,
 }
 
 pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
+    ticky_factorio::set_quality_pool(opts.quality);
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
     let fast = compile_module(&module, opts, true)?;
     if opts.opt == Opt::Speed {
@@ -104,7 +110,7 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     if opts.allow_unknown_signals {
         warnings.retain(|w| !w.message.starts_with("unknown signal"));
     }
-    Ok(Compiled { program, cg, layout, warnings })
+    Ok(Compiled { program, cg, layout, warnings, quality: opts.quality })
 }
 
 impl Compiled {
