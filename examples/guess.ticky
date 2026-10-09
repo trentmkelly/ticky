@@ -1,0 +1,17 @@
+# Higher / lower guessing game (SPEC §15.11). Set G on a constant combinator, pulse S.
+input  guess:  int @ G
+input  submit: bool @ S
+output higher: bool @ H
+output lower:  bool @ L
+output win:    bool @ W
+output tries:  int @ T
+
+secret = ticks() * 7919 % 100 + 1
+tries = 0
+while not win:
+    wait until submit
+    tries += 1
+    higher = guess < secret
+    lower = guess > secret
+    win = guess == secret
+    wait until not submit

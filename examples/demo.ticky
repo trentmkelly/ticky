@@ -1,0 +1,42 @@
+# Ticky level-0 demo. Hook-up instructions are in README.md.
+input  a: int @ A = port("A number to play with")
+
+output blink:   bool @ L    # flips every half second
+output seconds: int  @ T    # seconds since RUN was switched on
+output square:  int  @ Q    # a ** 2
+output half:    int  @ H    # a // 2, Python-style: -7 // 2 == -4
+output big:     bool @ B    # on once a >= 100, off again only when a < 50
+
+every 30 ticks:
+    blink = not blink
+
+every 60 ticks:
+    seconds += 1
+
+every tick:
+    square = a ** 2
+    half = a // 2
+    if a >= 100:
+        big = True
+    elif a < 50:
+        big = False
+
+test "counts seconds and blinks":
+    run 125 ticks
+    assert seconds == 2
+    run until blink, max 31 ticks
+    run until not blink, max 31 ticks
+
+test "arithmetic and hysteresis":
+    set a = -7
+    run 20 ticks
+    assert square == 49 and half == -4 and not big
+    set a = 150
+    run 20 ticks
+    assert big and half == 75
+    set a = 70
+    run 20 ticks
+    assert big
+    set a = 10
+    run 20 ticks
+    assert not big and square == 100

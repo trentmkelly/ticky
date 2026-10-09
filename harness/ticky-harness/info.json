@@ -1,0 +1,2 @@
+{"name": "ticky-harness", "version": "0.1.0", "title": "Ticky in-game harness", "author": "ticky",
+ "factorio_version": "2.0", "dependencies": ["base"]}

@@ -1,0 +1,33 @@
+# Fibonacci on demand (SPEC §15.5): set n, pulse start, read the result.
+input  start: bool @ S
+input  n: int @ N
+output result: int @ R
+output busy: bool @ B
+
+while True:
+    wait until start
+    busy = True
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    result = a
+    busy = False
+    wait until not start
+
+test "fib(20) in under a second":
+    set n = 20
+    set start = True
+    run 5 ticks
+    set start = False
+    run until result != 0, max 100 ticks
+    assert result == 6765 and not busy
+
+test "runs again with a new n":
+    set n = 10
+    set start = True
+    run until result == 55, max 60 ticks
+    set start = False
+    run 10 ticks
+    set n = 30
+    set start = True
+    run until result == 832040, max 100 ticks

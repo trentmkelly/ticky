@@ -1,0 +1,10 @@
+[package]
+name = "ticky-compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ticky-syntax.workspace = true
+ticky-factorio.workspace = true
+ticky-sim.workspace = true
+serde_json.workspace = true

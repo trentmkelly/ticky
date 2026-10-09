@@ -1,0 +1,30 @@
+# Python integer semantics on live inputs, including negative numbers.
+input  x: int @ X
+input  y: int @ Y
+output quot: int @ Q        # x // y   (floors, like Python)
+output rem:  int @ R        # x % y    (sign of y, like Python)
+output tq:   int @ T        # tdiv(x, y), Factorio's truncating division
+output mix:  int @ M
+output flags: int @ F
+
+every tick:
+    quot = x // y
+    rem = x % y
+    tq = tdiv(x, y)
+    mix = abs(x - y) * 3 + (x ** 2 if x < 10 else -x) - min(x, y, 7) + clamp(y, -5, 5)
+    flags = (1 if 0 <= x < 100 else 0) | ((x > y) << 1) | ((not x) << 2) | ((x and y) & 0x70) | (~y & 8)
+
+test "floor division and modulo follow Python":
+    set x = -7
+    set y = 2
+    run 30 ticks
+    assert quot == -4 and rem == 1 and tq == -3
+    set y = -2
+    run 30 ticks
+    assert quot == 3 and rem == -1
+    set x = 7
+    run 30 ticks
+    assert quot == -4 and rem == -1 and tq == -3
+    set y = 0
+    run 30 ticks
+    assert quot == 0 and rem == 0

@@ -1,0 +1,12 @@
+# Blink a lamp: wire signal-L from the output port to a lamp set to "L > 0".
+output lamp: bool @ L
+
+every 30 ticks:
+    lamp = not lamp
+
+test "toggles every 30 ticks":
+    run until lamp, max 40 ticks
+    run 15 ticks
+    assert lamp
+    run 30 ticks
+    assert not lamp

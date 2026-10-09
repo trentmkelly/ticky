@@ -1,0 +1,35 @@
+# Accumulators: totals that update every tick, with a reset.
+input  items: int @ I        # e.g. a belt reader in pulse mode
+input  reset: bool @ R
+output total: int @ T
+output busy_ticks: int @ B
+output seen: int @ S
+
+seen = 100                   # starts at 100, to exercise initial values
+
+every tick:
+    if reset:
+        total = 0
+        seen = 100
+    else:
+        total += items
+        seen += 1
+    if items > 0:
+        busy_ticks += 1
+
+test "adds every tick and resets":
+    run 20 ticks                 # let the program start
+    set items = 3
+    run 20 ticks
+    set items = 0
+    run 10 ticks
+    assert total == 60 and busy_ticks == 20 and seen > 140
+    set reset = True
+    run 10 ticks
+    assert total == 0 and seen == 100
+    set reset = False
+    set items = -2
+    run 10 ticks
+    set items = 0
+    run 10 ticks
+    assert total == -20 and busy_ticks == 20

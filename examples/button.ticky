@@ -1,0 +1,21 @@
+# Count button presses (SPEC §2).
+input  button: int @ B
+output total:  int @ T
+
+total = 0
+while True:
+    wait until button > 0
+    total += 1
+    wait until button == 0
+
+test "counts presses":
+    run 10 ticks
+    set button = 1
+    run 10 ticks
+    set button = 0
+    run 10 ticks
+    set button = 5
+    run 10 ticks
+    set button = 0
+    run 10 ticks
+    assert total == 2

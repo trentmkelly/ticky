@@ -1,0 +1,23 @@
+# Prime counter (SPEC §15.8): nested loops with break.
+input  limit: int @ N
+output count: int @ C
+output done: bool @ D
+
+c = 0
+for k in range(2, limit + 1):
+    d = 2
+    prime = True
+    while d * d <= k:
+        if k % d == 0:
+            prime = False
+            break
+        d += 1
+    if prime:
+        c += 1
+count = c
+done = True
+
+test "25 primes below 100":
+    set limit = 100
+    run until done, max 5000 ticks
+    assert count == 25

@@ -1,0 +1,23 @@
+# Two blocks: a fast counter and a slow block that reads it.
+input  step: int @ S
+output fast: int @ A
+output slow: int @ B
+output fib:  int @ C
+
+count = 0
+a = 0
+b = 1
+
+every tick:
+    count = (count + step) % 1000
+    fast = count
+
+every 7 ticks:
+    slow = count // 10
+    a, b = b, a + b      # wraps at 32 bits, just like Python would... if Python wrapped
+    fib = a
+
+test "fast counter counts by step":
+    set step = 3
+    run 100 ticks
+    assert fast > 0 and fast % 3 == 0

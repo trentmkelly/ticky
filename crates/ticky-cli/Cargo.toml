@@ -1,0 +1,16 @@
+[package]
+name = "ticky-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ticky"
+path = "src/main.rs"
+
+[dependencies]
+ticky-syntax.workspace = true
+ticky-factorio.workspace = true
+ticky-sim.workspace = true
+ticky-compiler.workspace = true
+clap.workspace = true
+serde_json.workspace = true

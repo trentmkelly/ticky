@@ -1,0 +1,58 @@
+# Level 2: functions (inlined), defaults, keyword arguments, tuple returns, early returns.
+input  a: int @ A
+input  b: int @ B
+output g: int @ G           # gcd(a, b)
+output lo: int @ L          # min and max via a tuple return
+output hi: int @ H
+output band: int @ C        # classify(a): 0 below 10, 1 up to 100, 2 above
+output scaled: int @ S      # scale(a) with a default factor and a keyword argument
+output squares: int @ Q     # sum of squares, computed at compile time
+
+def gcd(x, y):
+    x, y = abs(x), abs(y)
+    while y != 0:
+        x, y = y, x % y
+    return x
+
+def order(x, y):
+    if x <= y:
+        return x, y
+    return y, x
+
+def classify(x):
+    if x < 10:
+        return 0
+    if x <= 100:
+        return 1
+    return 2
+
+def scale(x, factor=3, offset=0):
+    return x * factor + offset
+
+def sum_squares(n):
+    total = 0
+    for i in range(1, n + 1):
+        total += i * i
+    return total
+
+SQUARES = sum_squares(10)     # a loop at the top level still runs (once), at startup
+
+every tick:
+    band = classify(a)
+    scaled = scale(a, offset=b)
+    lo, hi = order(a, b)
+
+squares = SQUARES
+while True:
+    g = gcd(a, b)
+    wait 2
+
+test "functions":
+    set a = 84
+    set b = -36
+    run 100 ticks
+    assert g == 12 and lo == -36 and hi == 84 and band == 1 and scaled == 216 and squares == 385
+    set a = 5
+    set b = 7
+    run 100 ticks
+    assert g == 1 and lo == 5 and hi == 7 and band == 0 and scaled == 22

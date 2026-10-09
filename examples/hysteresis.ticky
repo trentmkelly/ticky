@@ -1,0 +1,21 @@
+# Backup steam power with hysteresis: switch on below 20% charge, off above 80%.
+input  charge: int @ A = port("Accumulator charge %")
+output steam_on: bool @ S
+
+every tick:
+    if charge < 20:
+        steam_on = True
+    elif charge > 80:
+        steam_on = False
+
+test "turns on when low and stays on until high":
+    set charge = 50
+    run 20 ticks
+    assert not steam_on
+    set charge = 10
+    run until steam_on, max 20 ticks
+    set charge = 50
+    run 20 ticks
+    assert steam_on          # hysteresis: still on
+    set charge = 90
+    run until not steam_on, max 20 ticks

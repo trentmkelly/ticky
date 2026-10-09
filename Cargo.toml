@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ticky-syntax = { path = "crates/ticky-syntax" }
+ticky-factorio = { path = "crates/ticky-factorio" }
+ticky-sim = { path = "crates/ticky-sim" }
+ticky-compiler = { path = "crates/ticky-compiler" }
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }

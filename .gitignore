@@ -1,0 +1,3 @@
+/target
+*.bp.txt
+__pycache__/

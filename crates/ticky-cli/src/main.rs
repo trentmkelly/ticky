@@ -1,0 +1,320 @@
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use ticky_compiler::testrun::{run_tests, Harness};
+use ticky_compiler::{compile, Compiled, Opt, Options};
+use ticky_factorio::{blueprint, SignalTable};
+use ticky_syntax::ast::PortDir;
+use ticky_syntax::{Diag, Severity};
+
+#[derive(Parser)]
+#[command(name = "ticky", version, about = "Compile Ticky programs into Factorio 2.0 blueprints")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Compile to a blueprint string.
+    Build {
+        file: PathBuf,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Write blueprint JSON instead of a blueprint string.
+        #[arg(long)]
+        json: bool,
+        /// Save the RUN switch as on, so the program starts as soon as it's built.
+        #[arg(long)]
+        autostart: bool,
+        /// Optimise for `speed` (default) or `size`.
+        #[arg(long, default_value = "speed", value_parser = parse_opt)]
+        opt: Opt,
+    },
+    /// Check a program and print its cost report.
+    Check {
+        file: PathBuf,
+        #[arg(long, default_value = "speed", value_parser = parse_opt)]
+        opt: Opt,
+    },
+    /// Run the program's `test` blocks in the simulator.
+    Test { file: PathBuf },
+    /// Simulate and print output ports whenever they change.
+    Sim {
+        file: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        ticks: u64,
+        /// Set an input: `name=value` (at tick 0) or `name=value@tick`. Repeatable.
+        /// `RUN=0@tick` / `RUN=1@tick` switch the program off and on.
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        /// Print every tick instead of only changes.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run the program in the simulator and in headless Factorio, and compare tick by tick.
+    Difftest {
+        file: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        ticks: u64,
+        #[arg(long = "set")]
+        sets: Vec<String>,
+    },
+    /// Decode a blueprint string (from a file or argument) to JSON.
+    Decode { input: String },
+}
+
+fn parse_opt(s: &str) -> Result<Opt, String> {
+    match s {
+        "speed" => Ok(Opt::Speed),
+        "size" => Ok(Opt::Size),
+        _ => Err("expected `speed` or `size`".into()),
+    }
+}
+
+fn load(file: &Path) -> Result<(String, String), ExitCode> {
+    match std::fs::read_to_string(file) {
+        Ok(s) => Ok((file.display().to_string(), s)),
+        Err(e) => {
+            eprintln!("error: can't read {}: {e}", file.display());
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_diags(diags: &[Diag], file: &str, src: &str) {
+    for d in diags {
+        eprint!("{}", d.render(file, src));
+    }
+}
+
+fn build(file: &Path, autostart: bool, opt: Opt) -> Result<(String, String, Compiled), ExitCode> {
+    let (name, src) = load(file)?;
+    let label = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    match compile(&src, &Options { autostart, label, opt }) {
+        Ok(c) => {
+            print_diags(&c.warnings, &name, &src);
+            Ok((name, src, c))
+        }
+        Err(diags) => {
+            print_diags(&diags, &name, &src);
+            let n = diags.iter().filter(|d| d.severity == Severity::Error).count();
+            eprintln!("{n} error(s)");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Parses `name=value[@tick]` into (tick, port index, value).
+fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, i32)>, String> {
+    let mut out = Vec::new();
+    for s in sets {
+        let (name, rest) = s.split_once('=').ok_or(format!("expected name=value, got `{s}`"))?;
+        let (val, tick) = match rest.split_once('@') {
+            Some((v, t)) => (v, t.parse::<u64>().map_err(|e| format!("bad tick in `{s}`: {e}"))?),
+            None => (rest, 0),
+        };
+        let v = match val {
+            "True" | "true" => 1,
+            "False" | "false" => 0,
+            _ => val.parse::<i32>().map_err(|e| format!("bad value in `{s}`: {e}"))?,
+        };
+        // `RUN` toggles the RUN switch.
+        if name == "RUN" {
+            out.push((tick, usize::MAX, v));
+            continue;
+        }
+        let pi = c
+            .program
+            .port_index(name)
+            .filter(|&i| c.program.ports[i].dir == PortDir::Input)
+            .ok_or(format!("`{name}` is not an input port"))?;
+        out.push((tick, pi, v));
+    }
+    out.sort_by_key(|s| s.0);
+    Ok(out)
+}
+
+/// Output values observed at each tick, after applying that tick's input changes.
+fn sim_trace(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> Vec<Vec<i32>> {
+    let outs: Vec<usize> = (0..c.program.ports.len()).filter(|&i| c.program.ports[i].dir == PortDir::Output).collect();
+    let mut h = Harness::new(c);
+    let mut rows = Vec::new();
+    for i in 0..ticks {
+        for &(_, pi, v) in sets.iter().filter(|s| s.0 == i) {
+            if pi == usize::MAX {
+                h.sim.set_constant_on(c.cg.run_switch, v != 0);
+            } else {
+                h.set(pi, v);
+            }
+        }
+        rows.push(outs.iter().map(|&o| h.get(o)).collect());
+        h.sim.step();
+    }
+    rows
+}
+
+fn harness_dir() -> PathBuf {
+    std::env::var_os("TICKY_HARNESS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness"))
+}
+
+fn lua_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap()
+}
+
+/// A Lua job file for the in-game harness (harness/ticky-harness).
+fn job_lua(c: &Compiled, sets: &[(u64, usize, i32)], ticks: u64) -> String {
+    let t = SignalTable::base();
+    let sig = |s| {
+        let info = t.info(s);
+        format!("{{type={}, name={}}}", lua_str(info.kind.as_str()), lua_str(&info.name))
+    };
+    let mut ports = Vec::new();
+    for (i, p) in c.program.ports.iter().enumerate() {
+        ports.push(format!(
+            "{{name={}, dir={}, entity={}, signal={}}}",
+            lua_str(&p.name),
+            lua_str(if p.dir == PortDir::Input { "in" } else { "out" }),
+            c.cg.port_ents[i] + 1,
+            sig(p.sig)
+        ));
+    }
+    let sets: Vec<String> =
+        sets.iter().map(|(tk, pi, v)| format!("{{t={tk}, port={}, value={v}}}", pi.wrapping_add(1))).collect();
+    format!(
+        "return {{\n  bp = {},\n  ticks = {ticks},\n  run = {},\n  ports = {{{}}},\n  sets = {{{}}},\n}}\n",
+        lua_str(&c.blueprint_string()),
+        c.cg.run_switch + 1,
+        ports.join(", "),
+        sets.join(", ")
+    )
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let res = match cli.cmd {
+        Cmd::Build { file, output, json, autostart, opt } => build(&file, autostart, opt).and_then(|(_, src, c)| {
+            eprint!("{}", c.report(&src));
+            let text = if json {
+                serde_json::to_string_pretty(&c.blueprint_json()).unwrap()
+            } else {
+                c.blueprint_string()
+            };
+            match output {
+                Some(p) => std::fs::write(&p, text + "\n").map_err(|e| {
+                    eprintln!("error: can't write {}: {e}", p.display());
+                    ExitCode::FAILURE
+                }),
+                None => {
+                    println!("{text}");
+                    Ok(())
+                }
+            }
+        }),
+        Cmd::Check { file, opt } => build(&file, false, opt).map(|(_, src, c)| eprint!("{}", c.report(&src))),
+        Cmd::Test { file } => build(&file, false, Opt::Speed).and_then(|(name, src, c)| {
+            let results = run_tests(&c, &src);
+            if results.is_empty() {
+                eprintln!("no tests in {name}");
+            }
+            let mut failed = 0;
+            for r in &results {
+                match &r.failure {
+                    None => eprintln!("test {} ... ok ({} ticks)", r.name, r.ticks),
+                    Some(d) => {
+                        failed += 1;
+                        eprintln!("test {} ... FAILED", r.name);
+                        eprint!("{}", d.render(&name, &src));
+                    }
+                }
+            }
+            eprintln!("{} passed, {failed} failed", results.len() - failed);
+            if failed > 0 {
+                Err(ExitCode::FAILURE)
+            } else {
+                Ok(())
+            }
+        }),
+        Cmd::Sim { file, ticks, sets, all } => build(&file, false, Opt::Speed).and_then(|(_, _, c)| {
+            let sets = parse_sets(&c, &sets).map_err(|e| {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            })?;
+            let names: Vec<&str> =
+                c.program.ports.iter().filter(|p| p.dir == PortDir::Output).map(|p| p.name.as_str()).collect();
+            println!("tick  {}", names.join("  "));
+            let rows = sim_trace(&c, &sets, ticks);
+            for (i, row) in rows.iter().enumerate() {
+                if all || i == 0 || rows[i - 1] != *row {
+                    let cells: Vec<String> = row.iter().zip(&names).map(|(v, n)| format!("{v:>w$}", w = n.len())).collect();
+                    println!("{i:>4}  {}", cells.join("  "));
+                }
+            }
+            Ok(())
+        }),
+        Cmd::Difftest { file, ticks, sets } => build(&file, false, Opt::Speed).and_then(|(_, _, c)| {
+            let sets = parse_sets(&c, &sets).map_err(|e| {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            })?;
+            let expected = sim_trace(&c, &sets, ticks);
+            let job = std::env::temp_dir().join("ticky-job.lua");
+            std::fs::write(&job, job_lua(&c, &sets, ticks)).unwrap();
+            let script = harness_dir().join("run.sh");
+            let status = std::process::Command::new(&script).arg(&job).status();
+            if !matches!(status, Ok(s) if s.success()) {
+                eprintln!("error: harness failed ({})", script.display());
+                return Err(ExitCode::FAILURE);
+            }
+            let trace = std::fs::read_to_string("/tmp/ticky-harness/script-output/ticky/trace.txt").map_err(|e| {
+                eprintln!("error: no trace from the game: {e}");
+                ExitCode::FAILURE
+            })?;
+            let actual: Vec<Vec<i32>> = trace
+                .lines()
+                .map(|l| l.split_whitespace().skip(1).map(|v| v.parse().unwrap()).collect())
+                .collect();
+            // The harness script reads outputs one tick later than the simulator records them
+            // (calibrated: every program shows exactly this shift), so game[i + 1] ~ sim[i].
+            const OFFSET: usize = 1;
+            if actual.len() != expected.len() {
+                eprintln!("game trace has {} ticks, simulator {}", actual.len(), expected.len());
+                return Err(ExitCode::FAILURE);
+            }
+            let n = expected.len() - OFFSET;
+            let mismatches: Vec<usize> = (0..n).filter(|&i| expected[i] != actual[i + OFFSET]).collect();
+            if mismatches.is_empty() {
+                let changes = (1..n).filter(|&i| expected[i] != expected[i - 1]).count();
+                eprintln!("MATCH: {n} ticks identical in game and simulator ({changes} output changes)");
+                Ok(())
+            } else {
+                eprintln!("MISMATCH at {} tick(s); first few:", mismatches.len());
+                for &i in mismatches.iter().take(10) {
+                    eprintln!("  tick {i}: simulator {:?}, game {:?}", expected[i], actual[i + OFFSET]);
+                }
+                Err(ExitCode::FAILURE)
+            }
+        }),
+        Cmd::Decode { input } => {
+            let text = std::fs::read_to_string(&input).unwrap_or(input);
+            match blueprint::decode(&text) {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    Err(ExitCode::FAILURE)
+                }
+            }
+        }
+    };
+    match res {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(c) => c,
+    }
+}

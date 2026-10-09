@@ -1,0 +1,20 @@
+# Collatz step counter (SPEC §15.6): counts steps to reach 1 whenever x changes.
+input  x: int @ X
+output steps: int @ S
+
+last = 0
+while True:
+    wait until x != last and x > 0
+    last = x
+    n = x
+    count = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        count += 1
+    steps = count
+
+test "27 takes 111 steps":
+    set x = 27
+    run until steps == 111, max 1000 ticks
+    set x = 6
+    run until steps == 8, max 1000 ticks

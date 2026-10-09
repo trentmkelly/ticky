@@ -1,0 +1,25 @@
+# Smoothed reading with hysteresis and a minimum on-time.
+input  temp: int @ T
+output heater: bool @ H
+output avg: int @ A
+
+on_ticks = 0
+smooth = 0
+
+every tick:
+    smooth = (smooth * 3 + temp * 4) // 4
+    avg = smooth // 4
+    if heater:
+        on_ticks += 1
+        if avg > 60 and on_ticks >= 5:
+            heater = False
+            on_ticks = 0
+    elif avg < 40:
+        heater = True
+
+test "heats when cold, stops when warm":
+    set temp = 20
+    run until heater, max 300 ticks
+    set temp = 90
+    run until not heater, max 600 ticks
+    assert avg > 60

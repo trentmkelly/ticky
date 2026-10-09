@@ -1,0 +1,54 @@
+# Ticky level-2 demo: a statistics box. Once a second it records a reading and keeps
+# the last 8, reporting their average, lowest, highest and median, and the trend.
+input  reading: int @ R = port("The value to track (a belt reader, tank level, ...)")
+
+output average: int @ A
+output lowest: int @ L
+output highest: int @ H
+output median: int @ M
+output trend: int @ T       # +1 rising, -1 falling, 0 steady (vs. 8 seconds ago)
+output samples: int @ S
+
+N = 8
+history = [0] * N
+samples = 0
+
+def sign(x):
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
+
+def sort(xs):
+    for i in range(N - 1):
+        for j in range(N - 1 - i):
+            if xs[j] > xs[j + 1]:
+                t = xs[j]
+                xs[j] = xs[j + 1]
+                xs[j + 1] = t
+    return xs
+
+every 60 ticks:
+    if samples == 0:
+        history = [reading] * N          # start full of the first reading
+    oldest = history[samples % N]        # the slot we overwrite holds the oldest reading
+    history[samples % N] = reading
+    samples += 1
+
+    average = sum(history) // N
+    lowest = min(history)
+    highest = max(history)
+    median = sort(history)[N // 2]
+    trend = sign(reading - oldest)
+
+test "tracks a rising then falling reading":
+    set reading = 100
+    run 200 ticks
+    assert average == 100 and lowest == 100 and highest == 100 and median == 100 and trend == 0
+    set reading = 180
+    run 260 ticks
+    assert samples >= 6 and highest == 180 and lowest == 100 and trend == 1
+    set reading = 20
+    run 700 ticks
+    assert average == 20 and median == 20 and trend == 0

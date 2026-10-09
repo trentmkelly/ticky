@@ -1,0 +1,43 @@
+# Level 2: arrays of registers, constant and runtime indexes, comprehensions.
+input  pick: int @ P         # an index to read
+input  value: int @ V
+input  store: bool @ S       # pulse to store `value` at index `pick`
+output picked: int @ K       # history[pick]
+output total: int @ T        # sum(history)
+output biggest: int @ M
+output count: int @ C        # how many stores so far
+output evens: int @ E        # sum of the even squares below 10, from a comprehension
+
+N = 8
+history = [0] * N
+squares = [i * i for i in range(10) if i % 2 == 0]
+count = 0
+
+def bump(xs, k):
+    xs[k % N] += 1           # arrays are passed by value...
+    return xs                # ...so return the changed copy
+
+every tick:
+    total = sum(history)
+    biggest = max(history)
+    evens = sum(squares)
+
+while True:
+    picked = history[pick]   # runtime index: 0 when out of range
+    if store:
+        history[pick] = value
+        count += 1
+        history = bump(history, count)
+        wait until not store
+
+test "arrays":
+    set pick = 3
+    set value = 10
+    set store = True
+    run 30 ticks
+    set store = False
+    run 30 ticks
+    assert picked == 10 and count == 1 and total == 11 and biggest == 10 and evens == 120
+    set pick = 9
+    run 20 ticks
+    assert picked == 0
