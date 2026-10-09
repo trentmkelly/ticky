@@ -130,6 +130,26 @@ impl SignalTable {
         sig
     }
 
+    /// The game's order among signals with equal values in a selector combinator (verified
+    /// with the `tieprobe` scenario): items, then fluids, then virtual signals (then the other
+    /// kinds), each in prototype order (the table's order), then by quality. `select` max
+    /// with index 0 gives the lowest rank among the largest values; min gives the highest
+    /// among the smallest.
+    pub fn rank(&self, s: Sig) -> (u8, u32, u8) {
+        let info = self.info(s);
+        let kind = match info.kind {
+            SignalKind::Item => 0,
+            SignalKind::Fluid => 1,
+            SignalKind::Virtual => 2,
+            SignalKind::Recipe => 3,
+            SignalKind::SpaceLocation => 4,
+            SignalKind::AsteroidChunk => 5,
+            SignalKind::Quality => 6,
+        };
+        let base = if info.quality == 0 { s } else { self.lookup_kind(info.kind, &info.name).unwrap_or(s) };
+        (kind, base.0 as u32, info.quality)
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().sigs.len()
     }

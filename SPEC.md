@@ -2,9 +2,10 @@
 
 > A Python-like language that compiles to Factorio 2.0 combinator blueprints.
 
-- **Status:** Levels 0–5 implemented (Level 3: the bundle core, §4.3.5; Level 4: signal
-  arrays, §4.4; Level 5: processes and `--checks`, §9.2, §13), plus the first optimisation
-  passes (see NOTES.md); later levels are design
+- **Status:** Levels 0–6 implemented (Level 3: the bundle core, §4.3.5; Level 4: signal
+  arrays, §4.4; Level 5: processes and `--checks`, §9.2, §13; Level 6: runtime signals and
+  bundle iteration, §4.2, §4.3.4), plus the first optimisation passes (see NOTES.md); later
+  levels are design
 - **Target:** Factorio 2.0. By default the compiler wires its internals with *quality*
   variants of signals (uncommon to legendary), which needs the Quality mod (part of Space
   Age); `--no-quality` builds for the base game alone, with normal signals inside.
@@ -177,13 +178,26 @@ optional and checked.
      `asteroid-chunk`.
   4. Names the compiler doesn't know (the base game, Space Age and all recipes are built in)
      are **warnings**, not errors, so modded signals work: `S("nt-tbu-fuel")`.
-  5. Quality (Space Age): `S("iron-plate", quality="rare")` **[not implemented yet]**.
+  5. Quality (Space Age): `S("iron-plate", quality="rare")` (`normal`, `uncommon`, `rare`,
+     `epic`, `legendary`). Programs may use quality signals freely: they only ever share
+     wires with the compiler's own (quality) signals on bundle wires, where the two are kept
+     apart by wire colour.
 - **Where signal names appear:** after `@` in port declarations, as `Bundle(...)` keyword
   arguments, in `bundle.name` attribute access, and through `S(...)`.
 - **Signal-typed values** are compile-time constants, except values coming out of bundle
-  iteration and `argmax`/`argmin` (§4.3). Runtime signals are carried as one-hot bundles, i.e.
-  that signal with value 1.
-- Comparison: `s == t`, `s != t`. `s.value_in(b)` is the same as `b[s]`.
+  iteration, `argmax`/`argmin`/`nth` (§4.3), `Signal` inputs, and variables assigned those.
+  Runtime signals are carried as one-hot bundles, i.e. that signal with value 1; "no signal"
+  (the `argmax` of an empty bundle) is the empty bundle. A variable holding signals has type
+  `Signal` (inferred, or `x: Signal = …`); it may start as a constant (`last = S("coal")`).
+- Comparison: `s == t`, `s != t` (two "no signal"s are equal). `s.value_in(b)` is the same as
+  `b[s]`. `if s:` is true unless `s` is "no signal". Signals can't be used in arithmetic.
+- With a runtime signal `s`: `b[s]` and `s in b` (1 combinator: `each × each`),
+  `b.get(s, default)`, `b[s] = x` / `b[s] += x` (2 combinators), `{s: x, …}` (runtime keys
+  are set one after another, so a repeated signal keeps its last value, as in Python), and
+  choosing between signals (`s if c else S("coal")`).
+- **Ports.** `input s: Signal` reads the signal with the largest value on its wires (ties as
+  for `argmax`); `output t: Signal` sends the signal with value 1 (nothing for "no signal").
+  Neither has `@`.
 
 ### 4.3 `Bundle`
 
@@ -239,15 +253,24 @@ is a compile error with an explanation. Sequential iteration is still available 
 | `b.total()` | Sum of all values | 1 tick |
 | `len(b)` | Number of present signals | 1 tick (selector: count) |
 | `max(b.values())`, `min(b.values())` | `int` | 1–2 ticks (selector: sort) |
-| `b.argmax()`, `b.argmin()` | `Signal` (ties: unspecified but deterministic) | 1–2 ticks |
-| `b.nth(k)` | `(Signal, int)`, the k-th largest, 0-based | 1–2 ticks |
+| `b.argmax()`, `b.argmin()` | `Signal` ("no signal" if `b` is empty) | 2 ticks |
+| `b.nth(k)` | `(Signal, int)`, the k-th largest, 0-based (`k` may be a runtime value; out of range: no signal, 0) | 2 ticks |
 | `s in b` | `bool`: is `b[s] != 0` | 1 tick |
-| `for s, v in b.items():` | Sequential loop, descending by value | ~2–4 ticks/iteration |
+| `for s, v in b.items():` | Sequential loop, descending by value | ~4 ticks/iteration |
 | `for s, v in b.items(ascending=True):` | Sequential loop, ascending | same |
+| `for s in b.keys():` | The same, without the values | same |
+
+**Ties** (equal values) are ordered as the game's selector combinator orders them (verified
+in-game with harness/ticky-harness/scenarios/tieprobe): items, then fluids, then virtual
+signals (then recipes and the rest), each in prototype order, then by quality. `argmax` and
+descending loops take that order; `argmin` and ascending loops the reverse. (For modded
+signals the simulator's order is a best guess.)
 
 Bundle iteration is sequential: it is a loop in a process (§9) and cannot appear in `every tick:`
 blocks. It visits the signals present at loop entry (a snapshot); modifying `b` inside the loop
-does not affect the iteration.
+does not affect the iteration. Each iteration takes the top signal of the snapshot with a
+selector combinator and removes it, so `break` and `continue` work as usual and the cost
+doesn't depend on how many signals the bundle has.
 
 #### 4.3.5 What level 3 implements
 
@@ -267,8 +290,8 @@ does not affect the iteration.
   like Factorio (§12). Conditions on `v` itself cost one decider; conditions on other
   expressions of `v` (`v % 50 == 0`, `max(v - k, 0)`) compare a computed bundle with 0, with
   missing signals counted as 0.
-- Not yet: `argmax`/`argmin`/`nth` and runtime `Signal` values, `for s, v in b.items():`
-  loops, quality, `Signal` ports (level 6).
+- Level 6 adds `argmax`/`argmin`/`nth`, runtime `Signal` values and ports, `for s, v in
+  b.items():` loops and quality signals (§4.2, §4.3.4).
 
 ### 4.4 `list[int, N]`
 
@@ -702,6 +725,8 @@ Each item is deliberate, and the compiler gives a specific error or warning wher
 | `Counter + Counter` drops counts ≤ 0 | Bundle `+`/`-` keep every nonzero result (negative too) | Per-signal wire sums |
 | `//`, `%` floor | On bundles and inside bundle comprehensions they truncate (Factorio's rule); on numbers they floor as in Python | One combinator for the whole bundle |
 | `b + 5` (if it existed) | Changes only the signals `b` has (Factorio's `each`); warns | Wire semantics |
+| Iterating a dict follows insertion order | `for s, v in b.items()` goes from the largest value down (ties in the game's signal order) | Wire values have no insertion order; the selector combinator sorts |
+| `max(d, key=d.get)` of an empty dict raises | `b.argmax()` of an empty bundle is "no signal" | No exceptions |
 | Recursion | Compile error | No call stack (yet) |
 | `print` | Simulator only | No console in-game |
 | Strings, floats, classes, exceptions, imports | Absent | v1 scope |
@@ -899,7 +924,8 @@ while True:
     send_to = demand.argmax()
     wait until not train_waiting
 ```
-Expected: ~3 ticks per dispatch regardless of the number of stations.
+Expected: ~3 ticks per dispatch regardless of the number of stations. Implemented as
+examples/dispatch.ticky: 3 ticks per dispatch, 15 combinators.
 
 ### 15.8 Prime counter (sluggish, nested loops)
 
@@ -1061,7 +1087,8 @@ source ─parse→ AST ─sema→ typed AST ─lower→ CFG IR ─sched→ FSM +
    combinator queries (§4.3.5; `argmax`/`nth` move to level 6).
 5. ✅ **Level 4:** signal arrays and banked RAM, runtime indexing, `sorted` (§4.4).
 6. ✅ **Level 5:** `process` concurrency, single-writer rule, `--checks`.
-7. **Level 6:** bundle iteration, runtime `Signal` values.
+7. ✅ **Level 6:** bundle iteration, runtime `Signal` values (and `argmax`/`argmin`/`nth`,
+   `Signal` ports, quality signals).
 8. **Optimisation passes:** ✅ decider fusion, guarded loads, loop rotation, one-tick
    pipelining and accumulators for `every tick:`, `--opt` modes, signal namespaces per logic
    cluster. Still to do: loop pipelining in `main`, one-tick steps, single-decider counters,

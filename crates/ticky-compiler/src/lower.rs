@@ -40,7 +40,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 }
             }
             let x = expr(g, names, inner)?;
-            if g.is_bundle(x) {
+            if bundle::kind(g, x) == Kind::Bundle {
                 let m = g.konst(-1);
                 return Ok(g.bun(vec![BTerm::Map(ArOp::Mul, x, m)]));
             }
@@ -52,7 +52,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         ExprKind::Unary(UnOp::Invert, inner) => {
             let x = expr(g, names, inner)?;
             let m = g.konst(-1);
-            if g.is_bundle(x) {
+            if bundle::kind(g, x) == Kind::Bundle {
                 return Ok(g.bun(vec![BTerm::Map(ArOp::Xor, x, m)]));
             }
             let x = bundle::int(g, x, inner.span)?;
@@ -64,6 +64,10 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     .with_help("use `//` for integer division (or `tdiv(a, b)` for Factorio's truncating division)"));
             }
             let (x, y) = (expr(g, names, a)?, expr(g, names, b)?);
+            if bundle::kind(g, x).is_signal() || bundle::kind(g, y).is_signal() {
+                return Err(Diag::error(e.span, "signals can't be used in arithmetic")
+                    .with_help("a signal names a bundle entry: read its value with `b[s]`"));
+            }
             if bundle::kind(g, x) == Kind::Bundle || bundle::kind(g, y) == Kind::Bundle {
                 return bundle::binop(g, *op, x, y, e.span);
             }
@@ -111,9 +115,13 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 let (kl, kr) = (bundle::kind(g, left), bundle::kind(g, r));
                 let special = match op {
                     ast::CmpOp::In | ast::CmpOp::NotIn => {
-                        let sig = bundle::signal(g, left, left_span)?;
+                        let key = match kl {
+                            Kind::Signal => bundle::Key::Const(g.as_sig(left).unwrap()),
+                            Kind::SigVal => bundle::Key::Dyn(g.unsig(left)),
+                            _ => return Err(Diag::error(left_span, "expected a signal here").with_help("write S(\"name\"), a signal constant or a `Signal` value")),
+                        };
                         let b = bundle::bundle(g, r, right.span)?;
-                        let x = g.bget(b, sig);
+                        let x = bundle::get(g, b, key);
                         let z = g.konst(0);
                         Some(g.cmp(if *op == ast::CmpOp::In { CmpOp::Ne } else { CmpOp::Eq }, x, z))
                     }
@@ -124,11 +132,19 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                         let same = g.as_sig(left) == g.as_sig(r);
                         Some(g.konst((same == (*op == ast::CmpOp::Eq)) as i32))
                     }
+                    // A runtime signal: compare the one-hot bundles.
+                    ast::CmpOp::Eq | ast::CmpOp::Ne if kl.is_signal() && kr.is_signal() => {
+                        let (a, b) = (g.unsig(left), g.unsig(r));
+                        Some(bundle::equal(g, a, b, *op == ast::CmpOp::Eq))
+                    }
                     _ => None,
                 };
                 let c = match special {
                     Some(c) => c,
                     None => {
+                        if kl.is_signal() || kr.is_signal() {
+                            return Err(Diag::error(e.span, "signals can only be compared with `==` and `!=` (with other signals)"));
+                        }
                         if kl == Kind::Bundle || kr == Kind::Bundle {
                             return Err(Diag::error(e.span, "bundles can only be compared with `==` and `!=`")
                                 .with_help("to compare each signal, use a comprehension, e.g. `{s: v for s, v in b.items() if v > 10}`"));
@@ -209,10 +225,29 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 "#bset" => {
                     let b = expr(g, names, &args[0])?;
                     let b = bundle::bundle(g, b, args[0].span).map_err(|_| Diag::error(args[0].span, "only bundles and arrays can be indexed"))?;
-                    let k = bundle::key(g, names, &args[1])?;
+                    let k = bundle::key_any(g, names, &args[1])?;
                     let x = expr(g, names, &args[2])?;
                     let x = bundle::int(g, x, args[2].span)?;
-                    return Ok(g.bset(b, k, x));
+                    return Ok(bundle::set(g, b, k, x));
+                }
+                // Internal (bundle iteration, `nth`): `#rank(b, k, max)` is the signal of `b`
+                // ranked `k` (from the largest if `max`) with its value, as a bundle;
+                // `#hot(x)` that bundle's signal; `#total(x)` its value.
+                "#rank" => {
+                    let b = expr(g, names, &args[0])?;
+                    let b = bundle::bundle(g, b, args[0].span)?;
+                    let k = expr(g, names, &args[1])?;
+                    let k = bundle::int(g, k, args[1].span)?;
+                    let max = matches!(args[2].kind, ExprKind::Bool(true));
+                    return Ok(g.brank_at(b, max, k));
+                }
+                "#hot" => {
+                    let b = expr(g, names, &args[0])?;
+                    return Ok(g.onehot(b));
+                }
+                "#total" => {
+                    let b = expr(g, names, &args[0])?;
+                    return Ok(g.btotal(b));
                 }
                 "Bundle" => return bundle::construct(g, names, args, kwargs, e.span),
                 // Internal: signal arrays (from the expansion pass). A bank of an array is a
@@ -388,8 +423,8 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         ExprKind::Index(base, idx) => {
             let b = expr(g, names, base)?;
             let b = bundle::bundle(g, b, base.span).map_err(|_| Diag::error(base.span, "only bundles and arrays can be indexed"))?;
-            let sig = bundle::key(g, names, idx)?;
-            g.bget(b, sig)
+            let k = bundle::key_any(g, names, idx)?;
+            bundle::get(g, b, k)
         }
         ExprKind::Dict(items) => bundle::dict(g, names, items)?,
         ExprKind::DictComp { key, value, target, iter, conds } => {
@@ -411,11 +446,11 @@ pub fn div_check(g: &mut Graph, y: V, span: Span) {
 /// Both sides of a select (or `and`/`or`) must be the same kind of value.
 fn same_kind(g: &Graph, a: V, b: V, span: Span) -> Result<(), Diag> {
     let (ka, kb) = (bundle::kind(g, a), bundle::kind(g, b));
-    if ka != kb {
+    if ka != kb && !(ka.is_signal() && kb.is_signal()) {
         let name = |k: Kind| match k {
             Kind::Int => "a number",
             Kind::Bundle => "a bundle",
-            Kind::Signal => "a signal",
+            Kind::Signal | Kind::SigVal => "a signal",
         };
         return Err(Diag::error(span, format!("this is {}, but the other side is {}", name(kb), name(ka))));
     }
@@ -425,15 +460,39 @@ fn same_kind(g: &Graph, a: V, b: V, span: Span) -> Result<(), Diag> {
 /// `b.method(...)` on a bundle.
 fn method(g: &mut Graph, names: &mut dyn Names, base: &Expr, m: &str, args: &[Expr], kwargs: &[(String, Expr)], span: Span) -> Result<V, Diag> {
     let b = expr(g, names, base)?;
+    // `s.value_in(b)` is `b[s]`.
+    if bundle::kind(g, b).is_signal() {
+        let [arg] = args else {
+            return Err(Diag::error(span, format!("signals have no method `{m}` with {} argument(s)", args.len())).with_help("signals have `.value_in(bundle)`"));
+        };
+        if m != "value_in" {
+            return Err(Diag::error(span, format!("signals have no method `{m}`")).with_help("signals have `.value_in(bundle)`"));
+        }
+        let key = if let Some(s) = g.as_sig(b) { bundle::Key::Const(s) } else { bundle::Key::Dyn(g.unsig(b)) };
+        let x = expr(g, names, arg)?;
+        let x = bundle::bundle(g, x, arg.span)?;
+        return Ok(bundle::get(g, x, key));
+    }
     let b = bundle::bundle(g, b, base.span).map_err(|_| Diag::error(base.span, format!("`.{m}()` needs a bundle")))?;
     if let Some((k, _)) = kwargs.first() {
         return Err(Diag::error(span, format!("`.{m}()` doesn't take a keyword argument `{k}`")));
     }
     match (m, args) {
         ("total", []) => Ok(g.btotal(b)),
+        // The signal with the largest (smallest) value; ties in the game's signal order
+        // (`SignalTable::rank`); no signal for an empty bundle.
+        ("argmax", []) => {
+            let top = g.brank(b, true, 0);
+            Ok(g.onehot(top))
+        }
+        ("argmin", []) => {
+            let top = g.brank(b, false, 0);
+            Ok(g.onehot(top))
+        }
+        ("nth", _) => Err(Diag::error(span, "`.nth(k)` gives a signal and its value: unpack it, e.g. `s, v = b.nth(0)`")),
         ("get", [k]) | ("get", [k, _]) => {
-            let sig = bundle::key(g, names, k)?;
-            let x = g.bget(b, sig);
+            let key = bundle::key_any(g, names, k)?;
+            let x = bundle::get(g, b, key);
             if let [_, d] = args {
                 // Like dict.get: the default when the signal is missing (0).
                 let dv = expr(g, names, d)?;
@@ -446,7 +505,7 @@ fn method(g: &mut Graph, names: &mut dyn Names, base: &Expr, m: &str, args: &[Ex
         }
         ("values" | "items" | "keys", _) => Err(Diag::error(span, format!("`.{m}()` can only be used inside `sum`, `min`, `max` or a comprehension"))),
         _ => Err(Diag::error(span, format!("bundles have no method `{m}` with {} argument(s)", args.len()))
-            .with_help("bundle methods: `.total()`, `.get(sig, default)`, `.items()` (in comprehensions), `.values()` (in sum/min/max)")),
+            .with_help("bundle methods: `.total()`, `.get(sig, default)`, `.argmax()`, `.argmin()`, `.nth(k)`, `.items()` (in comprehensions and `for` loops), `.values()` (in sum/min/max)")),
     }
 }
 

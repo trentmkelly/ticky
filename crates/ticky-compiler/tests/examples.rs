@@ -101,6 +101,17 @@ fn helpful_errors() {
     assert!(error_of("output y: int\nprocess a:\n    y = 1\nprocess a:\n    y = 2\n").contains("already the name"));
     assert!(error_of("output y: int\ninput k: int\nx = k\nprocess a:\n    y = x\n").contains("might not have run yet"));
     assert!(error_of("output y: int\nwhile True:\n    process a:\n        y = 1\n").contains("top level"));
+    // Runtime signals.
+    let sg = "input b: Bundle\noutput o: int @ O\noutput t: Signal\n";
+    assert!(error_of(&format!("{sg}every tick:\n    o = b.argmax() + 1\n")).contains("signals can't be used in arithmetic"));
+    assert!(error_of(&format!("{sg}every tick:\n    o = b.argmax() < b.argmin()\n")).contains("only be compared with `==` and `!=`"));
+    assert!(error_of(&format!("{sg}every tick:\n    o = b.argmax()\n")).contains("is a number, but this value is a signal"));
+    assert!(error_of(&format!("{sg}every tick:\n    t = 5\n")).contains("is a signal, but this value isn't"));
+    assert!(error_of(&format!("{sg}every tick:\n    for s, v in b.items():\n        o += v\n")).contains("can't be used in an `every` block"));
+    assert!(error_of(&format!("{sg}every tick:\n    o = b.nth(0)\n")).contains("tuple"));
+    assert!(error_of(&format!("{sg}while True:\n    for s in b.items():\n        o += 1\n")).contains("two names"));
+    assert!(error_of("input s: Signal @ A\n").contains("no `@ signal`"));
+    assert!(error_of("output o: Bundle\no = {S(\"coal\", quality=\"shiny\"): 1}\n").contains("unknown quality"));
     // `--checks` reserves the `error` port.
     let c = compile("output error: int\nerror = 1\n", &Options { checks: true, ..opts() });
     assert!(c.is_err_and(|d| d[0].message.contains("reserved")));
@@ -147,5 +158,55 @@ fn ports_keep_declaration_order() {
             let y = ys(dir);
             assert!(y.windows(2).all(|w| w[0] < w[1]), "{dir:?} ports out of order (poles {poles}, west {outputs_west}): {y:?}");
         }
+    }
+}
+
+/// Runtime signals through function calls (inlined, with a loop) and processes.
+#[test]
+fn signals_through_functions() {
+    let src = r#"input  stock: Bundle
+input  go: bool @ G
+output best: Signal
+output worst: Signal
+output n: int @ N
+
+def first_over(b, limit):
+    for s, v in b.items(ascending=True):
+        if v > limit:
+            return s
+    return S("signal-0")
+
+def other(s, t, b):
+    return t if b[s] < b[t] else s
+
+process p:
+    while True:
+        wait until go
+        best = first_over(stock, 10)
+        wait until not go
+
+c = 0
+while True:
+    wait until go
+    worst = other(stock.argmax(), stock.argmin(), stock)
+    c += 1
+    n = c
+    wait until not go
+
+test "functions":
+    set stock = {"coal": 5, "stone": 12, "wood": 40}
+    set go = 1
+    run 60 ticks
+    assert best == S("stone") and worst == S("wood") and n == 1
+    set go = 0
+    set stock = {"coal": 5}
+    run 10 ticks
+    set go = 1
+    run 60 ticks
+    assert best == S("signal-0") and worst == S("coal")
+"#;
+    let c = compile(src, &opts()).unwrap();
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
     }
 }

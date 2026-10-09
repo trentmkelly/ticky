@@ -1,0 +1,58 @@
+# Loops over a bundle's signals (SPEC §4.3.4): largest first (or `ascending=True`),
+# ties in the game's signal order; `nth`, `in`, runtime keys.
+input  stock: Bundle
+input  go: bool @ G
+input  pick: Signal
+output first: Signal
+output order: int @ O
+output total: int @ T
+output count: int @ N
+output asc: int @ A
+output have: int @ H
+output marked: Bundle
+output second: int @ S
+output same: bool @ E
+
+while True:
+    wait until go
+    o = 0
+    n = 0
+    tot = 0
+    best = S("signal-0")
+    for s, v in stock.items():
+        if n == 0:
+            best = s
+        o = o * 10 + v
+        n += 1
+        tot += v
+    a = 0
+    for s, v in stock.items(ascending=True):
+        a = a * 10 + v
+    first = best
+    order = o
+    total = tot
+    count = n
+    asc = a
+    have = stock[pick] + (100 if pick in stock else 0)
+    m = Bundle()
+    m[pick] = 7
+    m[best] += 1
+    marked = m
+    sig, val = stock.nth(1)
+    second = val
+    same = sig == pick
+    wait until not go
+
+test "loops":
+    set stock = {"iron-plate": 3, "copper-plate": 5, "coal": 1}
+    set pick = S("iron-plate")
+    set go = 1
+    run until count == 3, max 200 ticks
+    run 5 ticks
+    assert first == S("copper-plate")
+    assert order == 531
+    assert asc == 135
+    assert total == 9
+    assert have == 103
+    assert second == 3
+    assert same

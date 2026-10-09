@@ -251,6 +251,18 @@ impl<'g> Fuser<'g> {
                 let b = self.rebuild(b);
                 self.g.brank(b, max, index)
             }
+            Op::BSelectAt(b, max, ix) => {
+                let (b, ix) = (self.rebuild(b), self.rebuild(ix));
+                self.g.intern_op(Op::BSelectAt(b, max, ix))
+            }
+            Op::BDot(a, b) => {
+                let (a, b) = (self.rebuild(a), self.rebuild(b));
+                self.g.bdot(a, b)
+            }
+            Op::SigOf(x) => {
+                let x = self.rebuild(x);
+                self.g.sigval(x)
+            }
             Op::AGet(b, ix) => {
                 let (b, ix) = (self.rebuild(b), self.rebuild(ix));
                 self.g.aget_ix(b, ix)

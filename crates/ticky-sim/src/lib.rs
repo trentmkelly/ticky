@@ -347,14 +347,25 @@ impl<'a> Sim<'a> {
                 Kind::Selector(sel) => {
                     let mut ins = self.signals(e, Nets::BOTH);
                     match sel {
-                        Selector::Select { max, index } => {
-                            // Ties: lower signal index first (the game's order is unspecified).
+                        Selector::Select { .. } | Selector::SelectAt { .. } => {
+                            let (max, index) = match sel {
+                                Selector::Select { max, index } => (max, *index),
+                                Selector::SelectAt { max, index } => {
+                                    // The index signal is read, and takes no part in the ranking.
+                                    let k = ins.iter().find(|(s, _)| s == index).map_or(0, |x| x.1);
+                                    ins.retain(|(s, _)| s != index);
+                                    (max, k)
+                                }
+                                Selector::Count { .. } => unreachable!(),
+                            };
+                            // Ties in the game's order (`SignalTable::rank`): min is max reversed.
+                            let t = SignalTable::base();
                             if *max {
-                                ins.sort_by_key(|(s, v)| (std::cmp::Reverse(*v), *s));
+                                ins.sort_by_key(|(s, v)| (std::cmp::Reverse(*v), t.rank(*s)));
                             } else {
-                                ins.sort_by_key(|(s, v)| (*v, *s));
+                                ins.sort_by_key(|(s, v)| (*v, std::cmp::Reverse(t.rank(*s))));
                             }
-                            usize::try_from(*index).ok().and_then(|i| ins.get(i).copied()).into_iter().collect()
+                            usize::try_from(index).ok().and_then(|i| ins.get(i).copied()).into_iter().collect()
                         }
                         Selector::Count { out } => {
                             if ins.is_empty() {
@@ -577,5 +588,56 @@ mod wildcard_tests {
         assert_eq!(probe(sel(true, 9), ties, &[]), v(&[]));
         // L9 the selector sums both wires
         assert_eq!(probe(sel(true, 0), &[("iron-plate", 3)], &[("iron-plate", 4), ("coal", 5)]), v(&[("iron-plate", 7)]));
+    }
+
+    /// A selector reading its rank from a signal (harness/ticky-harness/scenarios/selprobe):
+    /// the index signal takes no part in the ranking; missing means 0; past the end, nothing.
+    #[test]
+    fn selector_index_signal_matches_the_game() {
+        let b: &[(&str, i32)] = &[("iron-plate", 100), ("copper-plate", 50), ("coal", 10)];
+        let sel = |max: bool| Kind::Selector(Selector::SelectAt { max, index: sig("signal-I") });
+        let want_max = [v(&[("iron-plate", 100)]), v(&[("copper-plate", 50)]), v(&[("coal", 10)]), v(&[]), v(&[])];
+        let want_min = [v(&[("coal", 10)]), v(&[("copper-plate", 50)]), v(&[("iron-plate", 100)]), v(&[]), v(&[])];
+        for i in 0..5 {
+            let idx: &[(&str, i32)] = if i == 0 { &[] } else { &[("signal-I", i)] };
+            assert_eq!(probe(sel(true), b, idx), want_max[i as usize]);
+            assert_eq!(probe(sel(false), b, idx), want_min[i as usize]);
+        }
+    }
+
+    /// The selector's order among equal values (harness/ticky-harness/scenarios/tieprobe):
+    /// items, fluids, virtual signals, each in prototype order, then quality; min reverses it.
+    #[test]
+    fn selector_ties_match_the_game() {
+        let t = SignalTable::base();
+        let q = |n: &str, quality: u8| t.with_quality(sig(n), quality);
+        let order = |vals: &[(Sig, i32)], max: bool| -> Vec<Sig> {
+            (0..vals.len())
+                .map(|k| {
+                    let mut n = Netlist::default();
+                    let c = n.add(Kind::Selector(Selector::Select { max, index: k as i32 }), Role::Core);
+                    let kc = n.add(Kind::Constant(ConstComb { values: vals.to_vec(), on: true }), Role::Core);
+                    n.wire((kc, Conn::Red), (c, Conn::InRed));
+                    let mut sim = Sim::new(&n);
+                    sim.step();
+                    sim.step();
+                    sim.outputs_of(c)[0].0
+                })
+                .collect()
+        };
+        let check = |set: &[Sig], want_max: &[Sig]| {
+            let vals: Vec<(Sig, i32)> = set.iter().map(|s| (*s, 5)).collect();
+            assert_eq!(order(&vals, true), want_max);
+            let rev: Vec<Sig> = want_max.iter().rev().copied().collect();
+            assert_eq!(order(&vals, false), rev);
+        };
+        let n = |names: &[&str]| names.iter().map(|x| sig(x)).collect::<Vec<_>>();
+        check(&n(&["wood", "iron-plate", "coal", "copper-plate", "stone", "iron-ore"]), &n(&["wood", "coal", "stone", "iron-ore", "iron-plate", "copper-plate"]));
+        check(&n(&["signal-Z", "signal-A", "signal-0", "signal-red", "signal-check", "signal-B"]), &n(&["signal-0", "signal-A", "signal-B", "signal-Z", "signal-red", "signal-check"]));
+        check(&n(&["water", "coal", "signal-A", "iron-plate", "crude-oil", "signal-dot"]), &n(&["coal", "iron-plate", "water", "crude-oil", "signal-A", "signal-dot"]));
+        check(
+            &[q("signal-A", 2), q("signal-A", 0), q("signal-B", 1), q("signal-A", 4), q("signal-A", 1), q("coal", 3)],
+            &[q("coal", 3), q("signal-A", 0), q("signal-A", 1), q("signal-A", 2), q("signal-A", 4), q("signal-B", 1)],
+        );
     }
 }

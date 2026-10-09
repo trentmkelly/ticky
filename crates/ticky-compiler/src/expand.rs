@@ -537,6 +537,50 @@ impl<'a> Expander<'a> {
         self.parallel_assign(names, banks, span, out);
     }
 
+    /// `for s, v in b.items():` (or `for s in b.keys():`): visits the signals of a snapshot of
+    /// `b` from the largest value (`ascending=True`: the smallest), ties in the game's signal
+    /// order. Each iteration takes the top signal with a selector and removes it from the
+    /// snapshot.
+    #[allow(clippy::too_many_arguments)]
+    fn bundle_loop(&mut self, target: &Expr, base: &Expr, items: bool, kwargs: &[(String, Expr)], body: &[Stmt], span: Span, out: &mut Vec<Stmt>) -> Result<(), Diag> {
+        if self.every {
+            return Err(Diag::error(span, "a loop over a bundle's signals can't be used in an `every` block")
+                .with_help("it takes a few ticks per signal; write it in the main program or a process, or use a comprehension"));
+        }
+        let mut ascending = false;
+        for (k, v) in kwargs {
+            match (k.as_str(), self.fold(v)) {
+                ("ascending", Some(x)) => ascending = x != 0,
+                ("ascending", None) => return Err(Diag::error(v.span, "`ascending` must be a constant (True or False)")),
+                _ => return Err(Diag::error(v.span, format!("`.items()` doesn't take `{k}`"))),
+            }
+        }
+        let (s_target, v_target) = match (&target.kind, items) {
+            (ExprKind::Tuple(ts), true) if ts.len() == 2 => (&ts[0], Some(&ts[1])),
+            (ExprKind::Name(_), false) => (target, None),
+            (_, true) => return Err(Diag::error(target.span, "loop over `.items()` with two names: `for s, v in b.items():`")),
+            (_, false) => return Err(Diag::error(target.span, "loop over `.keys()` with one name: `for s in b.keys():`")),
+        };
+        let b = self.expr_scalar(base, out)?;
+        let rest = self.temp();
+        out.push(assign(&rest, b, span));
+        let k = self.temp();
+        let top = self.temp();
+        let mut pre = vec![assign(&top, call("#rank", vec![name(&rest, span), int(0, span), Expr { kind: ExprKind::Bool(!ascending), span }], span), span)];
+        self.assign_to(s_target, Val::Scalar(call("#hot", vec![name(&top, span)], span)), span, &mut pre)?;
+        if let Some(v) = v_target {
+            self.assign_to(v, Val::Scalar(call("#total", vec![name(&top, span)], span)), span, &mut pre)?;
+        }
+        pre.push(assign(&rest, bin(BinOp::Sub, name(&rest, span), name(&top, span), span), span));
+        self.loops.push(Loop::Real);
+        let b = self.stmts(body);
+        self.loops.pop();
+        pre.extend(b?);
+        let range = call("range", vec![call("len", vec![name(&rest, span)], span)], span);
+        out.push(stmt(StmtKind::For { target: name(&k, span), iter: range, body: pre }, span));
+        Ok(())
+    }
+
     /// `x in arr` for a signal array.
     fn mem_in(&mut self, banks: &[Expr], n: usize, x: Expr, span: Span, out: &mut Vec<Stmt>) -> Expr {
         let x = self.bind(x, out);
@@ -843,6 +887,22 @@ impl<'a> Expander<'a> {
                     }
                     // A bundle method: `b.total()`, `b.items()`, …
                     let b = self.scalar(bv, base.span)?;
+                    // `b.nth(k)`: the signal ranked `k` from the largest, and its value.
+                    if m == "nth" {
+                        let [k] = args.as_slice() else {
+                            return Err(Diag::error(span, "`.nth(k)` takes one argument: the rank (0 is the largest)"));
+                        };
+                        if let Some((kw, _)) = kwargs.first() {
+                            return Err(Diag::error(span, format!("`.nth()` doesn't take a keyword argument `{kw}`")));
+                        }
+                        let k = self.expr_scalar(k, out)?;
+                        let (b, k) = (self.bind(b, out), self.bind(k, out));
+                        let top = call("#rank", vec![b, k, Expr { kind: ExprKind::Bool(true), span }], span);
+                        return Ok(Val::Tuple(vec![
+                            Val::Scalar(call("#hot", vec![top.clone()], span)),
+                            Val::Scalar(call("#total", vec![top], span)),
+                        ]));
+                    }
                     let mut a = Vec::new();
                     for x in args {
                         a.push(self.expr_scalar(x, out)?);
@@ -1969,6 +2029,14 @@ impl<'a> Expander<'a> {
     }
 
     fn for_loop(&mut self, target: &Expr, iter: &Expr, body: &[Stmt], span: Span, out: &mut Vec<Stmt>) -> Result<(), Diag> {
+        // `for s, v in b.items():` / `for s in b.keys():` over a bundle.
+        if let ExprKind::Call { func, args, kwargs } = &iter.kind {
+            if let ExprKind::Attr(base, m) = &func.kind {
+                if (m == "items" || m == "keys") && args.is_empty() && !matches!(&base.kind, ExprKind::Name(n) if self.shapes.get(&self.resolve(n)).is_some_and(|s| *s != Shape::Scalar)) {
+                    return self.bundle_loop(target, base, m == "items", kwargs, body, span, out);
+                }
+            }
+        }
         let ExprKind::Name(t) = &target.kind else {
             return Err(Diag::error(target.span, "the loop variable must be a single name"));
         };

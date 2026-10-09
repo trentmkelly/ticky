@@ -23,7 +23,7 @@ use ticky_syntax::{Diag, Span};
 
 use crate::fuse::{is_true, LoadVal, WriterPlan};
 use crate::ir::{BOp, BTerm, Dnf, FOut, Graph, Lit, Op, V};
-use crate::program::{Next, Program, SrcKind, StepKind, Ty, WaitN};
+use crate::program::{Next, Program, SrcKind, StepKind, WaitN};
 
 /// A bundle value: everything its producers output, on its own wires (never the bus).
 type BRef = usize;
@@ -438,6 +438,17 @@ impl Cg {
                 self.bread(rb, id, false);
                 self.bprod(out, id);
             }
+            Op::BSelectAt(b, max, ix) => {
+                // The rank comes from the index signal on its own wire (green); the selector
+                // reads both wires, and the index signal takes no part in the ranking.
+                let index = SignalTable::base().index_signal();
+                let label = if max { "rank k from the largest" } else { "rank k from the smallest" };
+                let id = self.loose(Kind::Selector(Selector::SelectAt { max, index }), format!("{what}: {label}"));
+                let (rb, ri) = (r(b).bun(), r(ix).bun());
+                self.bread(rb, id, false);
+                self.bread(ri, id, true);
+                self.bprod(out, id);
+            }
             _ => unreachable!("not a bundle node"),
         }
     }
@@ -455,6 +466,16 @@ impl Cg {
             let (rb, ri) = (r(b).bun(), r(ix).bun());
             self.bread(rb, id, false);
             self.bread(ri, id, true);
+            self.nets[0].members.push((id, Conn::OutGreen));
+            return;
+        }
+        if let Op::BDot(a, b) = *g.op(v) {
+            // `each(a) * each(b)`, summed onto one signal: with `b` one-hot, a's value there.
+            let ar = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Sig(each), second_nets: Nets::GREEN, op: ArOp::Mul, out };
+            let id = self.loose(Kind::Arith(ar), format!("{what}: read a signal's value"));
+            let (ra, rb) = (r(a).bun(), r(b).bun());
+            self.bread(ra, id, false);
+            self.bread(rb, id, true);
             self.nets[0].members.push((id, Conn::OutGreen));
             return;
         }
@@ -502,8 +523,8 @@ impl Cg {
     fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Ref, what: &str) -> Result<HashMap<V, Ref>, Diag> {
         let live: Vec<V> = g.reachable(roots);
         let is_scalar_op = |v: V| matches!(g.op(v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_));
-        let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..));
-        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..));
+        let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..));
+        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..));
         let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
 
         // Split the logic into clusters of consecutive combinators. A value whose consumers
@@ -539,6 +560,7 @@ impl Cg {
         }
         // Where a value is, for combinators that read bundles (never cluster-local values).
         let locate = |u: V| -> Ref {
+            let u = through_sig(g, u);
             match *g.op(u) {
                 Op::Const(k) => Ref::Op(Operand::Const(k)),
                 Op::Src(s) => src(s),
@@ -884,7 +906,16 @@ fn lits(d: &Dnf, f: &dyn Fn(&Lit) -> Cond) -> CDnf {
 }
 
 /// Where any node is, given the sources and the emitted nodes.
+/// A runtime signal's one-hot bundle (`SigOf` is only a type marker).
+fn through_sig(g: &Graph, mut v: V) -> V {
+    while let Op::SigOf(x) = *g.op(v) {
+        v = x;
+    }
+    v
+}
+
 fn locate(g: &Graph, v: V, src: &dyn Fn(u32) -> Ref, nodes: &HashMap<V, Ref>) -> Ref {
+    let v = through_sig(g, v);
     match *g.op(v) {
         Op::Const(k) => Ref::Op(Operand::Const(k)),
         Op::Src(s) => src(s),
@@ -982,7 +1013,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     // State signals first, so they get the most readable names (letters).
     let mut state_sig: HashMap<usize, Sig> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {
-        if s.owner.is_some() && live[si] && s.ty != Ty::Bundle && !comb.contains(&si) {
+        if s.owner.is_some() && live[si] && !s.ty.is_bun() && !comb.contains(&si) {
             state_sig.insert(si, first());
         }
     }
@@ -1003,7 +1034,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     };
     let mut state_bun: HashMap<usize, BRef> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {
-        if s.owner.is_some() && live[si] && s.ty == Ty::Bundle && !comb.contains(&si) {
+        if s.owner.is_some() && live[si] && s.ty.is_bun() && !comb.contains(&si) {
             state_bun.insert(si, cg.bnew());
         }
     }
@@ -1056,7 +1087,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         if port.dir != PortDir::Input {
             continue;
         }
-        let bundle = port.ty == Ty::Bundle;
+        let bundle = port.ty.is_bun();
         let (kind, raw) = if bundle {
             // Copies everything on the player's wires onto the program's own bundle wire.
             (arith(Operand::Sig(cg.each), ArOp::Add, Operand::Const(0), cg.each), Ref::Bun(cg.bnew()))
@@ -1208,7 +1239,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         // Bundles: everything on the state's wire while running. Constant bundles: a
         // decider outputting the constants while running.
         let direct = comb_ref.get(&si).copied();
-        let (kind, reads) = match (s.ty == Ty::Bundle, direct.or(shared.state_sig.get(&si).map(|x| Ref::Op(Operand::Sig(*x)))), shared.state_bun.get(&si)) {
+        let (kind, reads) = match (s.ty.is_bun(), direct.or(shared.state_sig.get(&si).map(|x| Ref::Op(Operand::Sig(*x)))), shared.state_bun.get(&si)) {
             (true, Some(Ref::Bun(x)), _) => {
                 let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Sig(run), second_nets: Nets::GREEN, op: ArOp::Mul, out: each };
                 (Kind::Arith(a), Some(x))
@@ -1226,7 +1257,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
             (_, Some(_), _) => unreachable!("output of the wrong kind"),
             (false, None, _) => (arith(Operand::Sig(run), ArOp::Mul, Operand::Const(s.init), port.sig), None),
         };
-        let sends = if s.ty == Ty::Bundle { "its bundle".to_string() } else { t.name(port.sig).to_string() };
+        let sends = if s.ty.is_bun() { "its bundle".to_string() } else { t.name(port.sig).to_string() };
         let label = port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
         let role = if outputs_west {
             Role::OutputGate { name: port.name.clone() }
@@ -1248,7 +1279,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         port_ents[pi] = id;
         if outputs_west {
             // The output port proper: passes on what arrives on its line (red).
-            let pass = if s.ty == Ty::Bundle { each } else { port.sig };
+            let pass = if s.ty.is_bun() { each } else { port.sig };
             let a = Arith { first: Operand::Sig(pass), first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, op: ArOp::Add, out: pass };
             let out = cg.net.add(Kind::Arith(a), Role::OutputPort { name: port.name.clone(), signal: port.sig });
             let e = &mut cg.net.entities[out];
@@ -1308,10 +1339,10 @@ fn pipelined_block(
     let mut node_ref: HashMap<V, Ref> = HashMap::new();
     for &v in &nodes {
         match g.op(v) {
-            Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) => {
+            Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) => {
                 node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
             }
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) => {
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) => {
                 node_ref.insert(v, Ref::Bun(cg.bnew()));
             }
             _ => {}
@@ -1366,7 +1397,7 @@ fn pipelined_block(
             continue;
         }
         let t = tau(v).unwrap() - 1;
-        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) = g.op(v) {
+        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) = g.op(v) {
             // Operands as of this node's input tick, then the combinators.
             let mut ops: HashMap<V, Ref> = HashMap::new();
             for u in g.operands(v) {

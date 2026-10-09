@@ -119,6 +119,8 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
         let dir = if p.dir == PortDir::Input { "input " } else { "output" };
         if p.ty == program::Ty::Bundle {
             desc.push_str(&format!("\n{dir} {}: Bundle (every signal)", p.name));
+        } else if p.ty == program::Ty::Signal {
+            desc.push_str(&format!("\n{dir} {}: Signal (one signal, value 1)", p.name));
         } else {
             desc.push_str(&format!("\n{dir} {}: {} on {}", p.name, p.ty.name(), t.name(p.sig)));
         }
@@ -195,7 +197,12 @@ impl Compiled {
             .filter_map(|e| match &e.role {
                 Role::InputPort { name, signal } | Role::OutputPort { name, signal } => {
                     let dir = if matches!(e.role, Role::InputPort { .. }) { "in" } else { "out" };
-                    let what = if t.name(*signal) == "signal-each" { "bundle" } else { t.name(*signal) };
+                    let ty = self.program.ports.iter().find(|p| &p.name == name).map(|p| p.ty);
+                    let what = match ty {
+                        Some(program::Ty::Bundle) => "bundle",
+                        Some(program::Ty::Signal) => "signal",
+                        _ => t.name(*signal),
+                    };
                     Some(format!("{dir} {name} ({what})"))
                 }
                 _ => None,

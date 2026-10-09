@@ -107,6 +107,7 @@ fn decider_json(t: &SignalTable, d: &Decider) -> Value {
 fn selector_json(t: &SignalTable, s: &Selector) -> Value {
     match s {
         Selector::Select { max, index } => json!({ "operation": "select", "select_max": max, "index_constant": index }),
+        Selector::SelectAt { max, index } => json!({ "operation": "select", "select_max": max, "index_signal": signal_json(t, *index) }),
         Selector::Count { out } => json!({ "operation": "count", "count_signal": signal_json(t, *out) }),
     }
 }

@@ -1,0 +1,60 @@
+# Runtime signals (SPEC §4.2, §4.3.4): a `Signal` value is one signal, carried as that
+# signal with value 1. They come from Signal inputs, `argmax`/`argmin`, `nth` and loops over
+# a bundle's signals.
+input  stock: Bundle
+input  want: Signal               # e.g. a constant combinator with one signal set
+input  k: int @ K
+output top: Signal
+output top_value: int @ V
+output low: Signal
+output kth: Signal
+output kth_value: int @ W
+output wanted: int @ H
+output names: int @ N
+output tagged: Bundle
+
+RARE = S("iron-plate", quality="rare")
+last = S("signal-0")              # a Signal variable with an initial value
+
+every tick:
+    top = stock.argmax()
+    top_value = stock[top]
+    low = stock.argmin()
+    kth, kth_value = stock.nth(k)
+    wanted = want.value_in(stock) if want in stock else -1
+
+while True:
+    wait until len(stock) > 0
+    n = 0
+    for s in stock.keys():        # largest first; ties in the game's signal order
+        if s != last:
+            n += 1
+    names = n
+    tag = {want: 1, last: 2}
+    tag[RARE] = 3
+    tagged = tag
+    last = stock.argmax()
+    wait until stock.argmax() != last
+
+test "every tick":
+    set stock = {"iron-plate": 30, "copper-plate": 50, "coal": 10, "stone": 50}
+    set want = S("coal")
+    set k = 2
+    run 10 ticks
+    assert top == S("stone") and top_value == 50
+    assert low == S("coal")
+    assert kth == S("iron-plate") and kth_value == 30
+    assert wanted == 10
+    set want = S("wood")
+    set k = 7
+    run 10 ticks
+    assert wanted == -1 and kth_value == 0
+
+test "loops and variables":
+    set want = S("coal")
+    set stock = {"iron-plate": 30, "copper-plate": 50}
+    run 30 ticks
+    assert names == 2 and tagged == {"coal": 1, "signal-0": 2, RARE: 3}
+    set stock = {"iron-plate": 30, "copper-plate": 5}
+    run 40 ticks
+    assert names == 1 and tagged == {"coal": 1, "copper-plate": 2, RARE: 3}

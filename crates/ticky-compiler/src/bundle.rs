@@ -81,6 +81,7 @@ pub fn s_call(args: &[Expr], kwargs: &[(String, Expr)], span: Span) -> Result<Si
         return Err(Diag::error(span, "`S` takes a signal name in quotes, e.g. S(\"iron-plate\")"));
     };
     let mut kind = None;
+    let mut quality = 0u8;
     for (k, v) in kwargs {
         match (k.as_str(), &v.kind) {
             ("type", ExprKind::Str(t)) => {
@@ -89,11 +90,16 @@ pub fn s_call(args: &[Expr], kwargs: &[(String, Expr)], span: Span) -> Result<Si
                         .with_help("use \"item\", \"fluid\", \"virtual\", \"recipe\", \"quality\", \"space-location\" or \"asteroid-chunk\"")
                 })?);
             }
-            ("quality", _) => return Err(Diag::error(v.span, "quality signals aren't supported yet")),
+            ("quality", ExprKind::Str(q)) => {
+                quality = ticky_factorio::QUALITIES.iter().position(|x| x == q).ok_or_else(|| {
+                    Diag::error(v.span, format!("unknown quality \"{q}\"")).with_help("use \"normal\", \"uncommon\", \"rare\", \"epic\" or \"legendary\"")
+                })? as u8;
+            }
             _ => return Err(Diag::error(v.span, format!("`S` doesn't take `{k}`"))),
         }
     }
-    Ok(exact(name, kind, span))
+    let sig = exact(name, kind, span);
+    Ok(SignalTable::base().with_quality(sig, quality))
 }
 
 /// What a value is.
@@ -101,11 +107,23 @@ pub fn s_call(args: &[Expr], kwargs: &[(String, Expr)], span: Span) -> Result<Si
 pub enum Kind {
     Int,
     Bundle,
+    /// A signal known when compiling (`S("iron-plate")`).
     Signal,
+    /// A signal only known at run time (`b.argmax()`, a `Signal` variable): a one-hot bundle.
+    SigVal,
+}
+
+impl Kind {
+    /// Either kind of signal.
+    pub fn is_signal(self) -> bool {
+        matches!(self, Kind::Signal | Kind::SigVal)
+    }
 }
 
 pub fn kind(g: &Graph, v: V) -> Kind {
-    if g.is_bundle(v) {
+    if g.is_sigval(v) {
+        Kind::SigVal
+    } else if g.is_bundle(v) {
         Kind::Bundle
     } else if g.as_sig(v).is_some() {
         Kind::Signal
@@ -120,8 +138,43 @@ pub fn int(g: &Graph, v: V, span: Span) -> Result<V, Diag> {
         Kind::Int => Ok(v),
         Kind::Bundle => Err(Diag::error(span, "expected a number, but this is a bundle")
             .with_help("read one signal with `b[S(\"name\")]` or `b.name`, or reduce it with `b.total()`, `len(b)` or `max(b.values())`")),
-        Kind::Signal => Err(Diag::error(span, "expected a number, but this is a signal")
+        Kind::Signal | Kind::SigVal => Err(Diag::error(span, "expected a number, but this is a signal")
             .with_help("signals name bundle entries, e.g. `stock[sig]`")),
+    }
+}
+
+/// A bundle key: a signal known when compiling, or a runtime signal (its one-hot bundle).
+pub enum Key {
+    Const(Sig),
+    Dyn(V),
+}
+
+/// A key for indexing that may be a runtime signal.
+pub fn key_any(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<Key, Diag> {
+    if let ExprKind::Str(n) = &e.kind {
+        return Ok(Key::Const(exact(n, None, e.span)));
+    }
+    let v = lower::expr(g, names, e)?;
+    match kind(g, v) {
+        Kind::Signal => Ok(Key::Const(g.as_sig(v).unwrap())),
+        Kind::SigVal => Ok(Key::Dyn(g.unsig(v))),
+        _ => Err(Diag::error(e.span, "expected a signal here").with_help("write S(\"name\"), a signal constant or a `Signal` value")),
+    }
+}
+
+/// `b[k]`.
+pub fn get(g: &mut Graph, b: V, k: Key) -> V {
+    match k {
+        Key::Const(s) => g.bget(b, s),
+        Key::Dyn(h) => g.bdot(b, h),
+    }
+}
+
+/// `b` with `b[k] = x`.
+pub fn set(g: &mut Graph, b: V, k: Key, x: V) -> V {
+    match k {
+        Key::Const(s) => g.bset(b, s, x),
+        Key::Dyn(h) => g.bset_dyn(b, h, x),
     }
 }
 
@@ -158,7 +211,7 @@ fn arop(op: BinOp) -> ArOp {
 /// `a op b` where at least one side is a bundle.
 pub fn binop(g: &mut Graph, op: BinOp, a: V, b: V, span: Span) -> Result<V, Diag> {
     let (ka, kb) = (kind(g, a), kind(g, b));
-    if ka == Kind::Signal || kb == Kind::Signal {
+    if ka.is_signal() || kb.is_signal() {
         return Err(Diag::error(span, "signals can't be used in arithmetic"));
     }
     let o = arop(op);
@@ -229,16 +282,22 @@ fn sum_terms(g: &mut Graph, parts: Vec<BTerm>) -> V {
 /// A dict literal: keys are signal names in quotes or signal values.
 pub fn dict(g: &mut Graph, names: &mut dyn Names, items: &[(Expr, Expr)]) -> Result<V, Diag> {
     let mut last: Vec<(Sig, V)> = Vec::new();
+    let mut keys = Vec::new();
     for (k, e) in items {
-        let sig = match &k.kind {
-            ExprKind::Str(n) => exact(n, None, k.span),
-            _ => {
-                let kv = lower::expr(g, names, k)?;
-                signal(g, kv, k.span)?
-            }
-        };
+        let key = key_any(g, names, k)?;
         let v = lower::expr(g, names, e)?;
-        let v = int(g, v, e.span)?;
+        keys.push((key, int(g, v, e.span)?));
+    }
+    // Runtime keys may equal each other or a constant key: set them one by one.
+    if keys.iter().any(|(k, _)| matches!(k, Key::Dyn(_))) {
+        let mut acc = g.empty_bundle();
+        for (k, v) in keys {
+            acc = set(g, acc, k, v);
+        }
+        return Ok(acc);
+    }
+    for (key, v) in keys {
+        let Key::Const(sig) = key else { unreachable!() };
         // Like a Python dict, a repeated key keeps its last value.
         last.retain(|(s, _)| *s != sig);
         last.push((sig, v));

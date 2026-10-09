@@ -147,13 +147,20 @@ pub enum Op {
     Each,
     /// A signal constant (`S("iron-plate")`): used as a bundle key, never computed.
     SigK(Sig),
+    /// A runtime `Signal` value: the one-hot bundle `x` (that signal with value 1, or no
+    /// signal at all). Only for typing: consumers use `x` itself ([`Graph::unsig`]).
+    SigOf(V),
+    /// Like `BSelect`, with the rank read at runtime from bundle `ix` (just the index signal).
+    BSelectAt(V, bool, V),
+    /// Scalar: `Σ a[s] · b[s]` (with `b` one-hot: `a`'s value of that signal).
+    BDot(V, V),
 }
 
 impl Op {
     /// Whether the node's value is a bundle.
     pub fn is_bundle(&self, src_bun: &[bool]) -> bool {
         match self {
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) => true,
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) => true,
             Op::Src(s) => src_bun.get(*s as usize).copied().unwrap_or(false),
             _ => false,
         }
@@ -254,6 +261,7 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
         Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::AGet(..) | Op::Each | Op::SigK(_) => Iv::FULL,
+        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) => Iv::FULL,
         Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
@@ -338,6 +346,8 @@ pub struct Graph {
     pub src_iv: Vec<Iv>,
     /// Which sources are bundles.
     pub src_bun: Vec<bool>,
+    /// Which sources are runtime `Signal` values (one-hot bundles).
+    pub src_sig: Vec<bool>,
     bun: Vec<bool>,
     /// Whether each node depends on the comprehension placeholder ([`Op::Each`]).
     each_dep: Vec<bool>,
@@ -408,6 +418,11 @@ impl Graph {
 
     pub fn sigk(&mut self, s: Sig) -> V {
         self.intern(Op::SigK(s))
+    }
+
+    /// Interns `op` as it is (for rebuilding nodes without simplification).
+    pub fn intern_op(&mut self, op: Op) -> V {
+        self.intern(op)
     }
 
     fn intern(&mut self, op: Op) -> V {
@@ -548,8 +563,13 @@ impl Graph {
         r
     }
 
-    /// Python truthiness as a 0/1 value (a bundle is true when it has any signal).
+    /// Python truthiness as a 0/1 value (a bundle is true when it has any signal; a runtime
+    /// signal when it is one, i.e. not "no signal").
     pub fn truth(&mut self, v: V) -> V {
+        if self.is_sigval(v) {
+            let b = self.unsig(v);
+            return self.truth(b);
+        }
         if self.is_bundle(v) {
             let n = self.bcount(v);
             let z = self.konst(0);
@@ -631,6 +651,13 @@ impl Graph {
         }
         if a == b {
             return a;
+        }
+        // Signals (runtime, or different constants): select between one-hot bundles.
+        let sig = |g: &Self, v: V| g.is_sigval(v) || g.as_sig(v).is_some();
+        if sig(self, a) && sig(self, b) {
+            let (x, y) = (self.unsig(a), self.unsig(b));
+            let m = self.mux(t, x, y);
+            return self.sigval(m);
         }
         if self.is_bundle(a) {
             let f = self.not(t);
@@ -898,6 +925,88 @@ impl Graph {
         self.intern(Op::BCount(b))
     }
 
+    // ------------------------------------------------------------------ runtime signals
+
+    /// Whether `v` is a runtime `Signal` value.
+    pub fn is_sigval(&self, v: V) -> bool {
+        match self.nodes[v as usize] {
+            Op::SigOf(_) => true,
+            Op::Src(s) => self.src_sig.get(s as usize).copied().unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// A signal (runtime or constant) as its one-hot bundle; anything else unchanged.
+    pub fn unsig(&mut self, v: V) -> V {
+        match self.nodes[v as usize] {
+            Op::SigOf(x) => x,
+            Op::SigK(s) => self.bconst([(s, 1)]),
+            _ => v,
+        }
+    }
+
+    /// Marks one-hot bundle `b` as a runtime `Signal` value.
+    pub fn sigval(&mut self, b: V) -> V {
+        if self.is_sigval(b) {
+            return b;
+        }
+        self.intern(Op::SigOf(b))
+    }
+
+    /// The signal of a bundle with (at most) one signal: that signal with value 1.
+    pub fn onehot(&mut self, b: V) -> V {
+        if let Some(vals) = self.as_bconst(b) {
+            let one: BVals = vals.iter().map(|(s, _)| (*s, 1)).collect();
+            let k = self.bconst(one);
+            return self.sigval(k);
+        }
+        let z = self.konst(0);
+        let nz = vec![vec![BLit { op: CmpOp::Ne, a: BOp::Each, b: BOp::Val(z) }]];
+        let h = self.bun(vec![BTerm::Filter(b, nz, FOut::Const(1))]);
+        self.sigval(h)
+    }
+
+    /// `Σ a[s] · b[s]`: with `b` one-hot, `a`'s value of `b`'s signal.
+    pub fn bdot(&mut self, a: V, b: V) -> V {
+        if let Some(vals) = self.as_bconst(b).cloned() {
+            let mut acc = self.konst(0);
+            for (s, k) in vals {
+                let x = self.bget(a, s);
+                let kv = self.konst(k);
+                let t = self.ar(ArOp::Mul, x, kv);
+                acc = self.ar(ArOp::Add, acc, t);
+            }
+            return acc;
+        }
+        if self.as_bconst(a).is_some() {
+            return self.bdot(b, a);
+        }
+        self.intern(Op::BDot(a, b))
+    }
+
+    /// `b` with signal `s` (a one-hot bundle) set to `x`.
+    pub fn bset_dyn(&mut self, b: V, s: V, x: V) -> V {
+        if let Some(vals) = self.as_bconst(s).cloned() {
+            return match vals.as_slice() {
+                [] => b,
+                [(sig, _)] => self.bset(b, *sig, x),
+                _ => unreachable!("a signal value has one signal"),
+            };
+        }
+        let z = self.konst(0);
+        let missing = vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]];
+        self.bun(vec![BTerm::DFilter(b, s, missing, FOut::Copy), BTerm::Map(ArOp::Mul, s, x)])
+    }
+
+    /// Like [`Graph::brank`], with a runtime rank `k`.
+    pub fn brank_at(&mut self, b: V, max: bool, k: V) -> V {
+        if let Some(k) = self.as_const(k) {
+            return if k < 0 { self.bconst([]) } else { self.brank(b, max, k as u32) };
+        }
+        let ix = self.bun(vec![BTerm::Shift(SignalTable::base().index_signal(), k, 0)]);
+        self.intern(Op::BSelectAt(b, max, ix))
+    }
+
     pub fn bselect(&mut self, b: V, max: bool) -> V {
         self.brank(b, max, 0)
     }
@@ -907,10 +1016,11 @@ impl Graph {
     pub fn brank(&mut self, b: V, max: bool, index: u32) -> V {
         if let Some(vals) = self.as_bconst(b) {
             let mut v = vals.clone();
+            let t = SignalTable::base();
             if max {
-                v.sort_by_key(|(s, x)| (std::cmp::Reverse(*x), *s));
+                v.sort_by_key(|(s, x)| (std::cmp::Reverse(*x), t.rank(*s)));
             } else {
-                v.sort_by_key(|(s, x)| (*x, *s));
+                v.sort_by_key(|(s, x)| (*x, std::cmp::Reverse(t.rank(*s))));
             }
             let one: BVals = v.get(index as usize).into_iter().copied().collect();
             return self.bconst(one);
@@ -1136,8 +1246,8 @@ impl Graph {
             Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],
-            Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) => vec![b],
-            Op::AGet(b, ix) => vec![b, ix],
+            Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) | Op::SigOf(b) => vec![b],
+            Op::AGet(b, ix) | Op::BSelectAt(b, _, ix) | Op::BDot(b, ix) => vec![b, ix],
         }
     }
 

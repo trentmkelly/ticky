@@ -375,3 +375,50 @@ ties the grid's footprint and saves relays.
   output nonzero, otherwise identical values and error 0: 200 programs, 0 failures.
 - Example `checks` (first line `# ticky: --checks`, which tests/examples.rs honours) matches
   the game, including a block division by zero, an assert and a RUN reset.
+
+## 2026-10-09 — Level 6: runtime signals, bundle iteration
+
+### Verified first
+- **Selector ties** (scenario `tieprobe`): deterministic and independent of slot order;
+  `select` max ranks equal values items < fluids < virtual, each in prototype order (our
+  table's order within a kind), then by quality; min is exactly max reversed. The simulator
+  used signal-table order (virtual first) and the same order for min: fixed with
+  `SignalTable::rank`, also used when folding constant ranks. Test
+  `selector_ties_match_the_game`.
+- **Selector with an index signal** (scenario `selprobe`): the index signal is read and takes
+  no part in the ranking; missing = 0; past the end, nothing. New `Selector::SelectAt`. The
+  selector reads both wires, so the index sits on its own wire (a `Shift` term), never the bus.
+- **Lamps** (for `--checks`) and quality output signals in bundles: in the examples below.
+
+### Runtime `Signal` values
+- A runtime signal is a one-hot bundle; `Op::SigOf(b)` marks it for typing only (a user's
+  `Bundle(iron=1)` constant is the same node as the signal `iron`, so the mark can't live on
+  the node). Every consumer unwraps (`Graph::unsig`); `SigOf` never reaches fusion or codegen
+  (`locate` looks through it anyway). Signal-typed sources (`src_sig`) are bundle registers.
+- New IR: `BDot(a, b)` (`each(red) × each(green)` summed onto one signal: `b[s]`, `s in b`),
+  `BSelectAt(b, max, ix)`, `onehot` (filter `each != 0 → each = 1`), `bset_dyn` (domain filter
+  "where `s` is 0" copying `b`, plus `s × x`). `g.mux` selects between signals (runtime or
+  different constants) as bundles; `truth` of a signal is "is a signal".
+- `bundle::Kind::SigVal`; `Key::{Const, Dyn}` for `b[k]`, `b[k] = x`, `.get`, `in`, dict keys
+  (runtime keys are set one by one, so repeats keep the last value).
+- `Ty::Signal` (bundle-like: `Ty::is_bun`), inferred syntactically (`signal_names`: `S(…)`,
+  `.argmax()/.argmin()`, `#hot`, copies, choices) or annotated; prologue constants become the
+  initial one-hot value. `Signal` ports: no `@`; inputs read the argmax of their wire
+  (normalised when read), outputs send the one-hot bundle. CLI `--set want=coal`.
+- `S(name, quality="rare")`.
+
+### `argmax`/`argmin`/`nth`, bundle iteration
+- `argmax()` = `onehot(brank(b, max, 0))`, 2 ticks. `s, v = b.nth(k)` is expanded into a tuple
+  of `#hot(#rank(b, k, True))` and `#total(…)`; a runtime `k` uses `BSelectAt`.
+- `for s, v in b.items(ascending=…):` / `for s in b.keys():` (sequential code only):
+  `rest = b; for k in range(len(rest)): top = #rank(rest, 0, max); s = #hot(top);
+  v = #total(top); rest = rest - top; body`. 4 ticks per iteration; `break`/`continue` work.
+
+### Status
+- New examples `signals` (every-tick argmax/argmin/runtime nth/value_in, keys() loop, runtime
+  dict keys, a rare-quality signal, Signal ports and state), `dispatch` (§15.7: 3 ticks per
+  dispatch, 15 combinators), `ranking` (items() loops both ways, nth, `in`, runtime key
+  writes); all match the game, including ties across items, fluids and virtual signals.
+- `tools/fuzz_signals.py`: random bundles with ties and negatives through loops (both orders,
+  break/continue), signal comparisons, runtime-key writes, argmax/argmin and runtime nth,
+  against a Python model of the game's order: 150 programs, 0 failures.

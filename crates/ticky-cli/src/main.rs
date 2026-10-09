@@ -243,7 +243,13 @@ fn parse_sets(c: &Compiled, sets: &[String]) -> Result<Vec<(u64, usize, PVal)>, 
             .port_index(name)
             .filter(|&i| c.program.ports[i].dir == PortDir::Input)
             .ok_or(format!("`{name}` is not an input port"))?;
-        let v = if c.program.ports[pi].ty == Ty::Bundle { parse_bundle(val)? } else { PVal::Int(int(val)?) };
+        let v = match c.program.ports[pi].ty {
+            Ty::Bundle => parse_bundle(val)?,
+            // A Signal input: `name` (that signal = 1), or a bundle.
+            Ty::Signal if !val.contains([':', '=']) && !val.starts_with('{') => parse_bundle(&format!("{val}:1"))?,
+            Ty::Signal => parse_bundle(val)?,
+            _ => PVal::Int(int(val)?),
+        };
         out.push((tick, pi, v));
     }
     out.sort_by_key(|s| s.0);
@@ -308,7 +314,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
             lua_str(if p.dir == PortDir::Input { "in" } else { "out" }),
             c.cg.port_ents[i] + 1,
             sig(p.sig),
-            p.ty == Ty::Bundle
+            p.ty.is_bun()
         ));
     }
     let sets: Vec<String> = sets

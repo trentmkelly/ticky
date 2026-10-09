@@ -1,0 +1,29 @@
+# Train dispatcher (SPEC §15.7): when a train is waiting, send it to the station with the
+# largest demand. Each station's demand is on its own virtual signal.
+input  demand: Bundle
+input  train_waiting: bool @ T
+output send_to: Signal
+
+while True:
+    wait until train_waiting
+    send_to = demand.argmax()
+    wait until not train_waiting
+
+test "the largest demand wins":
+    set demand = {"signal-A": 3, "signal-B": 9, "signal-C": 5}
+    set train_waiting = 1
+    run 10 ticks
+    assert send_to == S("signal-B")
+    set train_waiting = 0
+    set demand = {"signal-A": 30, "signal-B": 9}
+    run 10 ticks
+    assert send_to == S("signal-B")     # no train: unchanged
+    set train_waiting = 1
+    run 10 ticks
+    assert send_to == S("signal-A")
+
+test "ties go to the first signal in the game's order":
+    set demand = {"signal-C": 4, "signal-A": 4, "signal-B": 4}
+    set train_waiting = 1
+    run 10 ticks
+    assert send_to == S("signal-A")

@@ -73,6 +73,9 @@ pub struct ConstComb {
 pub enum Selector {
     /// The input signal ranked `index` (0-based) by value, largest first if `max`.
     Select { max: bool, index: i32 },
+    /// Like `Select`, with the rank read from signal `index` on the inputs (which takes no
+    /// part in the ranking; verified with the `selprobe` scenario).
+    SelectAt { max: bool, index: Sig },
     /// How many distinct signals the input has, on `out`.
     Count { out: Sig },
 }

@@ -85,7 +85,7 @@ impl<'a> Harness<'a> {
 
     pub fn get(&self, port: usize) -> PVal {
         let p = &self.c.program.ports[port];
-        let bundle = p.ty == Ty::Bundle;
+        let bundle = p.ty.is_bun();
         match p.dir {
             PortDir::Input => self.inputs.get(&port).cloned().unwrap_or(if bundle { PVal::Bun(vec![]) } else { PVal::Int(0) }),
             PortDir::Output if bundle => PVal::Bun(normalize(self.sim.outputs_of(self.c.cg.port_ents[port]).iter().copied())),
@@ -105,7 +105,9 @@ impl<'a> Harness<'a> {
             fn lookup(&mut self, g: &mut Graph, name: &str, span: Span) -> Result<V, Diag> {
                 let h = self.0;
                 if let Some(pi) = h.c.program.port_index(name) {
-                    return Ok(g.cv(&h.get(pi).cv()));
+                    let v = g.cv(&h.get(pi).cv());
+                    // A Signal port's value is a signal (compare it with `S("…")`).
+                    return Ok(if h.c.program.ports[pi].ty == Ty::Signal { g.sigval(v) } else { v });
                 }
                 if let Some(k) = h.c.program.consts.get(name) {
                     return Ok(g.cv(k));
@@ -134,6 +136,8 @@ impl<'a> Harness<'a> {
                 let v = match (self.c.program.ports[pi].ty, self.eval(value)?) {
                     (Ty::Bundle, Cv::Bun(b)) => PVal::Bun(b),
                     (Ty::Bundle, _) => return Err(Diag::error(value.span, format!("`{name}` is a bundle input; set it to a bundle"))),
+                    (Ty::Signal, Cv::Sig(sg)) => PVal::Bun(vec![(sg, 1)]),
+                    (Ty::Signal, _) => return Err(Diag::error(value.span, format!("`{name}` is a Signal input; set it to a signal, e.g. S(\"iron-plate\")"))),
                     (_, Cv::Int(k)) => PVal::Int(k),
                     _ => return Err(Diag::error(value.span, format!("`{name}` takes a number"))),
                 };

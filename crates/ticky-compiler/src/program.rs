@@ -35,6 +35,8 @@ pub enum Ty {
     Int,
     Bool,
     Bundle,
+    /// A runtime signal: carried as a one-hot bundle (that signal with value 1).
+    Signal,
 }
 
 impl Ty {
@@ -43,7 +45,13 @@ impl Ty {
             Ty::Int => "int",
             Ty::Bool => "bool",
             Ty::Bundle => "Bundle",
+            Ty::Signal => "Signal",
         }
+    }
+
+    /// Carried as a bundle (on its own wires).
+    pub fn is_bun(self) -> bool {
+        matches!(self, Ty::Bundle | Ty::Signal)
     }
 }
 
@@ -266,10 +274,6 @@ impl Program {
     }
 }
 
-fn not_yet(span: Span, what: &str, level: u32) -> Diag {
-    Diag::error(span, format!("{what} isn't supported yet (planned for level {level})"))
-}
-
 /// Every name assigned anywhere in `body`, with the first assignment's span.
 fn assigned_names(body: &[Stmt], out: &mut BTreeMap<String, Span>, errs: &mut Vec<Diag>) {
     fn target(e: &Expr, out: &mut BTreeMap<String, Span>, errs: &mut Vec<Diag>) {
@@ -418,8 +422,8 @@ fn parse_type(e: &Expr) -> Result<Ty, Diag> {
         ExprKind::Name(n) if n == "int" => Ok(Ty::Int),
         ExprKind::Name(n) if n == "bool" => Ok(Ty::Bool),
         ExprKind::Name(n) if n == "Bundle" => Ok(Ty::Bundle),
-        ExprKind::Name(n) if n == "Signal" => Err(not_yet(e.span, "`Signal`", 6)),
-        _ => Err(Diag::error(e.span, "expected a type: `int`, `bool` or `Bundle`")),
+        ExprKind::Name(n) if n == "Signal" => Ok(Ty::Signal),
+        _ => Err(Diag::error(e.span, "expected a type: `int`, `bool`, `Bundle` or `Signal`")),
     }
 }
 
@@ -429,7 +433,7 @@ fn is_bundle_expr(e: &Expr, bundles: &HashSet<String>) -> bool {
         ExprKind::Dict(_) | ExprKind::DictComp { .. } => true,
         ExprKind::Name(n) => bundles.contains(n),
         ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n)
-            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx")),
+            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx" | "#rank")),
         ExprKind::Binary(_, a, b) => is_bundle_expr(a, bundles) || is_bundle_expr(b, bundles),
         ExprKind::Unary(_, a) => is_bundle_expr(a, bundles),
         ExprKind::IfExp { then, orelse, .. } => is_bundle_expr(then, bundles) || is_bundle_expr(orelse, bundles),
@@ -539,6 +543,78 @@ fn bundle_names(bodies: &[&[Stmt]], mut known: HashSet<String>) -> HashSet<Strin
     }
 }
 
+/// Whether an expression is (syntactically) a runtime-capable signal, given the names known
+/// to hold signals: `S(...)`, `.argmax()`/`.argmin()`, a loop's signal (`#hot`), a signal name,
+/// or a choice between those.
+fn is_signal_expr(e: &Expr, sigs: &HashSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Name(n) => sigs.contains(n),
+        ExprKind::Call { func, args, .. } => match &func.kind {
+            ExprKind::Name(n) => n == "S" || n == "#hot",
+            ExprKind::Attr(_, m) => args.is_empty() && (m == "argmax" || m == "argmin"),
+            _ => false,
+        },
+        ExprKind::IfExp { then, orelse, .. } => is_signal_expr(then, sigs) || is_signal_expr(orelse, sigs),
+        _ => false,
+    }
+}
+
+/// Names that hold signals (to a fixpoint, through copies).
+fn signal_names(bodies: &[&[Stmt]], mut known: HashSet<String>) -> HashSet<String> {
+    fn scan(body: &[Stmt], known: &mut HashSet<String>) -> bool {
+        fn mark(t: &Expr, v: &Expr, known: &mut HashSet<String>) -> bool {
+            match (&t.kind, is_signal_expr(v, known)) {
+                (ExprKind::Name(n), true) => known.insert(n.clone()),
+                _ => false,
+            }
+        }
+        let mut changed = false;
+        for s in body {
+            match &s.kind {
+                StmtKind::Assign { targets, value } => {
+                    for t in targets {
+                        match (&t.kind, &value.kind) {
+                            (ExprKind::Tuple(ts), ExprKind::Tuple(vs)) if ts.len() == vs.len() => {
+                                for (t, v) in ts.iter().zip(vs) {
+                                    changed |= mark(t, v, known);
+                                }
+                            }
+                            _ => changed |= mark(t, value, known),
+                        }
+                    }
+                }
+                StmtKind::AnnAssign { target, ann, value } => {
+                    if matches!(&ann.kind, ExprKind::Name(n) if n == "Signal") {
+                        if let ExprKind::Name(n) = &target.kind {
+                            changed |= known.insert(n.clone());
+                        }
+                    } else if let Some(v) = value {
+                        changed |= mark(target, v, known);
+                    }
+                }
+                StmtKind::If { body, orelse, .. } => {
+                    changed |= scan(body, known);
+                    changed |= scan(orelse, known);
+                }
+                StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Block { body, .. } | StmtKind::Every { body, .. } | StmtKind::Sub { body, .. } => {
+                    changed |= scan(body, known)
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+    loop {
+        let mut changed = false;
+        for b in bodies {
+            changed |= scan(b, &mut known);
+        }
+        if !changed {
+            return known;
+        }
+    }
+}
+
 /// Whether an expression is syntactically boolean (decides the type of un-annotated state).
 fn is_bool_expr(e: &Expr) -> bool {
     match &e.kind {
@@ -587,13 +663,14 @@ pub fn eval_int(e: &Expr, consts: &HashMap<String, Cv>, ports: &[Port]) -> Resul
 fn parse_port(table: &SignalTable, s: &Stmt, consts: &HashMap<String, Cv>) -> Result<Port, Diag> {
     let StmtKind::Port { dir, name, ty, signal, label } = &s.kind else { unreachable!() };
     let ty = parse_type(ty)?;
-    if ty == Ty::Bundle {
+    if ty.is_bun() {
         if let Some((_, sp)) = signal {
-            return Err(Diag::error(*sp, "a bundle port carries every signal, so it has no `@ signal`"));
+            let what = if ty == Ty::Bundle { "a bundle port carries every signal" } else { "a `Signal` port carries a signal (with value 1)" };
+            return Err(Diag::error(*sp, format!("{what}, so it has no `@ signal`")));
         }
     }
     let sig = match signal {
-        _ if ty == Ty::Bundle => table.special("signal-each"),
+        _ if ty.is_bun() => table.special("signal-each"),
         Some((SignalSpec::Ident(n), sp)) => crate::bundle::ident(n, *sp),
         Some((SignalSpec::Exact(n), sp)) => crate::bundle::exact(n, None, *sp),
         Some((SignalSpec::Expr(e), sp)) => match eval_const(e, consts, &[])? {
@@ -820,6 +897,8 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     bodies.extend(procs_src.iter().map(|(_, b)| b.as_slice()));
     bodies.extend(subs.iter().map(|(_, _, b)| b.as_slice()));
     let bundles = bundle_names(&bodies, seed);
+    let sig_seed: HashSet<String> = ports.iter().filter(|p| p.ty == Ty::Signal).map(|p| p.name.clone()).collect();
+    let signals = signal_names(&bodies, sig_seed);
     let mut nonbool = HashSet::new();
     for b in &bodies {
         nonbool_names(b, &mut nonbool);
@@ -887,6 +966,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                 }
             },
             _ if bundles.contains(&n) => Ty::Bundle,
+            _ if signals.contains(&n) => Ty::Signal,
             // A bool only if every assignment is one (`a = x > 0` once doesn't make `a = 5` an error).
             (None, Some((_, None, value, _))) if is_bool_expr(value) && !nonbool.contains(&n) => Ty::Bool,
             _ => Ty::Int,
@@ -897,10 +977,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             (None, _) => {}
             (Some(Cv::Int(k)), Ty::Int | Ty::Bool) => init = *k,
             (Some(Cv::Bun(b)), Ty::Bundle) => binit = b.clone(),
-            (Some(Cv::Sig(_)), _) => {
-                errs.push(Diag::error(span, format!("{} holds a signal, so it can't be changed while running", crate::expand::quoted(&n)))
-                    .with_help("signals that change at runtime come in a later level; use a constant or a bundle"));
-            }
+            (Some(Cv::Sig(sg)), Ty::Signal) => binit = vec![(*sg, 1)],
             (Some(_), _) => errs.push(Diag::error(span, format!("{} is a {}, but its initial value isn't", crate::expand::quoted(&n), ty.name()))),
         }
         if ty == Ty::Bool && !(0..=1).contains(&init) {
@@ -1060,10 +1137,12 @@ impl ProcNames<'_> {
             None => {
                 let states = self.ctx.states;
                 let bun = match kind {
-                    SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) => states[s].ty == Ty::Bundle,
-                    SrcKind::Input(p) | SrcKind::LiveInput(p) => self.ctx.ports[p].ty == Ty::Bundle,
+                    SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) => states[s].ty.is_bun(),
+                    SrcKind::Input(p) | SrcKind::LiveInput(p) => self.ctx.ports[p].ty.is_bun(),
                     SrcKind::Ticks | SrcKind::LiveTicks => false,
                 };
+                // Signal state is a one-hot bundle; a Signal input is normalised when read.
+                let sig = matches!(kind, SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) if states[s].ty == Ty::Signal);
                 let iv = match kind {
                     _ if bun => Iv::FULL,
                     SrcKind::Own(s) => self.own_iv[&s],
@@ -1074,6 +1153,10 @@ impl ProcNames<'_> {
                 self.srcs.push(kind);
                 g.src_iv.push(iv);
                 g.src_bun.push(bun);
+                while g.src_sig.len() < g.src_bun.len() - 1 {
+                    g.src_sig.push(false);
+                }
+                g.src_sig.push(sig);
                 (self.srcs.len() - 1) as SrcId
             }
         };
@@ -1112,6 +1195,10 @@ impl Names for ProcNames<'_> {
                 Some(_) if self.live => self.src_for(g, SrcKind::LiveForeign(si)),
                 Some(_) => self.src_for(g, SrcKind::Foreign(si)),
                 None if s.ty == Ty::Bundle => g.bconst(s.binit.iter().copied()),
+                None if s.ty == Ty::Signal => {
+                    let k = g.bconst(s.binit.iter().copied());
+                    g.sigval(k)
+                }
                 None => g.konst(s.init),
             });
         }
@@ -1122,7 +1209,15 @@ impl Names for ProcNames<'_> {
         }
         if let Some(pi) = self.ctx.ports.iter().position(|p| p.name == name) {
             let v = self.src_for(g, if self.live { SrcKind::LiveInput(pi) } else { SrcKind::Input(pi) });
-            return Ok(if self.ctx.ports[pi].ty == Ty::Bool { g.truth(v) } else { v });
+            return Ok(match self.ctx.ports[pi].ty {
+                Ty::Bool => g.truth(v),
+                // A Signal input: the signal with the largest value on its wires.
+                Ty::Signal => {
+                    let top = g.brank(v, true, 0);
+                    g.onehot(top)
+                }
+                _ => v,
+            });
         }
         Err(Diag::error(span, format!("{} is not defined", crate::expand::quoted(name))))
     }
@@ -1151,8 +1246,18 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                 if ty == Ty::Bool && !g.is_bool(v) {
                     return Err(Diag::error(value.span, "expected a bool value"));
                 }
-                if (ty == Ty::Bundle) != g.is_bundle(v) {
-                    return Err(Diag::error(value.span, format!("expected {}", if ty == Ty::Bundle { "a bundle" } else { "a number" })));
+                let k = crate::bundle::kind(g, v);
+                let ok = match ty {
+                    Ty::Bundle => k == crate::bundle::Kind::Bundle,
+                    Ty::Signal => k.is_signal(),
+                    Ty::Int | Ty::Bool => k == crate::bundle::Kind::Int,
+                };
+                if !ok {
+                    return Err(Diag::error(value.span, format!("expected {}", match ty {
+                        Ty::Bundle => "a bundle",
+                        Ty::Signal => "a signal",
+                        _ => "a number",
+                    })));
                 }
                 assign(g, n, target, &[v], value.span)?;
             }
@@ -1209,7 +1314,8 @@ fn exec(g: &mut Graph, n: &mut ProcNames, body: &[Stmt]) -> Result<(), Diag> {
                     let (a, b) = (side(&then_env, g, n)?, side(&else_env, g, n)?);
                     let m = match (a, b) {
                         (Binding::Val(x), Binding::Val(y)) => {
-                            if crate::bundle::kind(g, x) != crate::bundle::kind(g, y) {
+                            let (kx, ky) = (crate::bundle::kind(g, x), crate::bundle::kind(g, y));
+                            if kx != ky && !(kx.is_signal() && ky.is_signal()) {
                                 return Err(Diag::error(s.span, format!("{} is a bundle on one side of this `if` but not the other", crate::expand::quoted(k))));
                             }
                             Binding::Val(g.mux(c, x, y))
@@ -1276,16 +1382,30 @@ fn assign(g: &mut Graph, n: &mut ProcNames, target: &Expr, vals: &[V], vspan: Sp
     }
     for (name, &v) in names.into_iter().zip(vals) {
         if let Some(s) = n.ctx.states.iter().find(|s| s.name == name) {
-            match (s.ty == Ty::Bundle, crate::bundle::kind(g, v)) {
-                (true, crate::bundle::Kind::Bundle) | (false, crate::bundle::Kind::Int) => {}
-                (true, _) => return Err(Diag::error(vspan, format!("{} is a bundle, but this value isn't", crate::expand::quoted(name)))),
-                (false, crate::bundle::Kind::Bundle) => {
+            use crate::bundle::Kind;
+            let k = crate::bundle::kind(g, v);
+            match (s.ty, k) {
+                (Ty::Bundle, Kind::Bundle) | (Ty::Int | Ty::Bool, Kind::Int) => {}
+                (Ty::Signal, Kind::Signal) => {
+                    // A constant signal assigned to a `Signal` variable: its one-hot bundle.
+                    let h = g.unsig(v);
+                    let sv = g.sigval(h);
+                    n.env.insert(name.to_string(), Binding::Val(sv));
+                    continue;
+                }
+                (Ty::Signal, Kind::SigVal) => {}
+                (Ty::Bundle, _) => return Err(Diag::error(vspan, format!("{} is a bundle, but this value isn't", crate::expand::quoted(name)))),
+                (Ty::Signal, _) => {
+                    return Err(Diag::error(vspan, format!("{} is a signal, but this value isn't", crate::expand::quoted(name)))
+                        .with_help("signal variables hold one signal, e.g. `S(\"iron-plate\")` or `b.argmax()`"))
+                }
+                (_, Kind::Bundle) => {
                     return Err(Diag::error(vspan, format!("{} is a number, but this value is a bundle", crate::expand::quoted(name)))
                         .with_help("bundle variables are assigned bundles everywhere; check the other assignments"))
                 }
-                (false, crate::bundle::Kind::Signal) => {
-                    return Err(Diag::error(vspan, format!("{} can't hold a signal while running", crate::expand::quoted(name)))
-                        .with_help("signals that change at runtime come in a later level; use a constant"))
+                (_, Kind::Signal | Kind::SigVal) => {
+                    return Err(Diag::error(vspan, format!("{} is a number, but this value is a signal", crate::expand::quoted(name)))
+                        .with_help("read a signal's value from a bundle with `b[sig]`"))
                 }
             }
             if s.ty == Ty::Bool && !g.is_bool(v) {
@@ -1360,7 +1480,7 @@ fn lower_block(ctx: &Ctx, body: &[Stmt]) -> Result<Lowered, Diag> {
                     Some(Binding::Val(v)) => *v,
                     _ => n.src_for(&mut g, SrcKind::Own(si)),
                 };
-                next.push((si, v));
+                next.push((si, g.unsig(v)));
             }
         }
         let srcs = n.srcs;
@@ -1480,7 +1600,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
             let mut writes = Vec::new();
             for (name, b) in &n.env {
                 if let (Binding::Val(v), Some(si)) = (b, ctx.states.iter().position(|s| &s.name == name)) {
-                    writes.push((si, *v));
+                    writes.push((si, g.unsig(*v)));
                 }
             }
             let kind = match &d.term {

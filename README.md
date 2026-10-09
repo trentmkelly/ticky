@@ -20,8 +20,8 @@ with functions (`def`, defaults, keyword arguments, tuple returns), arrays (`[0]
 indexing, comprehensions, `sum`/`min`/`max`/`sorted`; arrays indexed at runtime live on
 signals, SPEC §4.4), **bundles** (everything on a wire as one value, with element-wise
 arithmetic, dict comprehensions and reductions, SPEC §4.3), concurrent **processes**
-(`process name:`, SPEC §9.2) and runtime checks (`--checks`, SPEC §13). Runtime `Signal`
-values and bundle iteration come in level 6 (SPEC §16).
+(`process name:`, SPEC §9.2), runtime checks (`--checks`, SPEC §13) and runtime **signals**
+(`b.argmax()`, `Signal` ports and variables, `for s, v in b.items():`, SPEC §4.2, §4.3.4).
 
 ```python
 input  stock: Bundle = port("Logistic network contents")
@@ -37,6 +37,17 @@ every tick:
 Modded signals work by exact name, with a type where an item and recipe share a name:
 `S("nt-tbu-fuel")`, `S("nt-reprocess-hecf-249", type="recipe")`. Names Ticky doesn't know are
 warnings, not errors.
+
+```python
+input  demand: Bundle             # each station's demand on its own virtual signal
+input  train_waiting: bool @ T
+output send_to: Signal            # the station with the largest demand, as that signal = 1
+
+while True:
+    wait until train_waiting
+    send_to = demand.argmax()
+    wait until not train_waiting
+```
 
 ```python
 input  start: bool @ S
@@ -75,7 +86,8 @@ ticky decode prog.bp.txt                # any blueprint string → JSON
 ```
 
 `--set name=value@tick` changes an input at a tick (default tick 0); bundle inputs take
-`--set stock=iron-plate:5,copper-plate:3@10`. `RUN=0@tick` and `RUN=1@tick` switch the program
+`--set stock=iron-plate:5,copper-plate:3@10`, and `Signal` inputs a signal name
+(`--set want=coal`; `iron-plate@rare` for a quality). `RUN=0@tick` and `RUN=1@tick` switch the program
 off and on.
 
 ## Using a compiled blueprint
@@ -88,7 +100,8 @@ off and on.
 - **Inputs:** combinators down the left edge, under the RUN switch, in declaration order. Connect a
   red or green wire carrying the input's signal to the port's input (left) side. Each port only
   reads its own signal, so a busy factory wire is fine. A `Bundle` input reads everything on
-  the wire.
+  the wire; a `Signal` input reads which signal has the largest value on it (e.g. a constant
+  combinator with one signal set). A `Signal` output sends its signal with value 1.
 - **Outputs:** combinators down the right edge, in declaration order. With `--outputs=west`, the
   output ports sit at the west edge north of the blueprint, one row each (the first output
   northernmost), facing west; each is fed by its own line of poles (red wire) from a gate on the
