@@ -706,3 +706,12 @@ In-game difftest MATCH with Cubium loaded
   sustainable without productivity. Plain `cube-jelly` only below AMP_MIN = 30 jelly (to
   start from nothing), and is interrupted once there's enough to amplify. 249 combinators;
   7 tests; in-game MATCH 1499 ticks.
+- Later still: in game it stalled with ~1500 dormant cubes, 1 energized, ~1500 jelly and no
+  copper. Amplify rows (never interrupted while busy, and 20 crafters each) burnt every cube
+  past the jelly goal, and nothing kept copper back for recharging; from there the old policy
+  even sent two iron rows after the last cube. Rework (tools/cubium_econ.py models the factory
+  roughly and reproduces the stall with the old policy; the new one recovers): ROW_SIZE sizes
+  the stocks; the copper score counts 2 plates owed per dormant cube; iron only above
+  COPPER_FLOOR (and interrupted below half of it); jelly rows stop at JELLY_GOAL or when they'd
+  dip into CUBE_RESERVE (allowed only while there's < 50 jelly). Turn period 30 → 40 ticks
+  (depth 32). 261 combinators, 10 tests, in-game MATCH 1599 ticks incl. the stall state.
