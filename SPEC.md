@@ -601,8 +601,11 @@ one) that difftest-matches the game, and a line in the README.
   to it as the program changes.
   The CLI can override it (`--at NAME=X,Y`, beside `--display NAME=SIDE`). Fixed peripherals
   reserve their tiles (and their power poles), so placement, annealing and wire relays work
-  around them; overlapping peripherals, or one too far from everything for its wires, are
-  compile errors naming both. Peripherals without `at=` keep automatic placement.
+  around them. A peripheral any distance away is wired with a line of relay poles, as
+  `--outputs=west` does (the build summary counts them); with `--place=anneal`, the
+  combinators driving it are pulled towards it, so the line stays short. Overlapping
+  peripherals are a compile error naming both. Peripherals without `at=` keep automatic
+  placement.
 
 ---
 
