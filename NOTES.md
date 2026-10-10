@@ -699,3 +699,10 @@ In-game difftest MATCH with Cubium loaded
   wire relay" with the default grid placement on the ~880-combinator draft (anneal was fine).
 - SPEC §7 corrected: element writes to module variables need no `global` (as in Python);
   only rebinding does. The old text said the opposite.
+- Later: the user found rows can't keep productivity modules (switching to
+  `metallic-aggravation`, which takes none, ejects them onto the output belt). Added
+  `matter-amplification` (1 e-cube + 10 jelly → 17 jelly, +7 net per charge; productivity
+  only applies to the 7) as the main jelly recipe: 41 ore ≈ 8.1 charges ≈ 16 copper, so
+  sustainable without productivity. Plain `cube-jelly` only below AMP_MIN = 30 jelly (to
+  start from nothing), and is interrupted once there's enough to amplify. 249 combinators;
+  7 tests; in-game MATCH 1499 ticks.

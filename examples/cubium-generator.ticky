@@ -3,7 +3,9 @@
 #
 #   cube-jelly-ore-advanced-copper   1 e-cube + 50 jelly -> 41 copper ore + 1 d-cube
 #   cube-jelly-ore-advanced-iron     1 e-cube + 50 jelly -> 41 iron ore + 1 d-cube
-#   cube-jelly                       1 e-cube            -> 2 jelly + 1 d-cube
+#   matter-amplification             1 e-cube + 10 jelly -> 17 jelly + 1 d-cube
+#   cube-jelly                       1 e-cube            -> 2 jelly + 1 d-cube (only to start
+#                                                           from no jelly: amplification needs 10)
 #   metallic-aggravation             1 d-cube + 2 copper -> 1 e-cube
 #
 # The controller looks at one row at a time, taking turns (each row every 2 seconds). It scores
@@ -13,10 +15,12 @@
 # its crafters is working (signal-A..D = 0) and it has had HOLD ticks to get its ingredients
 # since its last change. A busy row is only interrupted to stop jelly going to waste: when
 # there's plenty of it (it spoils in 3 minutes), or when it would eat the last energized cubes
-# that the ore rows need.
+# that the ore rows need, or (plain cube-jelly) once there's enough jelly to amplify instead.
 #
-# Without productivity, 41 ore costs 26 cube charges = 52 copper plates, so the loop loses
-# copper; productivity modules on the jelly and ore rows (both allow it) are what make it pay.
+# No productivity needed: 41 ore takes 50 jelly (~7.1 amplifications) + 1 charge for the ore
+# itself, ~8.1 charges = ~16 copper plates, so each copper ore craft nets ~25 copper. (Rows
+# switch recipes, and metallic-aggravation takes no productivity modules, so a row would
+# eject its modules when it switched to it.)
 
 input  warehouse: Bundle = port("Warehouse contents")
 input  crafter_status: Bundle = port("Crafters working: signal-A..D for rows 1-4")
@@ -29,6 +33,7 @@ output craft_target_4: Signal = port("Row 4 recipe")
 COPPER_ORE = S("cube-jelly-ore-advanced-copper", type="recipe")
 IRON_ORE   = S("cube-jelly-ore-advanced-iron", type="recipe")
 JELLY      = S("cube-jelly", type="recipe")
+AMPLIFY    = S("matter-amplification", type="recipe")
 RECHARGE   = S("metallic-aggravation", type="recipe")
 
 # Inside, a row's recipe is a number (cheaper to compare and count than signals).
@@ -37,10 +42,12 @@ COPPER = 1
 IRON = 2
 JELLY_ROW = 3
 CHARGE = 4
+AMP = 5
 
 PLATE_GOAL   = 10000   # ore scores fall towards 1 as plates near this, but never reach 0
 JELLY_GOAL   = 400     # make jelly below this...
 JELLY_HIGH   = 800     # ...and stop jelly rows above this, even mid-craft
+AMP_MIN      = 30      # amplify from here up (each needs 10); plain cube-jelly below
 CUBE_RESERVE = 2       # energized cubes the jelly rows leave for the ore rows
 SHARE        = 300     # a recipe's score drops by this for each other row already on it
 HOLD         = 600     # ticks a row keeps a new recipe before it may change again
@@ -61,7 +68,7 @@ def score(want, r, cur):
 
 def recipe(r):
     return (COPPER_ORE if r == COPPER else IRON_ORE if r == IRON else JELLY if r == JELLY_ROW
-            else RECHARGE if r == CHARGE else Bundle().argmax())
+            else RECHARGE if r == CHARGE else AMPLIFY if r == AMP else Bundle().argmax())
 
 every 30 ticks:
     copper = warehouse["copper-plate"]
@@ -74,7 +81,9 @@ every 30 ticks:
     ore_ok = charged > 0 and jelly >= 50
     want_copper = ore_score(copper) if ore_ok else 0
     want_iron = ore_score(iron) if ore_ok else 0
-    want_jelly = (JELLY_GOAL - jelly) * 1000 // JELLY_GOAL if jelly < JELLY_GOAL and charged > CUBE_RESERVE else 0
+    jelly_need = (JELLY_GOAL - jelly) * 1000 // JELLY_GOAL if jelly < JELLY_GOAL and charged > CUBE_RESERVE else 0
+    want_jelly = jelly_need if jelly < AMP_MIN else 0
+    want_amp = jelly_need if jelly >= AMP_MIN else 0
     want_charge = dormant * 1000 // (dormant + charged) if dormant > 0 and copper >= 2 else 0
     stop_jelly = jelly > JELLY_HIGH or charged <= CUBE_RESERVE
 
@@ -84,7 +93,8 @@ every 30 ticks:
     working = [crafter_status["signal-A"], crafter_status["signal-B"],
                crafter_status["signal-C"], crafter_status["signal-D"]][turn]
     busy = working > 0 or since[turn] < HOLD
-    if cur == IDLE or not busy or (cur == JELLY_ROW and stop_jelly):
+    stop = (cur == AMP and stop_jelly) or (cur == JELLY_ROW and (stop_jelly or jelly >= AMP_MIN))
+    if cur == IDLE or not busy or stop:
         best = IDLE
         top = 0
         s = score(want_copper, COPPER, cur)
@@ -96,6 +106,9 @@ every 30 ticks:
         s = score(want_jelly, JELLY_ROW, cur)
         if s > top:
             best, top = JELLY_ROW, s
+        s = score(want_amp, AMP, cur)
+        if s > top:
+            best, top = AMP, s
         s = score(want_charge, CHARGE, cur)
         if s > top:
             best, top = CHARGE, s
@@ -125,6 +138,22 @@ test "with jelly and cubes, rows go to ore, mostly copper when it's scarcer":
     assert craft_target_1 == COPPER_ORE and craft_target_2 == COPPER_ORE
     assert craft_target_3 == IRON_ORE and craft_target_4 == COPPER_ORE
 
+test "with some jelly but not enough for ore, rows amplify it":
+    # jelly 40: amplify 900, 600, 300; the fourth row has nothing worth doing.
+    set warehouse = {"energized-microcube": 10, "cube-jelly": 40, "copper-plate": 100}
+    run 300 ticks
+    assert craft_target_1 == AMPLIFY and craft_target_2 == AMPLIFY and craft_target_3 == AMPLIFY
+    assert not craft_target_4
+
+test "plain cube-jelly rows switch once there's jelly to amplify":
+    set warehouse = {"energized-microcube": 10}
+    run 300 ticks
+    assert craft_target_1 == JELLY
+    set crafter_status = {"signal-A": 4, "signal-B": 4, "signal-C": 4, "signal-D": 4}
+    set warehouse = {"energized-microcube": 10, "cube-jelly": 35}
+    run 300 ticks
+    assert craft_target_1 == AMPLIFY
+
 test "busy rows keep their recipe":
     set warehouse = {"energized-microcube": 20, "cube-jelly": 300, "copper-plate": 100, "iron-plate": 5000}
     run 300 ticks
@@ -136,8 +165,9 @@ test "busy rows keep their recipe":
     assert craft_target_2 == IRON_ORE and craft_target_3 == IRON_ORE and craft_target_4 == IRON_ORE
     set crafter_status = {}
     run 300 ticks
-    # Free again: iron is 990 - 3 * 300 = 90 with the other rows on it, so jelly (250) wins.
-    assert craft_target_1 == JELLY
+    # Free again: iron is 990 - 3 * 300 = 90 with the other rows on it, so making jelly (250)
+    # wins, by amplifying what there is.
+    assert craft_target_1 == AMPLIFY
 
 test "jelly rows stop when jelly piles up":
     set warehouse = {"energized-microcube": 20, "copper-plate": 100}
