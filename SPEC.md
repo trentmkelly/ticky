@@ -535,6 +535,63 @@ c = screen[3, 1]
   signals work as colour signals; the colour follows the network on the same tick, on/off one
   tick later.
 
+### 8.4 Standard library peripherals
+
+A fixed list of modules, each `import`ed like `display`. A peripheral is either hardware the
+compiler builds into the blueprint (placed like screens, with a `--NAME=SIDE`-style option
+where it has a position) or a function over bundles that maps to one combinator mode. None of
+them adds new semantics to the core language: each lowers to existing IR plus at most one new
+entity kind or combinator mode.
+
+Every item is done when it has: the syntax below (or a documented improvement on it), the
+entity behaviour checked in-game first with a harness probe scenario (findings in NOTES), the
+simulator matching that probe, a test in `tests/examples.rs`, an example (or an addition to
+one) that difftest-matches the game, and a line in the README.
+
+- [ ] **1. `display` drawing.** On screens (§8.3), with positions and colours constant or
+  computed:
+  `screen.rect(x, y, w, h, c)`, `screen.hline(x, y, w, c)`, `screen.vline(x, y, h, c)`;
+  `screen.digit(x, y, d, c)` (one 3×5 glyph, `d` 0–9); `screen.number(x, y, n, c, width=k)`
+  (right-aligned decimal, `-` sign); `screen.text(x, y, "TEXT", c)` (constant string, built-in
+  3×5 font of `A–Z 0–9` and `- . : ! ? % /` and space). Runtime rectangles should cost a few
+  combinators however big (constant x/y tables plus masks), not one per pixel.
+- [ ] **2. `display.Digits(n)`.** A numeric readout without a full screen:
+  `output temp: display.Digits(4) = port("Temperature")`, assigned like an `int`
+  (`temp = heat`), shown as `n` seven-segment digits of lamps (right-aligned, leading `-` for
+  negatives, all segments of the top digit lit as an overflow mark). Placed like a screen.
+- [ ] **3. `display.Panel`.** A display panel whose icon and message the program chooses:
+  `output status: display.Panel({"ok": ("signal-check", "Running"), "low": ("signal-alert",
+  "Low on fuel")}) = port("Status")`, then `status = "low"` (or a `Signal` for the icon alone).
+  Each message is a panel condition on one internal value. The probe settles what shows when
+  (map, alt-mode, hover) and documents it.
+- [ ] **4. `speaker`.** A programmable speaker built in:
+  `output siren: speaker.Alarm("Reactor too hot", icon="signal-fire") = port("Siren")`, `siren
+  = heat > 900` (a global alert with that message and a sound while true), and
+  `output tune: speaker.Notes(instrument="piano")`, `tune.play(note)` (note number, 0 = silent).
+  The probe settles which instruments/notes and alert options exist in 2.0.
+- [ ] **5. `controls`.** Player inputs inside the blueprint, so a program needs no wiring to
+  be configured: `input go: controls.Switch("Start", on=False)` (a constant combinator the
+  player toggles; `bool`) and `input target: controls.Setting("Target", 100)` (a constant
+  combinator whose value the player edits; `int`). Placed with the ports.
+- [ ] **6. `items`.** Game data from the selector combinator: `items.stack_size(b)` and
+  `items.rocket_capacity(b)` (bundle → bundle, one combinator; fluids and virtual signals
+  dropped; quality kept), and `items.stack_size(sig)` for a `Signal`. The simulator needs the
+  stack sizes and rocket capacities dumped from the game (base, Space Age, quality mod).
+- [ ] **7. `quality`.** Selector quality modes (needs the Quality mod; a compile error with
+  `--no-quality`): `quality.set(b, "rare")` (everything re-tagged, values that coincide added;
+  one combinator), `quality.set(b, sig)` (to the highest quality of `sig` on the input),
+  `quality.merge(b)` (= `quality.set(b, "normal")`), and the filter
+  `{s: v for s, v in b.items() if s.quality >= "rare"}` (any comparison against a constant
+  quality; one combinator, combinable with conditions on `v`). Semantics as in NOTES
+  2026-10-10 (scenario `qprobe`).
+- [ ] **8. `random`.** The selector's random mode: `random.choice(b)` (a random present
+  signal with its value, as a `Bundle` of one signal; `random.key(b)` for the `Signal`),
+  `random.randint(lo, hi)` (constant bounds, at most one bank wide: a constant combinator of
+  `lo..hi` plus a selector), with an optional `every=N` keyword for the update interval. The
+  simulator uses a seeded generator; test assertions on random values should be ranges, and
+  difftest compares everything except values derived from random picks (the program declares
+  nothing; the compiler marks those outputs and the harness skips them).
+
 ---
 
 ## 9. Sequential code: processes
@@ -1132,8 +1189,8 @@ source ─parse→ AST ─sema→ typed AST ─lower→ CFG IR ─sched→ FSM +
    pipelining and accumulators for `every tick:`, `--opt` modes, signal namespaces per logic
    cluster. Still to do: loop pipelining in `main`, one-tick steps, single-decider counters,
    general retiming, real placement.
-9. **Later:** recursion via a RAM stack, fixed-point numbers, a standard library of peripherals
-   (seven-segment and lamp-grid displays, train-stop helpers), and possibly option A (a general
+9. **Standard library peripherals** (§8.4): ✅ lamp screens; the rest is the checklist there.
+10. **Later:** recursion via a RAM stack, fixed-point numbers, and possibly option A (a general
    CPU backend) as a separate target.
 
 Each level ends with its examples from §15 passing in the simulator **and** in the headless-
@@ -1148,7 +1205,7 @@ Factorio differential harness.
    that it leaks the internal signal table? Alternative: arrays declared with explicit signals,
    e.g. `list[int] @ [A, B, C, …]`.
 3. ~~**Displays.**~~ Lamp screens: §8.3. Display panels only show a fixed label on hover, so
-   they're low priority. Still to do: drawing helpers (rectangles, digits, text).
+   they're low priority. Drawing helpers, digits and panels are on the §8.4 checklist.
 4. **Floor division default.** This spec picks Python semantics for `//` and `%`. If negative
    numbers turn out to be common in real programs, reconsider making truncation the default.
 5. **`every tick` naming.** Since `P` can be > 1, should the as-fast-as-possible form be named
