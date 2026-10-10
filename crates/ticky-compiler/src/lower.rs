@@ -221,6 +221,7 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
             };
             match fname.as_str() {
                 f if f.starts_with('#') && f.contains('.') => return crate::stdlib::lower_call(g, names, f, args, kwargs, e.span),
+                "#drawb" => return crate::display::lower_draw(g, names, args, e.span),
                 "S" => return Ok(g.sigk(bundle::s_call(args, kwargs, e.span)?)),
                 // Internal: `b[k] = x` (from the expansion pass).
                 "#bset" => {

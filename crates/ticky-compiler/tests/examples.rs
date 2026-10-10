@@ -241,6 +241,11 @@ fn screens() {
     assert!(error_of("import display\ninput c: int @ C\noutput s: display.Screen(c, 3)\n").contains("positive constants"));
     assert!(error_of(&s("every tick:\n    s.blink()\n")).contains("has no `blink`"));
     assert!(error_of(&s("every tick:\n    s[1, 2, 3] = 1\n")).contains("screen[x, y]"));
+    assert!(error_of(&s("every tick:\n    s.rect(1, 2, 3)\n")).contains("expected `screen.rect(x, y, width, height, colour)`"));
+    assert!(error_of(&s("every tick:\n    s.text(0, 0, \"a~b\", 1)\n")).contains("the font has no `~`"));
+    assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1)\n")).contains("width=k"));
+    assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1, width=c)\n")).contains("constant number of digits"));
+    assert!(error_of(&s("every tick:\n    x = s.rect\n")).contains("is a statement"));
     // A lamp per pixel, sizes as constants, each pixel on its own signal.
     let c = compile(&s("W = 4\nevery tick:\n    s.fill(c)\n    s[s.width - 1, s.height - 1] = 0xFF0000\n"), &opts()).unwrap();
     assert_eq!(c.cg.screen_lamps[0].len(), 12);
@@ -296,4 +301,76 @@ fn selector_libraries() {
     let mut r: Vec<&String> = c.program.random.iter().filter(|n| ["a", "b", "c"].contains(&n.as_str())).collect();
     r.sort();
     assert_eq!(r, ["a", "c"]);
+}
+
+/// Drawing on screens, every pixel against a direct rendering: runtime and constant
+/// positions, clipping at the edges, a screen of two banks.
+#[test]
+fn screen_drawing() {
+    use ticky_compiler::display::glyph;
+    use ticky_compiler::testrun::{Harness, PVal};
+    let (w, h) = (48usize, 32usize); // 1536 pixels: two banks
+    let src = format!(
+        "import display\ninput x: int @ X\ninput y: int @ Y\ninput n: int @ N\ninput d: int @ D\noutput s: display.Screen({w}, {h})\nevery tick:\n    s.fill(0x111111)\n    s.rect(x, y, 5, 3, 0xFF0000)\n    s.hline(0, 31, 48, 7)\n    s.vline(x, 20, 4, 8)\n    s.digit(y, x, d, 0x00FF00)\n    s.text(x, 25, \"OK!\", 0x0000FF)\n    s.number(30, 2, n, 0xFFFFFF, width=4)\n    s.digit(40, 10, 7, 9)\n"
+    );
+    let c = compile(&src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    let mut h_ = Harness::new(&c);
+    let port = |n: &str| c.program.port_index(n).unwrap();
+    for (x, y, n, d) in [(3, 4, -42, 5), (-2, 30, 12345, 8), (45, -1, 7, 0), (20, 10, -999, 9), (0, 0, 0, 3), (10, 28, -1234, 11)] {
+        h_.set(port("x"), PVal::Int(x));
+        h_.set(port("y"), PVal::Int(y));
+        h_.set(port("n"), PVal::Int(n));
+        h_.set(port("d"), PVal::Int(d));
+        for _ in 0..60 {
+            h_.sim.step();
+        }
+        // The reference.
+        let mut px = vec![0x111111i32; w * h];
+        let mut put = |px: &mut Vec<i32>, x: i32, y: i32, c: i32| {
+            if (0..w as i32).contains(&x) && (0..h as i32).contains(&y) {
+                px[y as usize * w + x as usize] = c;
+            }
+        };
+        let glyph_at = |px: &mut Vec<i32>, put: &mut dyn FnMut(&mut Vec<i32>, i32, i32, i32), gx: i32, gy: i32, bits: i32, c: i32| {
+            for i in 0..15 {
+                if bits >> i & 1 != 0 {
+                    put(px, gx + i % 3, gy + i / 3, c);
+                }
+            }
+        };
+        for yy in y..y + 3 {
+            for xx in x..x + 5 {
+                put(&mut px, xx, yy, 0xFF0000);
+            }
+        }
+        for xx in 0..48 {
+            put(&mut px, xx, 31, 7);
+        }
+        for yy in 20..24 {
+            put(&mut px, x, yy, 8);
+        }
+        if (0..10).contains(&d) {
+            glyph_at(&mut px, &mut put, y, x, glyph(char::from_digit(d as u32, 10).unwrap()).unwrap(), 0x00FF00);
+        }
+        for (i, ch) in "OK!".chars().enumerate() {
+            glyph_at(&mut px, &mut put, x + 4 * i as i32, 25, glyph(ch).unwrap(), 0x0000FF);
+        }
+        // `number`, width 4: right-aligned, minus before the first digit, top glyph all lit
+        // when it doesn't fit.
+        let text = n.to_string();
+        let text = if text.len() > 4 {
+            let digits = n.unsigned_abs().to_string();
+            format!("#{}", &digits[digits.len() - 3..])
+        } else {
+            format!("{text:>4}")
+        };
+        for (i, ch) in text.chars().enumerate() {
+            let bits = if ch == '#' { 0x7FFF } else { glyph(ch).unwrap() };
+            glyph_at(&mut px, &mut put, 30 + 4 * i as i32, 2, bits, 0xFFFFFF);
+        }
+        glyph_at(&mut px, &mut put, 40, 10, glyph('7').unwrap(), 9);
+        for (k, want) in px.iter().enumerate() {
+            assert_eq!(h_.pixel(0, k), *want, "pixel ({}, {}) with x={x} y={y} n={n} d={d}", k % w, k / w);
+        }
+    }
 }

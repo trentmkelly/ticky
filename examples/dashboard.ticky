@@ -1,0 +1,45 @@
+# A dashboard on a lamp screen (`import display`): a label, a number, a tank-level bar and a
+# blinking alarm, redrawn three times a second. Each drawing call works out every pixel it changes
+# at once, with positions and sizes known when compiling or computed at run time.
+import display
+
+input  temp: int @ T = port("Temperature")
+input  level: int @ L = port("Tank level, 0-100")
+output panel: display.Screen(40, 6) = port("Dashboard")
+
+WHITE = 0xFFFFFF
+GREY = 0x303030
+RED = 0xFF2020
+BLUE = 0x2060FF
+
+every 20 ticks:
+    panel.fill(0)
+    panel.text(0, 0, "T:", GREY)
+    panel.number(7, 0, temp, RED if temp > 900 else WHITE, width=4)
+    panel.hline(0, 5, 40, GREY)
+    panel.rect(24, 0, clamp(level, 0, 100) * 12 // 100, 5, BLUE)
+    if temp > 900 and ticks() % 60 < 30:
+        panel.text(37, 0, "!", RED)
+
+test "readout":
+    set temp = 345
+    set level = 50
+    run 60 ticks
+    assert panel[11, 0] == WHITE
+    assert panel[14, 0] == 0
+    assert panel[0, 5] == GREY
+    assert panel[24, 2] == BLUE
+    assert panel[29, 4] == BLUE
+    assert panel[30, 2] == 0
+    assert panel[38, 0] == 0
+
+test "alarm":
+    set temp = 950
+    set level = 100
+    run 60 ticks
+    assert panel[11, 2] == RED
+    assert panel[35, 4] == BLUE
+    set temp = -42
+    run 60 ticks
+    assert panel[11, 2] == WHITE
+    assert panel[16, 2] == WHITE

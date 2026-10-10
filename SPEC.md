@@ -548,13 +548,21 @@ entity behaviour checked in-game first with a harness probe scenario (findings i
 simulator matching that probe, a test in `tests/examples.rs`, an example (or an addition to
 one) that difftest-matches the game, and a line in the README.
 
-- [ ] **1. `display` drawing.** On screens (§8.3), with positions and colours constant or
-  computed:
+- [x] **1. `display` drawing.** Statements on screens (§8.3), with positions, sizes,
+  digits and colours constant or computed (`examples/dashboard.ticky`):
   `screen.rect(x, y, w, h, c)`, `screen.hline(x, y, w, c)`, `screen.vline(x, y, h, c)`;
-  `screen.digit(x, y, d, c)` (one 3×5 glyph, `d` 0–9); `screen.number(x, y, n, c, width=k)`
-  (right-aligned decimal, `-` sign); `screen.text(x, y, "TEXT", c)` (constant string, built-in
-  3×5 font of `A–Z 0–9` and `- . : ! ? % /` and space). Runtime rectangles should cost a few
-  combinators however big (constant x/y tables plus masks), not one per pixel.
+  `screen.digit(x, y, d, c)` (one 3×5 glyph; nothing for `d` outside 0–9);
+  `screen.number(x, y, n, c, width=k)` (`k` glyphs 4 pixels apart, right-aligned, a `-`
+  before the first digit; when it doesn't fit, the low digits and every pixel of the first
+  glyph lit); `screen.text(x, y, "TEXT", c)` (a constant string in the built-in 3×5 font:
+  `A–Z` (either case), `0–9`, space and `- . : ! ? % / +`). Shapes are clipped at the edges;
+  glyphs are transparent between their pixels. Cost: with everything but the colour constant,
+  ordinary pixel writes (combined); otherwise each shape is a mask over the whole screen at
+  once from constant tables of every pixel's x and y (a rectangle: two deciders and four
+  scalar additions; a glyph at a constant position: two combinators, anywhere: about seven),
+  and a call's masks are painted together by two combinators, however many pixels. Runtime
+  arguments are evaluated once (temporaries `_drawN_…`). Checked against a direct rendering
+  pixel by pixel (`tests/examples.rs`, `screen_drawing`, a two-bank screen) and in-game.
 - [ ] **2. `display.Digits(n)`.** A numeric readout without a full screen:
   `output temp: display.Digits(4) = port("Temperature")`, assigned like an `int`
   (`temp = heat`), shown as `n` seven-segment digits of lamps (right-aligned, leading `-` for

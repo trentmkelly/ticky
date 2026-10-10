@@ -1252,6 +1252,28 @@ impl<'a> Expander<'a> {
             let right = items.split_off(items.len() / 2);
             join(tree(items, join), tree(right, join))
         }
+        // Drawing on a screen (`display.rs`): `#draw(screen, W, op, args…)` draws on each
+        // bank, knowing which pixels it holds.
+        if f == "#draw" {
+            let mut vals = vals.into_iter();
+            let Some(Val::Mem(banks, n)) = vals.next() else {
+                return Err(Diag::error(span, "drawing needs a screen"));
+            };
+            let mut rest = Vec::new();
+            for (v, a) in vals.zip(&args[1..]) {
+                rest.push(self.scalar(v, a.span)?);
+            }
+            let banks = banks
+                .into_iter()
+                .zip(bank_ranges(n))
+                .map(|(b, (off, nb))| {
+                    let mut a = vec![b, int(off as i64, span), int(nb as i64, span)];
+                    a.extend(rest.iter().cloned());
+                    self::call("#drawb", a, span)
+                })
+                .collect();
+            return Ok(Val::Mem(banks, n));
+        }
         if let [v @ (Val::Mem(..) | Val::Array(_))] = vals.as_slice() {
             if f == "sorted" {
                 let mut rev = false;

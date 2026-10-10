@@ -33,3 +33,4 @@ run examples/alarms.ticky --ticks 200 --set power=80 --set heat=300 --set 'fault
 run examples/screen.ticky --ticks 200 --set level=50 --set level=100@40 --set level=0@80 --set level=73@120 --set level=-5@150 --set level=1000@170
 run examples/warehouse.ticky --ticks 80 --set 'stock=iron-plate:250,coal:50,water:500,nuclear-reactor:11@2' --set pick=iron-gear-wheel@epic --set 'stock=iron-plate:100,iron-plate@rare:3,iron-plate@epic:1,coal@legendary:7,stone@uncommon:2@30' --set pick=rocket-silo@40 --set pick=water@50 --set 'stock={}@60'
 run examples/dice.ticky --ticks 300 --set 'queue=iron-plate:10,coal:4' --set 'queue=wood:1@150'
+run examples/dashboard.ticky --ticks 300 --set temp=345 --set level=50 --set temp=950@60 --set level=100@100 --set temp=-42@150 --set level=-5@180 --set temp=123456@200 --set level=33@230 --set temp=0@260

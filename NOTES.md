@@ -569,3 +569,23 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
 - Runtime `quality.set(b, q)`: five transfers + `BDec` guards on `q`, rather than the
   selector's "quality from signal" source (it drops the source signal from the output).
 - In-game difftests: warehouse and dice MATCH (dice: random columns skipped).
+
+## 2026-10-10 — Screen drawing (SPEC §8.4 item 1)
+- `display.rs`: drawing statements are spliced into their body (`rewrite_body`) as
+  `screen = #draw(screen, W, op, …)`, runtime arguments first bound to `_drawN_…`
+  temporaries. `number` computes each glyph index arithmetically (digit + 10·blank +
+  minus) with `tdiv`/`tmod` (its argument is `abs(n)`), then one table read per glyph:
+  an `if` chain was 13 deciders and 13 selects more; floor division's sign fixes 20 more.
+- Expansion turns `#draw` on a signal array into `#drawb(bank, offset, length, …)` per bank;
+  `display::lower_draw` builds the IR. Known pixels → `bset` (write combining). Otherwise a
+  mask per shape: `x + 1` table filtered by the x range → `BIG` (2^16), added to the `y + 1`
+  table on the same wire, filtered by the y range shifted by `BIG`. Glyph bit test: `bits <<
+  (31 − i)` negative (shift amounts from a constant table, or `31 + 3y + x + 1 − (3py + px +
+  1)` at runtime; +1 so pixel 0 is on the wire: found by `screen_drawing`). A call's masks are
+  summed on one wire; painting is `old + old·mask + c·(−mask)`, joined to a chain of drawings
+  by a `Zip(Add)` (merging terms duplicated every earlier drawing's combinators: 145 → 134).
+- Cost (16-wide test screen): runtime rect 19 (block overhead included), text 8, digit 15,
+  number width 3 47. Dashboard example: 89 combinators at `every 20 ticks`.
+- In-game: dashboard MATCH; a scratch program with runtime-position rects, digits and text,
+  clipped at every edge, MATCH (so Factorio's shifts agree with the simulator's where it
+  matters).

@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ticky_syntax::ast::{BinOp, Expr, ExprKind, Module, PortDir, Stmt, StmtKind};
+use ticky_syntax::ast::{BinOp, BoolOp, CmpOp, Expr, ExprKind, Module, PortDir, Stmt, StmtKind};
 use ticky_syntax::{Diag, Span};
 
 use crate::ir::Cv;
@@ -83,9 +83,7 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
         return Ok((Module { body }, screens));
     }
     let by_name: HashMap<String, Screen> = screens.iter().map(|s| (s.name.clone(), s.clone())).collect();
-    for s in &mut body {
-        rewrite_stmt(s, &by_name, &mut errs);
-    }
+    rewrite_body(&mut body, &by_name, &mut errs);
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -173,6 +171,170 @@ fn screen_of<'a>(e: &Expr, screens: &'a HashMap<String, Screen>) -> Option<&'a S
     }
 }
 
+/// Rewrites a body, replacing drawing calls (`screen.rect(…)`, …) with the statements that
+/// draw.
+fn rewrite_body(b: &mut Vec<Stmt>, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) {
+    let mut out = Vec::new();
+    for mut s in std::mem::take(b) {
+        if let Some(stmts) = drawing(&s, screens, errs) {
+            out.extend(stmts);
+            continue;
+        }
+        rewrite_stmt(&mut s, screens, errs);
+        out.push(s);
+    }
+    *b = out;
+}
+
+/// Drawing calls on screens; `None` for other statements.
+fn drawing(s: &Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) -> Option<Vec<Stmt>> {
+    let StmtKind::Expr(Expr { kind: ExprKind::Call { func, args, kwargs }, span }) = &s.kind else { return None };
+    let ExprKind::Attr(base, m) = &func.kind else { return None };
+    let sc = screen_of(base, screens)?;
+    let sp = *span;
+    let usage = match m.as_str() {
+        "rect" => "screen.rect(x, y, width, height, colour)",
+        "hline" => "screen.hline(x, y, width, colour)",
+        "vline" => "screen.vline(x, y, height, colour)",
+        "digit" => "screen.digit(x, y, digit, colour)",
+        "number" => "screen.number(x, y, n, colour, width=k)",
+        "text" => "screen.text(x, y, \"TEXT\", colour)",
+        _ => return None,
+    };
+    let want = match m.as_str() {
+        "rect" => 5,
+        "text" | "hline" | "vline" | "digit" | "number" => 4,
+        _ => unreachable!(),
+    };
+    let width_kw = m == "number" && kwargs.iter().all(|(k, _)| k == "width") && kwargs.len() == 1;
+    if args.len() != want || !(kwargs.is_empty() || width_kw) || (m == "number" && !width_kw) {
+        errs.push(Diag::error(sp, format!("expected `{usage}`")));
+        return Some(vec![]);
+    }
+    let mut args: Vec<Expr> = args.to_vec();
+    for a in &mut args {
+        rewrite_expr(a, screens, errs);
+    }
+    // Runtime arguments are evaluated once, into temporaries.
+    let mut out = Vec::new();
+    let id = DRAW_ID.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    let temp = |e: Expr, what: &str, out: &mut Vec<Stmt>| -> Expr {
+        if matches!(e.kind, ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Name(_)) {
+            return e;
+        }
+        let n = format!("_draw{id}_{what}");
+        out.push(Stmt { kind: StmtKind::Assign { targets: vec![ex(ExprKind::Name(n.clone()), sp)], value: e }, span: sp });
+        ex(ExprKind::Name(n), sp)
+    };
+    let x = temp(args[0].clone(), "x", &mut out);
+    let y = temp(args[1].clone(), "y", &mut out);
+    let c = temp(args[want - 1].clone(), "c", &mut out);
+    let screen = (**base).clone();
+    let draw = |op: i64, rest: Vec<Expr>| -> Stmt {
+        let mut a = vec![screen.clone(), int(sc.w as i64, sp), int(op, sp)];
+        a.extend(rest);
+        let call = ex(ExprKind::Call { func: Box::new(ex(ExprKind::Name("#draw".into()), sp)), args: a, kwargs: vec![] }, sp);
+        Stmt { kind: StmtKind::Assign { targets: vec![screen.clone()], value: call }, span: sp }
+    };
+    let plus = |e: &Expr, k: i64| if k == 0 { e.clone() } else { bin(BinOp::Add, e.clone(), int(k, sp), sp) };
+    let glyph_table = |codes: Vec<i32>| ex(ExprKind::List(codes.into_iter().map(|g| int(g as i64, sp)).collect()), sp);
+    let digits: Vec<i32> = ('0'..='9').map(|d| glyph(d).unwrap()).collect();
+    match m.as_str() {
+        "rect" | "hline" | "vline" => {
+            let (w, h) = match m.as_str() {
+                "rect" => (temp(args[2].clone(), "w", &mut out), temp(args[3].clone(), "h", &mut out)),
+                "hline" => (temp(args[2].clone(), "w", &mut out), int(1, sp)),
+                _ => (int(1, sp), temp(args[2].clone(), "h", &mut out)),
+            };
+            out.push(draw(0, vec![x, y, w, h, c]));
+        }
+        "digit" => {
+            let d = temp(args[2].clone(), "d", &mut out);
+            let bits = ex(ExprKind::Index(Box::new(glyph_table(digits)), Box::new(d)), sp);
+            let bits = temp(bits, "g", &mut out);
+            out.push(draw(1, vec![c, x, y, bits]));
+        }
+        "text" => {
+            let ExprKind::Str(text) = &args[2].kind else {
+                errs.push(Diag::error(args[2].span, "the text must be a constant string"));
+                return Some(vec![]);
+            };
+            let mut rest = vec![c.clone()];
+            for (i, ch) in text.chars().enumerate() {
+                let Some(bits) = glyph(ch) else {
+                    errs.push(Diag::error(args[2].span, format!("the font has no `{ch}`")).with_help(format!("it has letters, digits, space and {}", font_chars().trim_start_matches(|c: char| c.is_ascii_alphanumeric()))));
+                    return Some(vec![]);
+                };
+                if bits != 0 {
+                    rest.extend([plus(&x, 4 * i as i64), y.clone(), int(bits as i64, sp)]);
+                }
+            }
+            out.push(draw(1, rest));
+        }
+        "number" => {
+            let k = match kwargs[0].1.kind {
+                ExprKind::Int(k) if (1..=10).contains(&k) => k as usize,
+                _ => {
+                    errs.push(Diag::error(kwargs[0].1.span, "`width` must be a constant number of digits, 1 to 10"));
+                    return Some(vec![]);
+                }
+            };
+            // Glyphs 0–9, then blank, minus and the overflow mark (every pixel lit).
+            let mut codes = digits;
+            codes.extend([0, glyph('-').unwrap(), FULL]);
+            let n = temp(args[2].clone(), "n", &mut out);
+            let nm = |what: &str| format!("_draw{id}_{what}");
+            let name_e = |what: &str| ex(ExprKind::Name(nm(what)), sp);
+            let assign = |what: &str, e: Expr| Stmt { kind: StmtKind::Assign { targets: vec![name_e(what)], value: e }, span: sp };
+            let call = |f: &str, a: Vec<Expr>| ex(ExprKind::Call { func: Box::new(ex(ExprKind::Name(f.into()), sp)), args: a, kwargs: vec![] }, sp);
+            let cmp = |a: Expr, op: CmpOp, b: Expr| ex(ExprKind::Compare(Box::new(a), vec![(op, b)]), sp);
+            let and = |a: Expr, b: Expr| ex(ExprKind::BoolOp(BoolOp::And, vec![a, b]), sp);
+            let or = |a: Expr, b: Expr| ex(ExprKind::BoolOp(BoolOp::Or, vec![a, b]), sp);
+            let ifexp = |c: Expr, a: Expr, b: Expr| ex(ExprKind::IfExp { cond: Box::new(c), then: Box::new(a), orelse: Box::new(b) }, sp);
+            let pow10 = |i: usize| int(10i64.pow(i as u32), sp);
+            out.push(assign("a", call("abs", vec![n.clone()])));
+            out.push(assign("neg", cmp(n.clone(), CmpOp::Lt, int(0, sp))));
+            let over = or(cmp(name_e("a"), CmpOp::Ge, pow10(k)), and(name_e("neg"), cmp(name_e("a"), CmpOp::Ge, pow10(k - 1))));
+            out.push(assign("over", over));
+            let mut rest = vec![c.clone()];
+            for i in 0..k {
+                // (`a` isn't negative: truncating division is enough.)
+                let digit = if i == 0 {
+                    call("tmod", vec![name_e("a"), int(10, sp)])
+                } else {
+                    call("tmod", vec![call("tdiv", vec![name_e("a"), pow10(i)]), int(10, sp)])
+                };
+                // Leading positions have digit 0: blank is 10 more, and the minus sign (just
+                // before the first digit) 11 more.
+                let mut idx = if i == 0 {
+                    digit
+                } else {
+                    let below = cmp(name_e("a"), CmpOp::Lt, pow10(i));
+                    let minus = and(and(name_e("neg"), cmp(name_e("a"), CmpOp::Ge, pow10(i - 1))), below.clone());
+                    let blank = bin(BinOp::Mul, int(10, sp), below, sp);
+                    bin(BinOp::Add, bin(BinOp::Add, digit, blank, sp), minus, sp)
+                };
+                if i == k - 1 {
+                    idx = ifexp(name_e("over"), int(12, sp), idx);
+                }
+                let what = format!("g{i}");
+                out.push(assign(&what, ex(ExprKind::Index(Box::new(glyph_table(codes.clone())), Box::new(idx)), sp)));
+                rest.extend([plus(&x, 4 * (k - 1 - i) as i64), y.clone(), name_e(&what)]);
+            }
+            out.push(draw(1, rest));
+        }
+        _ => unreachable!(),
+    }
+    Some(out)
+}
+
+thread_local! {
+    static DRAW_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn rewrite_stmt(s: &mut Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) {
     // `s.fill(c)` as a statement: every pixel set to `c`.
     if let StmtKind::Expr(Expr { kind: ExprKind::Call { func, args, kwargs }, span }) = &s.kind {
@@ -191,11 +353,7 @@ fn rewrite_stmt(s: &mut Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<
             }
         }
     }
-    let body = |b: &mut Vec<Stmt>, errs: &mut Vec<Diag>| {
-        for s in b {
-            rewrite_stmt(s, screens, errs);
-        }
-    };
+    let body = |b: &mut Vec<Stmt>, errs: &mut Vec<Diag>| rewrite_body(b, screens, errs);
     match &mut s.kind {
         StmtKind::Assign { targets, value } => {
             for t in targets {
@@ -278,7 +436,12 @@ fn rewrite_expr(e: &mut Expr, screens: &HashMap<String, Screen>, errs: &mut Vec<
                 "width" => e.kind = ExprKind::Int(sc.w as i64),
                 "height" => e.kind = ExprKind::Int(sc.h as i64),
                 "fill" => errs.push(Diag::error(span, "`fill` is a statement: `screen.fill(colour)`")),
-                other => errs.push(Diag::error(span, format!("a screen has no `{other}` (it has `width`, `height` and `fill`)"))),
+                "rect" | "hline" | "vline" | "digit" | "number" | "text" => {
+                    errs.push(Diag::error(span, format!("`{a}` is a statement: `screen.{a}(…)`")))
+                }
+                other => errs.push(Diag::error(span, format!("a screen has no `{other}`")).with_help(
+                    "screens have `width`, `height`, `fill`, `rect`, `hline`, `vline`, `digit`, `number` and `text`",
+                )),
             }
         }
         ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Name(_) => {}
@@ -336,4 +499,215 @@ fn rewrite_expr(e: &mut Expr, screens: &HashMap<String, Screen>, errs: &mut Vec<
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------- drawing
+
+/// The built-in 3×5 font: each glyph is five rows of three pixels, top to bottom; bit
+/// `row * 3 + col` (col 0 at the left) is set where the glyph is lit.
+const FONT: &[(char, [&str; 5])] = &[
+    ('0', ["###", "#.#", "#.#", "#.#", "###"]),
+    ('1', [".#.", "##.", ".#.", ".#.", "###"]),
+    ('2', ["###", "..#", "###", "#..", "###"]),
+    ('3', ["###", "..#", ".##", "..#", "###"]),
+    ('4', ["#.#", "#.#", "###", "..#", "..#"]),
+    ('5', ["###", "#..", "###", "..#", "###"]),
+    ('6', ["###", "#..", "###", "#.#", "###"]),
+    ('7', ["###", "..#", ".#.", ".#.", ".#."]),
+    ('8', ["###", "#.#", "###", "#.#", "###"]),
+    ('9', ["###", "#.#", "###", "..#", "###"]),
+    ('A', [".#.", "#.#", "###", "#.#", "#.#"]),
+    ('B', ["##.", "#.#", "##.", "#.#", "##."]),
+    ('C', [".##", "#..", "#..", "#..", ".##"]),
+    ('D', ["##.", "#.#", "#.#", "#.#", "##."]),
+    ('E', ["###", "#..", "##.", "#..", "###"]),
+    ('F', ["###", "#..", "##.", "#..", "#.."]),
+    ('G', [".##", "#..", "#.#", "#.#", ".##"]),
+    ('H', ["#.#", "#.#", "###", "#.#", "#.#"]),
+    ('I', ["###", ".#.", ".#.", ".#.", "###"]),
+    ('J', ["..#", "..#", "..#", "#.#", ".#."]),
+    ('K', ["#.#", "#.#", "##.", "#.#", "#.#"]),
+    ('L', ["#..", "#..", "#..", "#..", "###"]),
+    ('M', ["#.#", "###", "###", "#.#", "#.#"]),
+    ('N', ["##.", "#.#", "#.#", "#.#", "#.#"]),
+    ('O', [".#.", "#.#", "#.#", "#.#", ".#."]),
+    ('P', ["##.", "#.#", "##.", "#..", "#.."]),
+    ('Q', [".#.", "#.#", "#.#", "##.", ".##"]),
+    ('R', ["##.", "#.#", "##.", "#.#", "#.#"]),
+    ('S', [".##", "#..", ".#.", "..#", "##."]),
+    ('T', ["###", ".#.", ".#.", ".#.", ".#."]),
+    ('U', ["#.#", "#.#", "#.#", "#.#", "###"]),
+    ('V', ["#.#", "#.#", "#.#", "#.#", ".#."]),
+    ('W', ["#.#", "#.#", "###", "###", "#.#"]),
+    ('X', ["#.#", "#.#", ".#.", "#.#", "#.#"]),
+    ('Y', ["#.#", "#.#", ".#.", ".#.", ".#."]),
+    ('Z', ["###", "..#", ".#.", "#..", "###"]),
+    ('-', ["...", "...", "###", "...", "..."]),
+    ('.', ["...", "...", "...", "...", ".#."]),
+    (':', ["...", ".#.", "...", ".#.", "..."]),
+    ('!', [".#.", ".#.", ".#.", "...", ".#."]),
+    ('?', ["##.", "..#", ".#.", "...", ".#."]),
+    ('%', ["#.#", "..#", ".#.", "#..", "#.#"]),
+    ('/', ["..#", "..#", ".#.", "#..", "#.."]),
+    ('+', ["...", ".#.", "###", ".#.", "..."]),
+    (' ', ["...", "...", "...", "...", "..."]),
+];
+
+/// The 15-bit code of a glyph, if the font has it (letters in either case).
+pub fn glyph(ch: char) -> Option<i32> {
+    let ch = ch.to_ascii_uppercase();
+    let rows = FONT.iter().find(|(c, _)| *c == ch)?.1;
+    let mut bits = 0;
+    for (r, row) in rows.iter().enumerate() {
+        for (c, p) in row.chars().enumerate() {
+            if p == '#' {
+                bits |= 1 << (r * 3 + c);
+            }
+        }
+    }
+    Some(bits)
+}
+
+/// The characters [`glyph`] knows, for messages.
+fn font_chars() -> String {
+    FONT.iter().map(|(c, _)| *c).filter(|c| *c != ' ').collect()
+}
+
+/// Every pixel lit: the overflow mark of `number`.
+const FULL: i32 = (1 << 15) - 1;
+
+/// Larger than any coordinate plus one (bit tricks in [`lower_draw`]).
+const BIG: i32 = 1 << 16;
+
+/// `#drawb(bank, off, nb, W, op, …)`: one bank of a screen, pixels `off .. off + nb` of a
+/// screen `W` wide, after drawing:
+/// - op 0, `x, y, w, h, c`: a filled rectangle;
+/// - op 1, `c, x1, y1, bits1, x2, y2, bits2, …`: 3×5 glyphs in colour `c` (bit `row * 3 +
+///   col` lit), transparent elsewhere; glyphs mustn't overlap.
+///
+/// With everything constant but the colour, the pixels are known: ordinary writes, which are
+/// combined. Otherwise each shape is a mask (−1 on the pixels to paint) computed for the
+/// whole bank at once against tables of each pixel's x and y, a few combinators however
+/// large; the masks are added on one wire and painted with two combinators.
+pub fn lower_draw(g: &mut crate::ir::Graph, names: &mut dyn crate::lower::Names, args: &[Expr], span: Span) -> Result<crate::ir::V, Diag> {
+    use crate::ir::{BLit, BOp, BTerm, FOut, Graph};
+    use ticky_factorio::{ArOp, CmpOp};
+    type V = crate::ir::V;
+    let lit = |e: &Expr| match e.kind {
+        ExprKind::Int(k) => k as usize,
+        _ => unreachable!("drawing: literal arguments"),
+    };
+    let (off, nb, w, op) = (lit(&args[1]), lit(&args[2]), lit(&args[3]), lit(&args[4]));
+    let bank = crate::lower::expr(g, names, &args[0])?;
+    let bank = crate::bundle::bundle(g, bank, args[0].span)?;
+    let mut ints = Vec::new();
+    for a in &args[5..] {
+        let x = crate::lower::expr(g, names, a)?;
+        ints.push(crate::bundle::int(g, x, a.span)?);
+    }
+    let px = |k: usize| ((off + k) % w) as i32;
+    let py = |k: usize| ((off + k) / w) as i32;
+    // Shapes: (x, y, w, h) rectangles or (x, y, bits) glyphs.
+    let (c, rects, glyphs): (V, Vec<[V; 4]>, Vec<[V; 3]>) = if op == 0 {
+        (ints[4], vec![[ints[0], ints[1], ints[2], ints[3]]], vec![])
+    } else {
+        (ints[0], vec![], ints[1..].chunks(3).map(|t| [t[0], t[1], t[2]]).collect())
+    };
+    let konst = |g: &Graph, v: V| g.as_const(v);
+    // Known pixels.
+    let all_known = rects.iter().all(|r| r.iter().all(|v| konst(g, *v).is_some())) && glyphs.iter().all(|r| r.iter().all(|v| konst(g, *v).is_some()));
+    if all_known {
+        let mut pixels = Vec::new();
+        for r in &rects {
+            let [x0, y0, ww, hh] = r.map(|v| konst(g, v).unwrap());
+            pixels.extend((0..nb).filter(|&k| (x0..x0.saturating_add(ww)).contains(&px(k)) && (y0..y0.saturating_add(hh)).contains(&py(k))));
+        }
+        for gl in &glyphs {
+            let [x0, y0, bits] = gl.map(|v| konst(g, v).unwrap());
+            pixels.extend((0..nb).filter(|&k| {
+                let (dx, dy) = (px(k) - x0, py(k) - y0);
+                (0..3).contains(&dx) && (0..5).contains(&dy) && bits >> (dy * 3 + dx) & 1 != 0
+            }));
+        }
+        let mut b = bank;
+        for k in pixels {
+            b = g.bset(b, Graph::slot(k), c);
+        }
+        return Ok(b);
+    }
+    let add = |g: &mut Graph, a: V, k: i32| -> V {
+        let kv = g.konst(k);
+        g.ar(ArOp::Add, a, kv)
+    };
+    let cond = |op: CmpOp, x: V| BLit { op, a: BOp::Each, b: BOp::Val(x) };
+    // Pixels inside a box: `x + 1` tables (never 0, so every pixel is on the wire) give `BIG`
+    // where x is in range; added to the `y + 1` table, the y range shifted by `BIG` picks the
+    // box (marked `mark`).
+    let in_box = |g: &mut Graph, x: V, y: V, bw: V, bh: V, mark: i32| -> BTerm {
+        let x0 = add(g, x, 1);
+        let x1 = g.ar(ArOp::Add, x0, bw);
+        let y0 = add(g, y, 1 + BIG);
+        let y1 = g.ar(ArOp::Add, y0, bh);
+        let xt = g.bconst((0..nb).map(|k| (Graph::slot(k), px(k) + 1)));
+        let in_x = BTerm::Filter(xt, vec![vec![cond(CmpOp::Ge, x0), cond(CmpOp::Lt, x1)]], FOut::Const(BIG));
+        let yt = BTerm::K((0..nb).map(|k| (Graph::slot(k), py(k) + 1)).collect());
+        let zx = g.bun(vec![in_x, yt]);
+        BTerm::Filter(zx, vec![vec![cond(CmpOp::Ge, y0), cond(CmpOp::Lt, y1)]], FOut::Const(mark))
+    };
+    let mut mask: Vec<BTerm> = Vec::new();
+    for r in &rects {
+        mask.push(in_box(g, r[0], r[1], r[2], r[3], -1));
+    }
+    for gl in &glyphs {
+        let [x, y, bits] = *gl;
+        // A pixel at position i (`row * 3 + col`) of the glyph is lit when bit i of `bits`
+        // is: `bits << (31 - i)` is negative.
+        let neg = vec![vec![cond(CmpOp::Lt, g.konst(0))]];
+        match (konst(g, x), konst(g, y)) {
+            (Some(x0), Some(y0)) => {
+                let sh: Vec<(ticky_factorio::Sig, i32)> = (0..nb)
+                    .filter_map(|k| {
+                        let (dx, dy) = (px(k) - x0, py(k) - y0);
+                        ((0..3).contains(&dx) && (0..5).contains(&dy)).then(|| (Graph::slot(k), 31 - (dy * 3 + dx)))
+                    })
+                    .collect();
+                if sh.is_empty() {
+                    continue;
+                }
+                let sh = g.bconst(sh);
+                let shifted = g.bun(vec![BTerm::RMap(ArOp::Shl, bits, sh)]);
+                mask.push(BTerm::Filter(shifted, neg, FOut::Const(-1)));
+            }
+            _ => {
+                // Anywhere: shift amounts `31 + 3y + x - (3 py + px)` from a table (of
+                // `3 py + px + 1`, never 0, so every pixel is on the wire), then in the box (2)
+                // plus lit (1) is 3.
+                let (three, five) = (g.konst(3), g.konst(5));
+                let boxed = in_box(g, x, y, three, five, 2);
+                let pos = g.bconst((0..nb).map(|k| (Graph::slot(k), py(k) * 3 + px(k) + 1)));
+                let sy = g.ar(ArOp::Mul, y, three);
+                let s = g.ar(ArOp::Add, sy, x);
+                let s31 = add(g, s, 32);
+                let amount = g.bun(vec![BTerm::RMap(ArOp::Sub, s31, pos)]);
+                let shifted = g.bun(vec![BTerm::RMap(ArOp::Shl, bits, amount)]);
+                let bit = BTerm::Filter(shifted, neg, FOut::Const(1));
+                let both = g.bun(vec![boxed, bit]);
+                let three = g.konst(3);
+                mask.push(BTerm::Filter(both, vec![vec![cond(CmpOp::Eq, three)]], FOut::Const(-1)));
+            }
+        }
+    }
+    if mask.is_empty() {
+        return Ok(bank);
+    }
+    // New = old − old·[lit] + c·[lit], added to the old values by one more combinator (a
+    // chain of drawings doesn't copy each earlier one's combinators).
+    let mask = g.bun(mask);
+    let z = g.konst(0);
+    let neg_c = g.ar(ArOp::Sub, z, c);
+    let delta = g.bun(vec![BTerm::Zip(ArOp::Mul, bank, mask), BTerm::Map(ArOp::Mul, mask, neg_c)]);
+    if matches!(g.op(bank), crate::ir::Op::Bun(_)) {
+        return Ok(g.bun(vec![BTerm::Zip(ArOp::Add, bank, delta)]));
+    }
+    crate::bundle::binop(g, ticky_syntax::ast::BinOp::Add, bank, delta, span)
 }
