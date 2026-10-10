@@ -1021,7 +1021,7 @@ impl Shared {
 /// States some process reads, or that drive an output. Others need no register at all.
 fn live_states(p: &Program) -> Vec<bool> {
     // Outputs, and screens' banks (`name#b`).
-    let screen_bank = |n: &str| n.split_once('#').is_some_and(|(a, b)| b.parse::<usize>().is_ok() && p.screens.iter().any(|s| s.name == a));
+    let screen_bank = |n: &str| n.split_once('#').is_some_and(|(a, b)| b.parse::<usize>().is_ok() && p.screens.iter().any(|s| s.var == a));
     let mut live: Vec<bool> = p.states.iter().map(|s| s.port.is_some() || screen_bank(&s.name)).collect();
     let mut mark = |srcs: &[SrcKind]| {
         for k in srcs {
@@ -1371,7 +1371,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         let bs = crate::expand::bank_size();
         let mut lamps = Vec::new();
         for b in 0..sc.pixels().div_ceil(bs) {
-            let bank = format!("{}#{b}", sc.name);
+            let bank = format!("{}#{b}", sc.var);
             let reg = p.states.iter().position(|s| s.name == bank).and_then(|si| shared.state_bun.get(&si).copied());
             for j in 0..bs.min(sc.pixels() - b * bs) {
                 let sig = crate::ir::Graph::slot(j);

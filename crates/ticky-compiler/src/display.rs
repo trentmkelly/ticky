@@ -14,14 +14,27 @@ use ticky_syntax::{Diag, Span};
 
 use crate::ir::Cv;
 
-/// A screen output.
+/// A screen output: a grid of lamps showing a signal array.
 #[derive(Clone, Debug)]
 pub struct Screen {
+    /// The declared name (`--display NAME=…`, messages).
     pub name: String,
+    /// The signal array it shows: the name itself for a screen; a hidden array for a
+    /// [`Digits`](ScreenKind::Digits) readout, whose name is an `int`.
+    pub var: String,
+    pub kind: ScreenKind,
     pub w: usize,
     pub h: usize,
     pub label: Option<String>,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenKind {
+    /// `display.Screen(W, H)`: pixels the program sets.
+    Screen,
+    /// `display.Digits(n)`: an `int` shown in `n` digits.
+    Digits,
 }
 
 impl Screen {
@@ -39,6 +52,8 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
     let mut imported = HashSet::new();
     let mut consts: HashMap<String, Cv> = HashMap::new();
     let mut screens = Vec::new();
+    // `display.Digits` readouts, with their colours.
+    let mut readouts: Vec<(Screen, Expr)> = Vec::new();
     let mut body = Vec::new();
     for s in &m.body {
         match &s.kind {
@@ -46,12 +61,20 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
             StmtKind::Import(n) => {
                 imported.insert(n.clone());
             }
-            StmtKind::Port { dir, name, ty, signal, label } if is_screen_type(ty) => {
+            StmtKind::Port { dir, name, ty, signal, label } if display_type(ty).is_some() => {
+                let what = display_type(ty).unwrap();
                 if !imported.contains("display") {
-                    errs.push(Diag::error(ty.span, "`display.Screen` needs `import display` first"));
+                    errs.push(Diag::error(ty.span, format!("`display.{what}` needs `import display` first")));
                     continue;
                 }
-                match screen(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span) {
+                let r = match what {
+                    "Screen" => screen(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
+                    _ => digits(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span).map(|(sc, colour)| {
+                        readouts.push((sc.clone(), colour));
+                        sc
+                    }),
+                };
+                match r {
                     Ok(sc) => screens.push(sc),
                     Err(d) => errs.push(d),
                 }
@@ -82,8 +105,29 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
     if screens.is_empty() {
         return Ok((Module { body }, screens));
     }
-    let by_name: HashMap<String, Screen> = screens.iter().map(|s| (s.name.clone(), s.clone())).collect();
-    rewrite_body(&mut body, &by_name, &mut errs);
+    // A readout is an `int` variable, drawn on its hidden screen by a block (one for all
+    // readouts) that runs as often as it can, without pipelining: small, and the delay
+    // doesn't matter.
+    let mut draw_all = Vec::new();
+    for (sc, colour) in &readouts {
+        let sp = sc.span;
+        let n = (sc.w + 1) / 4;
+        let target = ex(ExprKind::Name(sc.var.clone()), sp);
+        let call = |m: &str, args: Vec<Expr>, kwargs: Vec<(String, Expr)>| Stmt {
+            kind: StmtKind::Expr(ex(ExprKind::Call { func: Box::new(ex(ExprKind::Attr(Box::new(target.clone()), m.into()), sp)), args, kwargs }, sp)),
+            span: sp,
+        };
+        draw_all.push(call("fill", vec![int(0, sp)], vec![]));
+        draw_all.push(call("number", vec![int(0, sp), int(0, sp), ex(ExprKind::Name(sc.name.clone()), sp), colour.clone()], vec![("width".into(), int(n as i64, sp))]));
+    }
+    if let Some((sc, _)) = readouts.first() {
+        body.push(Stmt { kind: StmtKind::Every { period: Some(ex(ExprKind::Name(NATURAL.into()), sc.span)), body: draw_all }, span: sc.span });
+    }
+    let by_name: HashMap<String, Screen> = screens.iter().filter(|s| s.kind == ScreenKind::Screen).map(|s| (s.name.clone(), s.clone())).collect();
+    let mut by_var = by_name.clone();
+    by_var.extend(readouts.iter().map(|(s, _)| (s.var.clone(), s.clone())));
+    CONSTS.with(|c| *c.borrow_mut() = consts.clone());
+    rewrite_body(&mut body, &by_var, &mut errs);
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -93,19 +137,87 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
         .map(|sc| {
             let sp = sc.span;
             let zeros = bin(BinOp::Mul, ex(ExprKind::List(vec![int(0, sp)]), sp), int(sc.pixels() as i64, sp), sp);
-            Stmt { kind: StmtKind::Assign { targets: vec![ex(ExprKind::Name(sc.name.clone()), sp)], value: zeros }, span: sp }
+            Stmt { kind: StmtKind::Assign { targets: vec![ex(ExprKind::Name(sc.var.clone()), sp)], value: zeros }, span: sp }
         })
         .collect();
+    // A readout's number starts at 0.
+    for (sc, _) in &readouts {
+        let sp = sc.span;
+        out.push(Stmt { kind: StmtKind::Assign { targets: vec![ex(ExprKind::Name(sc.name.clone()), sp)], value: int(0, sp) }, span: sp });
+    }
     out.extend(body);
     Ok((Module { body: out }, screens))
 }
 
-fn is_screen_type(ty: &Expr) -> bool {
-    match &ty.kind {
-        ExprKind::Call { func, .. } => {
-            matches!(&func.kind, ExprKind::Attr(b, a) if a == "Screen" && matches!(&b.kind, ExprKind::Name(n) if n == "display"))
+/// The period of a block that runs as often as its depth allows, without pipelining (an
+/// internal name: the expansion leaves periods alone).
+pub const NATURAL: &str = "#natural";
+
+/// `display.Screen(…)` → `Screen`, `display.Digits(…)` → `Digits`.
+fn display_type(ty: &Expr) -> Option<&'static str> {
+    let ExprKind::Call { func, .. } = &ty.kind else { return None };
+    let ExprKind::Attr(b, a) = &func.kind else { return None };
+    if !matches!(&b.kind, ExprKind::Name(n) if n == "display") {
+        return None;
+    }
+    match a.as_str() {
+        "Screen" => Some("Screen"),
+        "Digits" => Some("Digits"),
+        _ => None,
+    }
+}
+
+/// The colour of a readout unless it says: amber, like an old LED display.
+const DIGITS_COLOUR: i64 = 0xFF8C00;
+
+/// `output x: display.Digits(n, colour=c)`: the readout's screen (`n` glyphs 4 pixels apart, 5
+/// tall) and colour.
+fn digits(
+    dir: PortDir,
+    name: &str,
+    ty: &Expr,
+    has_signal: bool,
+    label: Option<&Expr>,
+    consts: &HashMap<String, Cv>,
+    span: Span,
+) -> Result<(Screen, Expr), Diag> {
+    if dir != PortDir::Output {
+        return Err(Diag::error(span, "a readout is an `output`"));
+    }
+    if has_signal {
+        return Err(Diag::error(span, "a readout has no `@ signal`: it shows its number on lamps"));
+    }
+    let ExprKind::Call { args, kwargs, .. } = &ty.kind else { unreachable!() };
+    let usage = "expected `display.Digits(digits)` or `display.Digits(digits, colour=0xRRGGBB)`";
+    if args.len() != 1 || kwargs.iter().any(|(k, _)| k != "colour" && k != "color") {
+        return Err(Diag::error(ty.span, usage));
+    }
+    let n = match crate::program::eval_const(&args[0], consts, &[]).ok().and_then(|v| v.int()) {
+        Some(k) if (1..=10).contains(&k) => k as usize,
+        _ => return Err(Diag::error(args[0].span, "a readout has 1 to 10 digits (a constant)")),
+    };
+    let colour = match kwargs.first() {
+        None => int(DIGITS_COLOUR, ty.span),
+        Some((_, e)) => match crate::program::eval_const(e, consts, &[]).ok().and_then(|v| v.int()) {
+            Some(c) => int(c as i64, e.span),
+            None => return Err(Diag::error(e.span, "a readout's colour must be a constant")),
+        },
+    };
+    let label = port_label(label)?;
+    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span };
+    Ok((sc, colour))
+}
+
+fn port_label(label: Option<&Expr>) -> Result<Option<String>, Diag> {
+    match label {
+        None => Ok(None),
+        Some(Expr { kind: ExprKind::Call { func, args, .. }, .. })
+            if matches!(&func.kind, ExprKind::Name(n) if n == "port") && matches!(args.first().map(|a| &a.kind), Some(ExprKind::Str(_))) =>
+        {
+            let ExprKind::Str(text) = &args[0].kind else { unreachable!() };
+            Ok(Some(text.clone()))
         }
-        _ => false,
+        Some(e) => Err(Diag::error(e.span, "expected `port(\"label\")`")),
     }
 }
 
@@ -139,17 +251,8 @@ fn screen(
     if w * h > MAX_PIXELS {
         return Err(Diag::error(ty.span, format!("a screen can have at most {MAX_PIXELS} pixels; this one has {}", w * h)));
     }
-    let label = match label {
-        None => None,
-        Some(Expr { kind: ExprKind::Call { func, args, .. }, .. })
-            if matches!(&func.kind, ExprKind::Name(n) if n == "port") && matches!(args.first().map(|a| &a.kind), Some(ExprKind::Str(_))) =>
-        {
-            let ExprKind::Str(text) = &args[0].kind else { unreachable!() };
-            Some(text.clone())
-        }
-        Some(e) => return Err(Diag::error(e.span, "expected `port(\"label\")`")),
-    };
-    Ok(Screen { name: name.to_string(), w, h, label, span })
+    let label = port_label(label)?;
+    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span })
 }
 
 fn ex(kind: ExprKind, span: Span) -> Expr {
@@ -282,6 +385,13 @@ fn drawing(s: &Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) ->
                     return Some(vec![]);
                 }
             };
+            // At a constant position: every pixel's place value is known, so the whole
+            // number is worked out at once (`lower_draw`, op 2).
+            if let (Some(x0), Some(y0)) = (const_int(&x), const_int(&y)) {
+                let n = temp(args[2].clone(), "n", &mut out);
+                out.push(draw(2, vec![c, int(x0, sp), int(y0, sp), n, int(k as i64, sp)]));
+                return Some(out);
+            }
             // Glyphs 0–9, then blank, minus and the overflow mark (every pixel lit).
             let mut codes = digits;
             codes.extend([0, glyph('-').unwrap(), FULL]);
@@ -333,6 +443,12 @@ fn drawing(s: &Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) ->
 
 thread_local! {
     static DRAW_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The module's constants, for drawing calls at constant positions.
+    static CONSTS: std::cell::RefCell<HashMap<String, Cv>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn const_int(e: &Expr) -> Option<i64> {
+    CONSTS.with(|c| crate::program::eval_const(e, &c.borrow(), &[]).ok().and_then(|v| v.int())).map(|k| k as i64)
 }
 
 fn rewrite_stmt(s: &mut Stmt, screens: &HashMap<String, Screen>, errs: &mut Vec<Diag>) {
@@ -573,6 +689,33 @@ fn font_chars() -> String {
     FONT.iter().map(|(c, _)| *c).filter(|c| *c != ' ').collect()
 }
 
+/// The number a `Digits` readout shows, read back from its pixels (lit = nonzero), as a
+/// player would: `Err` for the overflow mark or anything that isn't a number.
+pub fn read_digits(sc: &Screen, px: impl Fn(usize) -> i32) -> Result<i64, String> {
+    let n = (sc.w + 1) / 4;
+    let mut text = String::new();
+    for i in 0..n {
+        let mut bits = 0;
+        for k in 0..15 {
+            if px((k / 3) * sc.w + 4 * i + k % 3) != 0 {
+                bits |= 1 << k;
+            }
+        }
+        if bits == FULL {
+            return Err(format!("`{}` shows its overflow mark", sc.name));
+        }
+        match "0123456789- ".chars().find(|c| glyph(*c) == Some(bits)) {
+            Some(c) => text.push(c),
+            None => return Err(format!("`{}` shows something that isn't a digit", sc.name)),
+        }
+    }
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(format!("`{}` is blank", sc.name));
+    }
+    t.parse().map_err(|_| format!("`{}` shows \"{text}\", not a number", sc.name))
+}
+
 /// Every pixel lit: the overflow mark of `number`.
 const FULL: i32 = (1 << 15) - 1;
 
@@ -607,6 +750,11 @@ pub fn lower_draw(g: &mut crate::ir::Graph, names: &mut dyn crate::lower::Names,
     }
     let px = |k: usize| ((off + k) % w) as i32;
     let py = |k: usize| ((off + k) / w) as i32;
+    if op == 2 {
+        let (x0, y0, k) = (lit(&args[6]) as i32, lit(&args[7]) as i32, lit(&args[9]));
+        let mask = number_mask(g, off, nb, w, x0, y0, ints[3], k);
+        return Ok(paint(g, bank, mask, ints[0], span));
+    }
     // Shapes: (x, y, w, h) rectangles or (x, y, bits) glyphs.
     let (c, rects, glyphs): (V, Vec<[V; 4]>, Vec<[V; 3]>) = if op == 0 {
         (ints[4], vec![[ints[0], ints[1], ints[2], ints[3]]], vec![])
@@ -700,14 +848,97 @@ pub fn lower_draw(g: &mut crate::ir::Graph, names: &mut dyn crate::lower::Names,
     if mask.is_empty() {
         return Ok(bank);
     }
-    // New = old − old·[lit] + c·[lit], added to the old values by one more combinator (a
-    // chain of drawings doesn't copy each earlier one's combinators).
     let mask = g.bun(mask);
+    Ok(paint(g, bank, mask, c, span))
+}
+
+/// `bank` with colour `c` on the pixels where `mask` is −1: `old − old·[lit] + c·[lit]`,
+/// added to the old values by one more combinator (a chain of drawings doesn't copy each
+/// earlier one's combinators). On a blank bank, just `c·[lit]`.
+fn paint(g: &mut crate::ir::Graph, bank: crate::ir::V, mask: crate::ir::V, c: crate::ir::V, span: Span) -> crate::ir::V {
+    use crate::ir::BTerm;
+    use ticky_factorio::ArOp;
     let z = g.konst(0);
     let neg_c = g.ar(ArOp::Sub, z, c);
+    if g.as_bconst(bank).is_some_and(|b| b.is_empty()) {
+        return g.bun(vec![BTerm::Map(ArOp::Mul, mask, neg_c)]);
+    }
     let delta = g.bun(vec![BTerm::Zip(ArOp::Mul, bank, mask), BTerm::Map(ArOp::Mul, mask, neg_c)]);
     if matches!(g.op(bank), crate::ir::Op::Bun(_)) {
-        return Ok(g.bun(vec![BTerm::Zip(ArOp::Add, bank, delta)]));
+        return g.bun(vec![BTerm::Zip(ArOp::Add, bank, delta)]);
     }
-    crate::bundle::binop(g, ticky_syntax::ast::BinOp::Add, bank, delta, span)
+    crate::bundle::binop(g, ticky_syntax::ast::BinOp::Add, bank, delta, span).expect("bundle sum")
+}
+
+/// The mask (−1 on lit pixels) of `n` drawn as `k` glyphs from `(x0, y0)`, for the pixels
+/// `off .. off + nb` of a screen `w` wide: every glyph at once. Each pixel's digit is
+/// `|n| // 10^i % 10` (`i` its glyph's place) plus 10 if it's a leading blank, 11 for the
+/// minus sign and 16 + for the overflow mark; a constant per pixel has bit `31 − d` set when
+/// glyph `d` lights it, so shifting it left by the digit leaves it negative exactly then.
+#[allow(clippy::too_many_arguments)]
+fn number_mask(g: &mut crate::ir::Graph, off: usize, nb: usize, w: usize, x0: i32, y0: i32, n: crate::ir::V, k: usize) -> crate::ir::V {
+    use crate::ir::{BLit, BOp, BTerm, FOut, Graph};
+    use ticky_factorio::{ArOp, CmpOp, Sig};
+    // (pixel slot, place i, bit in the glyph) for the pixels inside the number.
+    let mut cells: Vec<(Sig, usize, usize)> = Vec::new();
+    for j in 0..nb {
+        let (px, py) = (((off + j) % w) as i32 - x0, ((off + j) / w) as i32 - y0);
+        if px < 0 || py < 0 || py >= 5 || px >= 4 * k as i32 || px % 4 == 3 {
+            continue;
+        }
+        let place = k - 1 - (px / 4) as usize;
+        cells.push((Graph::slot(j), place, (py * 3 + px % 4) as usize));
+    }
+    if cells.is_empty() {
+        return g.bconst([]);
+    }
+    let codes: Vec<i32> = ('0'..='9').map(|d| glyph(d).unwrap()).chain([0, glyph('-').unwrap()]).collect();
+    let lights = |bit: usize| -> i32 {
+        let mut m: u32 = 0;
+        for (d, code) in codes.iter().enumerate() {
+            if code >> bit & 1 != 0 {
+                m |= 1 << (31 - d);
+            }
+        }
+        // 16 and up: the overflow mark, every pixel lit.
+        for d in 16..=26 {
+            m |= 1 << (31 - d);
+        }
+        m as i32
+    };
+    let pow = |i: usize| 10i64.pow(i as u32);
+    let table = |g: &mut Graph, f: &dyn Fn(usize, usize) -> Option<i32>| g.bconst(cells.iter().filter_map(|&(s, i, b)| Some((s, f(i, b)?))));
+    let place = table(g, &|i, _| Some(pow(i) as i32));
+    let leading = table(g, &|i, _| (i > 0).then(|| pow(i) as i32));
+    let top = table(g, &|i, _| (i == k - 1).then_some(1));
+    let lit = table(g, &|_, b| Some(lights(b)));
+    let z = g.konst(0);
+    let neg = g.cmp(CmpOp::Lt, n, z);
+    let minus_n = g.ar(ArOp::Sub, z, n);
+    let a = g.mux(neg, minus_n, n);
+    // Doesn't fit: |n| ≥ 10^k, or negative with |n| ≥ 10^(k-1).
+    let fits_neg = g.konst(pow(k - 1).min(i32::MAX as i64) as i32);
+    let big_neg = g.cmp(CmpOp::Ge, a, fits_neg);
+    let mut over = g.ar(ArOp::And, neg, big_neg);
+    if pow(k) <= i32::MAX as i64 {
+        let fits = g.konst(pow(k) as i32);
+        let big = g.cmp(CmpOp::Ge, a, fits);
+        over = g.ar(ArOp::Or, over, big);
+    }
+    // The minus sign goes where 10^(i-1) ≤ |n| < 10^i: `place ≤ 10|n|` (−1 when positive).
+    let ten = g.konst(10);
+    let ten_a = g.ar(ArOp::Mul, a, ten);
+    let none = g.konst(-1);
+    let minus_lim = g.mux(neg, ten_a, none);
+    let cond = |op: CmpOp, x: V| BLit { op, a: BOp::Each, b: BOp::Val(x) };
+    type V = crate::ir::V;
+    let quot = g.bun(vec![BTerm::RMap(ArOp::Div, a, place)]);
+    let digit = g.bun(vec![
+        BTerm::Map(ArOp::Mod, quot, ten),
+        BTerm::Filter(leading, vec![vec![cond(CmpOp::Gt, a)]], FOut::Const(10)),
+        BTerm::Filter(leading, vec![vec![cond(CmpOp::Gt, a), cond(CmpOp::Le, minus_lim)]], FOut::Const(1)),
+        BTerm::Filter(top, vec![vec![BLit { op: CmpOp::Ne, a: BOp::Val(over), b: BOp::Val(z) }]], FOut::Const(16)),
+    ]);
+    let shifted = g.bun(vec![BTerm::Zip(ArOp::Shl, lit, digit)]);
+    g.bun(vec![BTerm::Filter(shifted, vec![vec![cond(CmpOp::Lt, z)]], FOut::Const(-1))])
 }

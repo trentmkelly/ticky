@@ -1,0 +1,31 @@
+# Numeric readouts (`import display`): `display.Digits(n)` is an `int` the program assigns,
+# shown on lamps as n digits (right-aligned, a minus sign before negatives, the first digit
+# fully lit when the number doesn't fit). Here: a temperature, and items per minute.
+import display
+
+input  heat: int @ H = port("Temperature")
+input  items: int @ I = port("Items arriving (pulses)")
+output temp: display.Digits(4) = port("Temperature")
+output rate: display.Digits(3, colour=0x40FF40) = port("Items per minute")
+
+total = 0
+last = 0
+every tick:
+    temp = heat
+    total += items
+
+every 60 ticks:
+    rate = total - last
+    last = total
+
+test "readouts":
+    set heat = 873
+    set items = 1
+    run 130 ticks
+    assert temp == 873
+    assert rate >= 59 and rate <= 61
+    set heat = -45
+    set items = 0
+    run 130 ticks
+    assert temp == -45
+    assert rate == 0

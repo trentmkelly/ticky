@@ -715,7 +715,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     crate::stdlib::rewrite_calls(&mut m, &imported)?;
     let random = if imported.contains("random") { crate::stdlib::random_names(&m) } else { Default::default() };
     let (m, screens) = crate::display::desugar(&m)?;
-    let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.name.clone()).collect();
+    let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
     let mut p = analyze_expanded(&expanded, pipeline)?;
@@ -1013,8 +1013,11 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mut blocks = Vec::new();
     let mut warnings = Vec::new();
     for (bi, (stmt, period, body)) in every.iter().enumerate() {
+        // Readouts' drawing blocks (`display::NATURAL`): as often as they can, unpipelined.
+        let natural = matches!(period, Some(Expr { kind: ExprKind::Name(n), .. }) if n == crate::display::NATURAL);
         let requested = match period {
             None => None,
+            Some(_) if natural => None,
             Some(e) => match eval_int(e, &consts, &ports) {
                 Ok(n) if n >= 1 => Some(n as u32),
                 Ok(n) => {
@@ -1042,7 +1045,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                 let checks = fused_checks(&mut fz, raw);
                 // A block with runtime checks runs multi-cycle, so a check is read on the
                 // commit pulse with the rest of its iteration.
-                let pipe = if pipeline && requested.is_none() && checks.is_empty() {
+                let pipe = if pipeline && requested.is_none() && checks.is_empty() && !natural {
                     crate::pipeline::plan(&mut graph, &srcs, &mut plans)
                 } else {
                     None
@@ -1060,7 +1063,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                     }
                     Some(n) => n,
                     None => {
-                        if needed > 1 {
+                        if needed > 1 && !natural {
                             warnings.push(Diag::warning(header, format!(
                                 "this block can only run every {needed} ticks, not every tick"
                             )).with_help(format!(

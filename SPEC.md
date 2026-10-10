@@ -557,16 +557,26 @@ one) that difftest-matches the game, and a line in the README.
   glyph lit); `screen.text(x, y, "TEXT", c)` (a constant string in the built-in 3×5 font:
   `A–Z` (either case), `0–9`, space and `- . : ! ? % / +`). Shapes are clipped at the edges;
   glyphs are transparent between their pixels. Cost: with everything but the colour constant,
-  ordinary pixel writes (combined); otherwise each shape is a mask over the whole screen at
+  ordinary pixel writes (combined); `number` at a constant position works out every glyph at
+  once (each pixel's digit `|n| // 10^i % 10` from a table of place values, plus 10 for a
+  leading blank, 11 for the minus sign, 16 for the overflow mark, then a constant per pixel
+  with bit `31 − d` set where glyph `d` lights it, shifted left by the digit: negative when
+  lit), about 16 combinators however many digits; otherwise each shape is a mask over the whole screen at
   once from constant tables of every pixel's x and y (a rectangle: two deciders and four
   scalar additions; a glyph at a constant position: two combinators, anywhere: about seven),
   and a call's masks are painted together by two combinators, however many pixels. Runtime
   arguments are evaluated once (temporaries `_drawN_…`). Checked against a direct rendering
   pixel by pixel (`tests/examples.rs`, `screen_drawing`, a two-bank screen) and in-game.
-- [ ] **2. `display.Digits(n)`.** A numeric readout without a full screen:
-  `output temp: display.Digits(4) = port("Temperature")`, assigned like an `int`
-  (`temp = heat`), shown as `n` seven-segment digits of lamps (right-aligned, leading `-` for
-  negatives, all segments of the top digit lit as an overflow mark). Placed like a screen.
+- [x] **2. `display.Digits(n)`.** A numeric readout without a full screen
+  (`examples/readouts.ticky`): `output temp: display.Digits(4) = port("Temperature")`, or
+  `display.Digits(4, colour=0x40FF40)` (default amber), assigned like an `int` (`temp =
+  heat`, starting at 0), shown as `n` (1–10) glyphs of the 3×5 font on a `4n − 1` × 5 grid of
+  lamps placed like a screen (`--display temp=east`): right-aligned, a `-` before the first
+  digit of a negative number, and the first glyph fully lit when the number doesn't fit (the
+  font's `8` would be ambiguous). The lamps are a hidden screen drawn by one generated block
+  for all readouts, which runs as often as its depth allows (no pipelining: about 9 ticks
+  behind). Tests read a readout as the number its lamps show (an error for the overflow mark).
+  Cost: about 20 combinators per readout, whatever its width (below).
 - [ ] **3. `display.Panel`.** A display panel whose icon and message the program chooses:
   `output status: display.Panel({"ok": ("signal-check", "Running"), "low": ("signal-alert",
   "Low on fuel")}) = port("Status")`, then `status = "low"` (or a `Signal` for the icon alone).

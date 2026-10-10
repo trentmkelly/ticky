@@ -589,3 +589,16 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
 - In-game: dashboard MATCH; a scratch program with runtime-position rects, digits and text,
   clipped at every edge, MATCH (so Factorio's shifts agree with the simulator's where it
   matters).
+
+## 2026-10-10 — Readouts: `display.Digits(n)` (SPEC §8.4 item 2)
+- `Screen` gained `var` (the signal array shown; a hidden `_digits_NAME` for readouts) and
+  `kind`. A readout's name is an `int` module variable (0 at start); one generated `every`
+  block draws all readouts (`fill(0)` then `number`), with the internal period
+  `display::NATURAL` (`#natural`): as often as its depth allows, never pipelined, no warning.
+- `number` at a constant position (also used by `screen.number`): op 2 of `lower_draw`,
+  `number_mask` — every glyph at once from per-pixel tables (place values, leading places,
+  top glyph, and per-pixel "which glyphs light me" bits `31 − d`), shifted by the digit with
+  a `Zip(Shl)` (a missing digit is 0: still right). Readout 57 → 25 combinators; the dashboard
+  89 → 58; the drawing test program 134 → 55. Painting onto a blank bank is one combinator.
+- Tests read a readout by decoding its lamps (`display::read_digits`).
+- In-game: readouts and dashboard (−2147483648 included) MATCH.

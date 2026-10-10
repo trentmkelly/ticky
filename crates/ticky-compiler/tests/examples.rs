@@ -246,6 +246,24 @@ fn screens() {
     assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1)\n")).contains("width=k"));
     assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1, width=c)\n")).contains("constant number of digits"));
     assert!(error_of(&s("every tick:\n    x = s.rect\n")).contains("is a statement"));
+    // Readouts.
+    assert!(error_of("import display\ninput d: display.Digits(3)\n").contains("is an `output`"));
+    assert!(error_of("import display\noutput d: display.Digits(11)\n").contains("1 to 10 digits"));
+    assert!(error_of("import display\ninput c: int @ C\noutput d: display.Digits(2, colour=c)\n").contains("colour must be a constant"));
+    let c = compile("import display\ninput c: int @ C\noutput d: display.Digits(3)\nevery tick:\n    d = c * 2\n", &opts()).unwrap();
+    assert_eq!(c.cg.screen_lamps[0].len(), 11 * 5);
+    let mut h = ticky_compiler::testrun::Harness::new(&c);
+    for (v, want) in [(-21, Ok(-42)), (7, Ok(14)), (600, Err("overflow")), (-60, Err("overflow")), (-49, Ok(-98))] {
+        h.set(c.program.port_index("c").unwrap(), ticky_compiler::testrun::PVal::Int(v));
+        for _ in 0..40 {
+            h.sim.step();
+        }
+        let got = ticky_compiler::display::read_digits(&c.program.screens[0], |k| h.pixel(0, k));
+        match want {
+            Ok(n) => assert_eq!(got, Ok(n)),
+            Err(m) => assert!(got.is_err_and(|e| e.contains(m))),
+        }
+    }
     // A lamp per pixel, sizes as constants, each pixel on its own signal.
     let c = compile(&s("W = 4\nevery tick:\n    s.fill(c)\n    s[s.width - 1, s.height - 1] = 0xFF0000\n"), &opts()).unwrap();
     assert_eq!(c.cg.screen_lamps[0].len(), 12);

@@ -116,7 +116,7 @@ impl<'a> Harness<'a> {
         fn walk(h: &mut Harness, e: &mut Expr, err: &mut Option<Diag>) {
             if let ExprKind::Index(base, idx) = &mut e.kind {
                 if let ExprKind::Name(n) = &base.kind {
-                    if let Some(si) = h.c.program.screens.iter().position(|s| &s.name == n) {
+                    if let Some(si) = h.c.program.screens.iter().position(|s| &s.name == n && s.kind == crate::display::ScreenKind::Screen) {
                         walk(h, idx, err);
                         let n = h.c.program.screens[si].pixels();
                         match h.eval_int(idx) {
@@ -182,7 +182,12 @@ impl<'a> Harness<'a> {
                 if let Some(k) = h.c.program.consts.get(name) {
                     return Ok(g.cv(k));
                 }
-                Err(Diag::error(span, format!("tests can only read ports and constants; `{name}` is neither")))
+                // A readout: the number its lamps show.
+                if let Some(si) = h.c.program.screens.iter().position(|s| s.name == name && s.kind == crate::display::ScreenKind::Digits) {
+                    let n = crate::display::read_digits(&h.c.program.screens[si], |k| h.pixel(si, k)).map_err(|m| Diag::error(span, m))?;
+                    return Ok(g.konst(n as i32));
+                }
+                Err(Diag::error(span, format!("tests can only read ports, readouts and constants; `{name}` is none of those")))
             }
         }
         let mut g = Graph::default();
