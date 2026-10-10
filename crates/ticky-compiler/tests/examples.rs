@@ -246,6 +246,22 @@ fn screens() {
     assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1)\n")).contains("width=k"));
     assert!(error_of(&s("every tick:\n    s.number(0, 0, c, 1, width=c)\n")).contains("constant number of digits"));
     assert!(error_of(&s("every tick:\n    x = s.rect\n")).contains("is a statement"));
+    // Panels.
+    let pn = |body: &str| format!("import display\ninput c: int @ C\noutput p: display.Panel({{\"a\": (\"signal-check\", \"A\"), \"b\": \"B\"}})\n{body}");
+    assert!(error_of(&pn("every tick:\n    p = \"zz\"\n")).contains("no message \"zz\""));
+    assert!(error_of("import display\noutput p: display.Panel({\"a\": (\"nope-signal\", \"A\")})\n").contains("unknown signal"));
+    assert!(error_of("import display\noutput p: display.Panel({})\n").contains("at least one message"));
+    assert!(error_of("import display\noutput p: display.Panel({\"a\": \"A\"}, blink=1)\n").contains("no setting `blink`"));
+    let c = compile(&pn("every tick:\n    if c > 0:\n        p = \"a\" if c == 1 else \"b\"\n    else:\n        p = 0\n"), &opts()).unwrap();
+    assert_eq!(c.cg.netlist.entities.iter().filter(|e| e.kind.proto_name() == "display-panel").count(), 1);
+    let mut h = ticky_compiler::testrun::Harness::new(&c);
+    for (v, want) in [(1, 1), (2, 2), (0, 0), (1, 1)] {
+        h.set(c.program.port_index("c").unwrap(), ticky_compiler::testrun::PVal::Int(v));
+        for _ in 0..20 {
+            h.sim.step();
+        }
+        assert_eq!(h.pixel(0, 0), want);
+    }
     // Readouts.
     assert!(error_of("import display\ninput d: display.Digits(3)\n").contains("is an `output`"));
     assert!(error_of("import display\noutput d: display.Digits(11)\n").contains("1 to 10 digits"));

@@ -27,6 +27,24 @@ pub struct Screen {
     pub h: usize,
     pub label: Option<String>,
     pub span: Span,
+    /// A panel's messages and settings.
+    pub panel: Option<PanelSpec>,
+}
+
+/// `display.Panel({key: (icon, text), …})`: the value `k + 1` shows message `k`.
+#[derive(Clone, Debug)]
+pub struct PanelSpec {
+    /// `(key, icon, text)` in declaration order.
+    pub messages: Vec<(String, Option<ticky_factorio::Sig>, String)>,
+    pub always_show: bool,
+    pub show_in_chart: bool,
+}
+
+impl PanelSpec {
+    /// The value that shows the message with this key.
+    pub fn code(&self, key: &str) -> Option<i64> {
+        self.messages.iter().position(|m| m.0 == key).map(|k| k as i64 + 1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +53,8 @@ pub enum ScreenKind {
     Screen,
     /// `display.Digits(n)`: an `int` shown in `n` digits.
     Digits,
+    /// `display.Panel(…)`: an `int` choosing a display panel's message (0: none).
+    Panel,
 }
 
 impl Screen {
@@ -69,6 +89,7 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
                 }
                 let r = match what {
                     "Screen" => screen(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
+                    "Panel" => panel(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
                     _ => digits(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span).map(|(sc, colour)| {
                         readouts.push((sc.clone(), colour));
                         sc
@@ -120,6 +141,28 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
         draw_all.push(call("fill", vec![int(0, sp)], vec![]));
         draw_all.push(call("number", vec![int(0, sp), int(0, sp), ex(ExprKind::Name(sc.name.clone()), sp), colour.clone()], vec![("width".into(), int(n as i64, sp))]));
     }
+    // A panel's keys stand for their values where it's assigned or compared; outside tests,
+    // the panel's name is element 0 of the one-element array it shows.
+    let panels: HashMap<String, PanelSpec> = screens.iter().filter_map(|s| Some((s.name.clone(), s.panel.clone()?))).collect();
+    if !panels.is_empty() {
+        for s in &mut body {
+            panel_keys(s, &panels, &mut errs);
+            if !matches!(s.kind, StmtKind::Test { .. }) {
+                panel_assigns(s, &panels);
+                crate::stdlib::stmt_exprs_mut(s, &mut |e| {
+                    crate::stdlib::walk_mut(e, &mut |x| {
+                        if let ExprKind::Name(n) = &x.kind {
+                            if panels.contains_key(n) {
+                                let sp = x.span;
+                                let arr = ex(ExprKind::Name(format!("_panel_{n}")), sp);
+                                x.kind = ExprKind::Index(Box::new(arr), Box::new(int(0, sp)));
+                            }
+                        }
+                    })
+                });
+            }
+        }
+    }
     if let Some((sc, _)) = readouts.first() {
         body.push(Stmt { kind: StmtKind::Every { period: Some(ex(ExprKind::Name(NATURAL.into()), sc.span)), body: draw_all }, span: sc.span });
     }
@@ -163,6 +206,7 @@ fn display_type(ty: &Expr) -> Option<&'static str> {
     match a.as_str() {
         "Screen" => Some("Screen"),
         "Digits" => Some("Digits"),
+        "Panel" => Some("Panel"),
         _ => None,
     }
 }
@@ -204,8 +248,214 @@ fn digits(
         },
     };
     let label = port_label(label)?;
-    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span };
+    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span, panel: None };
     Ok((sc, colour))
+}
+
+/// `output s: display.Panel({"ok": ("signal-check", "Running"), "low": "Low"}, always_show=True,
+/// show_in_chart=False)`: messages by key, each `(icon, text)` or just a text.
+fn panel(
+    dir: PortDir,
+    name: &str,
+    ty: &Expr,
+    has_signal: bool,
+    label: Option<&Expr>,
+    consts: &HashMap<String, Cv>,
+    span: Span,
+) -> Result<Screen, Diag> {
+    if dir != PortDir::Output {
+        return Err(Diag::error(span, "a panel is an `output`"));
+    }
+    if has_signal {
+        return Err(Diag::error(span, "a panel has no `@ signal`"));
+    }
+    let ExprKind::Call { args, kwargs, .. } = &ty.kind else { unreachable!() };
+    let usage = "expected `display.Panel({\"key\": (\"icon-signal\", \"text\"), …})`";
+    let [Expr { kind: ExprKind::Dict(items), .. }] = args.as_slice() else {
+        return Err(Diag::error(ty.span, usage));
+    };
+    let flag = |k: &str| -> Result<bool, Diag> {
+        match kwargs.iter().find(|(n, _)| n == k) {
+            None => Ok(k == "always_show"),
+            Some((_, e)) => match crate::program::eval_const(e, consts, &[]).ok().and_then(|v| v.int()) {
+                Some(v) => Ok(v != 0),
+                None => Err(Diag::error(e.span, format!("`{k}` must be a constant"))),
+            },
+        }
+    };
+    if let Some((k, e)) = kwargs.iter().find(|(k, _)| k != "always_show" && k != "show_in_chart") {
+        return Err(Diag::error(e.span, format!("`display.Panel` has no setting `{k}` (it has `always_show` and `show_in_chart`)")));
+    }
+    let (always_show, show_in_chart) = (flag("always_show")?, flag("show_in_chart")?);
+    let t = ticky_factorio::SignalTable::base();
+    let mut messages = Vec::new();
+    for (k, v) in items {
+        let ExprKind::Str(key) = &k.kind else {
+            return Err(Diag::error(k.span, "a panel's keys are strings"));
+        };
+        if messages.iter().any(|(m, _, _): &(String, _, _)| m == key) {
+            return Err(Diag::error(k.span, format!("`{key}` is given twice")));
+        }
+        let (icon, text) = match &v.kind {
+            ExprKind::Str(text) => (None, text.clone()),
+            ExprKind::Tuple(xs) => match xs.as_slice() {
+                [Expr { kind: ExprKind::Str(icon), span: isp }, Expr { kind: ExprKind::Str(text), .. }] => {
+                    let s = t.lookup_display(icon).or_else(|| t.resolve_ident(icon)).ok_or_else(|| Diag::error(*isp, format!("unknown signal \"{icon}\" for an icon")))?;
+                    (Some(s), text.clone())
+                }
+                _ => return Err(Diag::error(v.span, "a message is `(\"icon-signal\", \"text\")` or `\"text\"`")),
+            },
+            _ => return Err(Diag::error(v.span, "a message is `(\"icon-signal\", \"text\")` or `\"text\"`")),
+        };
+        messages.push((key.clone(), icon, text));
+    }
+    if messages.is_empty() {
+        return Err(Diag::error(ty.span, "a panel needs at least one message"));
+    }
+    let label = port_label(label)?;
+    let spec = PanelSpec { messages, always_show, show_in_chart };
+    Ok(Screen { name: name.to_string(), var: format!("_panel_{name}"), kind: ScreenKind::Panel, w: 1, h: 1, label, span, panel: Some(spec) })
+}
+
+/// `panel = e` → `panel = [e]` and `panel op= e` → `panel = [panel op e]` (whole-array
+/// writes: no feedback through the old value); the names then become the array's.
+fn panel_assigns(s: &mut Stmt, panels: &HashMap<String, PanelSpec>) {
+    let is_panel = |e: &Expr| matches!(&e.kind, ExprKind::Name(n) if panels.contains_key(n));
+    match &mut s.kind {
+        StmtKind::Assign { targets, value } if targets.len() == 1 && is_panel(&targets[0]) => {
+            let ExprKind::Name(n) = &targets[0].kind else { unreachable!() };
+            let sp = value.span;
+            targets[0].kind = ExprKind::Name(format!("_panel_{n}"));
+            *value = ex(ExprKind::List(vec![value.clone()]), sp);
+        }
+        StmtKind::AugAssign { target, op, value } if is_panel(target) => {
+            let ExprKind::Name(n) = &target.kind else { unreachable!() };
+            let sp = value.span;
+            let new = bin(*op, target.clone(), value.clone(), sp);
+            let t = ex(ExprKind::Name(format!("_panel_{n}")), target.span);
+            s.kind = StmtKind::Assign { targets: vec![t], value: ex(ExprKind::List(vec![new]), sp) };
+        }
+        StmtKind::If { body, orelse, .. } => {
+            for x in body.iter_mut().chain(orelse.iter_mut()) {
+                panel_assigns(x, panels);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Def { body, .. }
+        | StmtKind::Every { body, .. }
+        | StmtKind::Process { body, .. }
+        | StmtKind::Block { body, .. }
+        | StmtKind::Sub { body, .. } => {
+            for x in body {
+                panel_assigns(x, panels);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replaces a panel's keys (strings) by their values in assignments to it and comparisons
+/// with it.
+fn panel_keys(s: &mut Stmt, panels: &HashMap<String, PanelSpec>, errs: &mut Vec<Diag>) {
+    let panel_of = |e: &Expr| match &e.kind {
+        ExprKind::Name(n) => panels.get(n),
+        _ => None,
+    };
+    let keys = |e: &mut Expr, p: &PanelSpec, errs: &mut Vec<Diag>| {
+        crate::stdlib::walk_mut(e, &mut |x| {
+            if let ExprKind::Str(k) = &x.kind {
+                match p.code(k) {
+                    Some(c) => x.kind = ExprKind::Int(c),
+                    None => {
+                        let all: Vec<String> = p.messages.iter().map(|m| format!("\"{}\"", m.0)).collect();
+                        errs.push(Diag::error(x.span, format!("the panel has no message \"{k}\"")).with_help(format!("it has {}", all.join(", "))));
+                    }
+                }
+            }
+        })
+    };
+    if let StmtKind::Assign { targets, value } = &mut s.kind {
+        if let [t] = targets.as_slice() {
+            if let Some(p) = panel_of(t) {
+                keys(value, p, errs);
+            }
+        }
+    }
+    let mut cmp_fix = |e: &mut Expr| {
+        crate::stdlib::walk_mut(e, &mut |x| {
+            if let ExprKind::Compare(a, rest) = &mut x.kind {
+                if let [(_, b)] = rest.as_mut_slice() {
+                    if let Some(p) = panel_of(a) {
+                        keys(b, p, errs);
+                    } else if let Some(p) = panel_of(b) {
+                        keys(a, p, errs);
+                    }
+                }
+            }
+        })
+    };
+    crate::stdlib::stmt_exprs_mut(s, &mut cmp_fix);
+    // Statements inside.
+    match &mut s.kind {
+        StmtKind::If { body, orelse, .. } => {
+            for x in body.iter_mut().chain(orelse.iter_mut()) {
+                panel_keys_nested(x, panels, errs);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Def { body, .. }
+        | StmtKind::Every { body, .. }
+        | StmtKind::Process { body, .. }
+        | StmtKind::Test { body, .. }
+        | StmtKind::Block { body, .. }
+        | StmtKind::Sub { body, .. } => {
+            for x in body {
+                panel_keys_nested(x, panels, errs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`panel_keys`] for a statement inside another (its comparisons were already done).
+fn panel_keys_nested(s: &mut Stmt, panels: &HashMap<String, PanelSpec>, errs: &mut Vec<Diag>) {
+    if let StmtKind::Assign { targets, value } = &mut s.kind {
+        if let [Expr { kind: ExprKind::Name(n), .. }] = targets.as_slice() {
+            if let Some(p) = panels.get(n) {
+                let p = p.clone();
+                crate::stdlib::walk_mut(value, &mut |x| {
+                    if let ExprKind::Str(k) = &x.kind {
+                        match p.code(k) {
+                            Some(c) => x.kind = ExprKind::Int(c),
+                            None => errs.push(Diag::error(x.span, format!("the panel has no message \"{k}\""))),
+                        }
+                    }
+                });
+            }
+        }
+    }
+    match &mut s.kind {
+        StmtKind::If { body, orelse, .. } => {
+            for x in body.iter_mut().chain(orelse.iter_mut()) {
+                panel_keys_nested(x, panels, errs);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Def { body, .. }
+        | StmtKind::Every { body, .. }
+        | StmtKind::Process { body, .. }
+        | StmtKind::Test { body, .. }
+        | StmtKind::Block { body, .. }
+        | StmtKind::Sub { body, .. } => {
+            for x in body {
+                panel_keys_nested(x, panels, errs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn port_label(label: Option<&Expr>) -> Result<Option<String>, Diag> {
@@ -252,7 +502,7 @@ fn screen(
         return Err(Diag::error(ty.span, format!("a screen can have at most {MAX_PIXELS} pixels; this one has {}", w * h)));
     }
     let label = port_label(label)?;
-    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span })
+    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span, panel: None })
 }
 
 fn ex(kind: ExprKind, span: Span) -> Expr {

@@ -104,6 +104,7 @@ impl<'a> Harness<'a> {
         let lamp = self.c.cg.screen_lamps[si][k];
         match self.c.cg.netlist.entities[lamp].kind {
             ticky_factorio::netlist::Kind::Lamp(_, Some(sig)) => self.sim.net_value(lamp, ticky_factorio::netlist::Conn::Red, sig),
+            ticky_factorio::netlist::Kind::Panel(ref p) => self.sim.net_value(lamp, ticky_factorio::netlist::Conn::Red, p.sig),
             _ => unreachable!("a pixel is a colour lamp"),
         }
     }
@@ -181,6 +182,12 @@ impl<'a> Harness<'a> {
                 }
                 if let Some(k) = h.c.program.consts.get(name) {
                     return Ok(g.cv(k));
+                }
+                // A panel: the value of the message it shows (0 for none).
+                if let Some(si) = h.c.program.screens.iter().position(|s| s.name == name && s.kind == crate::display::ScreenKind::Panel) {
+                    let v = h.pixel(si, 0);
+                    let n = h.c.program.screens[si].panel.as_ref().unwrap().messages.len() as i32;
+                    return Ok(g.konst(if (1..=n).contains(&v) { v } else { 0 }));
                 }
                 // A readout: the number its lamps show.
                 if let Some(si) = h.c.program.screens.iter().position(|s| s.name == name && s.kind == crate::display::ScreenKind::Digits) {

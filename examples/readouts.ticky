@@ -1,18 +1,26 @@
-# Numeric readouts (`import display`): `display.Digits(n)` is an `int` the program assigns,
-# shown on lamps as n digits (right-aligned, a minus sign before negatives, the first digit
-# fully lit when the number doesn't fit). Here: a temperature, and items per minute.
+# Readouts (`import display`): `display.Digits(n)` is an `int` the program assigns, shown on
+# lamps as n digits (right-aligned, a minus sign before negatives, the first digit fully lit
+# when the number doesn't fit); `display.Panel` is a display panel showing one of its messages,
+# chosen by key. Here: a temperature, items per minute and a status.
 import display
 
 input  heat: int @ H = port("Temperature")
 input  items: int @ I = port("Items arriving (pulses)")
 output temp: display.Digits(4) = port("Temperature")
 output rate: display.Digits(3, colour=0x40FF40) = port("Items per minute")
+output status: display.Panel({"cold": ("signal-blue", "Warming up"), "ok": ("signal-check", "Running"), "hot": ("signal-fire", "Too hot!")}) = port("Status")
 
 total = 0
 last = 0
 every tick:
     temp = heat
     total += items
+    if heat < 100:
+        status = "cold"
+    elif heat > 900:
+        status = "hot"
+    else:
+        status = "ok"
 
 every 60 ticks:
     rate = total - last
@@ -21,11 +29,16 @@ every 60 ticks:
 test "readouts":
     set heat = 873
     set items = 1
-    run 130 ticks
+    run 200 ticks
     assert temp == 873
     assert rate >= 59 and rate <= 61
+    assert status == "ok"
     set heat = -45
     set items = 0
     run 130 ticks
     assert temp == -45
     assert rate == 0
+    assert status == "cold"
+    set heat = 950
+    run 20 ticks
+    assert status == "hot"

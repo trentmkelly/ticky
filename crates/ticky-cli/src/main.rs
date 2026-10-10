@@ -376,7 +376,12 @@ fn screen_trace(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> Vec<Ve
         rows.push(
             on.iter()
                 .zip(&now)
-                .map(|(on, now)| on.iter().zip(now).map(|(o, v)| if *o != 0 { (v & 0xFF_FFFF).to_string() } else { "0".into() }).collect::<Vec<_>>().join(","))
+                .zip(&c.program.screens)
+                .map(|((on, now), sc)| match &sc.panel {
+                    // A panel: the message it shows (as of the tick before).
+                    Some(p) => (if (1..=p.messages.len() as i32).contains(&on[0]) { on[0] } else { 0 }).to_string(),
+                    None => on.iter().zip(now).map(|(o, v)| if *o != 0 { (v & 0xFF_FFFF).to_string() } else { "0".into() }).collect::<Vec<_>>().join(","),
+                })
                 .collect(),
         );
     }

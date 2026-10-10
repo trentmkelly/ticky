@@ -1373,6 +1373,19 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         for b in 0..sc.pixels().div_ceil(bs) {
             let bank = format!("{}#{b}", sc.var);
             let reg = p.states.iter().position(|s| s.name == bank).and_then(|si| shared.state_bun.get(&si).copied());
+            if let Some(spec) = &sc.panel {
+                let sig = crate::ir::Graph::slot(0);
+                let messages = spec.messages.iter().enumerate().map(|(k, (_, icon, text))| (k as i32 + 1, *icon, text.clone())).collect();
+                let kind = Kind::Panel(ticky_factorio::netlist::Panel { sig, messages, always_show: spec.always_show, show_in_chart: spec.show_in_chart });
+                let id = cg.net.add(kind, Role::Pixel { screen: k, index: 0 });
+                let label = sc.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
+                cg.net.entities[id].description = Some(format!("Ticky panel `{}`{label}", sc.name));
+                if let Some(x) = reg {
+                    cg.bread_single(x, id);
+                }
+                lamps.push(id);
+                continue;
+            }
             for j in 0..bs.min(sc.pixels() - b * bs) {
                 let sig = crate::ir::Graph::slot(j);
                 let i = b * bs + j;

@@ -194,6 +194,31 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                         }
                     }
                 }
+                // Verified in-game (scenario panelprobe).
+                Kind::Panel(p) => {
+                    let msgs: Vec<Value> = p
+                        .messages
+                        .iter()
+                        .map(|(v, icon, text)| {
+                            let mut msg = Map::new();
+                            msg.insert("condition".into(), json!({ "first_signal": signal_json(t, p.sig), "constant": v, "comparator": "=" }));
+                            if let Some(i) = icon {
+                                msg.insert("icon".into(), signal_json(t, *i));
+                            }
+                            if !text.is_empty() {
+                                msg.insert("text".into(), json!(text));
+                            }
+                            Value::Object(msg)
+                        })
+                        .collect();
+                    if p.always_show {
+                        m.insert("always_show".into(), json!(true));
+                    }
+                    if p.show_in_chart {
+                        m.insert("show_in_chart".into(), json!(true));
+                    }
+                    Some(json!({ "parameters": msgs }))
+                }
             };
             if let Some(cb) = cb {
                 m.insert("control_behavior".into(), cb);

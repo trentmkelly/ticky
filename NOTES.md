@@ -602,3 +602,17 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
   89 → 58; the drawing test program 134 → 55. Painting onto a blank bank is one combinator.
 - Tests read a readout by decoding its lamps (`display::read_digits`).
 - In-game: readouts and dashboard (−2147483648 included) MATCH.
+
+## 2026-10-10 — Panels: `display.Panel` (SPEC §8.4 item 3)
+- Probe `panelprobe`: the first message whose condition holds shows; same delay as a lamp's
+  on/off; wildcard icons show as the wildcard (not resolved from the wire); blueprint
+  `control_behavior.parameters = [{condition, icon, text}]`, entity keys `always_show`,
+  `show_in_chart`; the control behaviour only exists once the panel is wired.
+- `Kind::Panel` (netlist, blueprint). The panel is a 1 × 1 `Screen` (kind `Panel`, array
+  `_panel_NAME`): `NAME = e` → `_panel_NAME = [e]` (a whole-array write: element writes fed
+  back through the old bank, period 3), `NAME op= e` likewise, reads → `_panel_NAME[0]`;
+  keys → numbers in assignments and comparisons (`panel_keys`), tests excluded from the
+  renaming (they read the panel through `TestNames`).
+- Harness: a screen whose entity is a display panel reports the index of the message shown
+  (matching text and icon); the simulator side uses the previous tick's value. MATCH on a
+  scratch program (including a one-tick message) and on the readouts example.

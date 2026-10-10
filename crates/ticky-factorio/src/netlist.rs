@@ -101,6 +101,19 @@ pub enum Kind {
     /// A small lamp, on while the condition holds; with a colour signal, it shows that
     /// signal's low 24 bits as `0xRRGGBB` (packed-RGB colour mode), otherwise red.
     Lamp(Cond, Option<Sig>),
+    /// A display panel showing the first message whose value equals signal `sig`.
+    Panel(Panel),
+}
+
+#[derive(Clone, Debug)]
+pub struct Panel {
+    pub sig: Sig,
+    /// `(value, icon, text)`: shown while `sig == value` (the first such message wins).
+    pub messages: Vec<(i32, Option<Sig>, String)>,
+    /// The panel's "Always show" setting (text above it, not only on hover).
+    pub always_show: bool,
+    /// "Show in chart": on the map.
+    pub show_in_chart: bool,
 }
 
 impl Kind {
@@ -112,6 +125,7 @@ impl Kind {
             Kind::Constant(_) => "constant-combinator",
             Kind::Pole => "medium-electric-pole",
             Kind::Lamp(..) => "small-lamp",
+            Kind::Panel(_) => "display-panel",
         }
     }
 

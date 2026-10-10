@@ -158,6 +158,19 @@ script.on_event(defines.events.on_tick, function(e)
   -- Screens: each pixel's colour as shown (0xRRGGBB as a number, 0 while off).
   for _, lamps in ipairs(job.screens or {}) do
     local px = {}
+    local first = storage.ents[lamps[1]]
+    if first and first.name == "display-panel" then
+      -- A panel: which message it shows (1-based; 0 for none), by text and icon.
+      local shown, ic = 0, first.display_panel_icon
+      for k, m in ipairs(first.get_control_behavior().messages) do
+        if (m.text or "") == (first.display_panel_text or "") and ((m.icon and m.icon.name) == (ic and ic.name)) then
+          shown = k
+          break
+        end
+      end
+      px[1] = tostring(shown)
+      lamps = {}
+    end
     for k, id in ipairs(lamps) do
       local cb = storage.ents[id].get_control_behavior()
       local c = (not cb.disabled) and cb.color

@@ -577,11 +577,20 @@ one) that difftest-matches the game, and a line in the README.
   for all readouts, which runs as often as its depth allows (no pipelining: about 9 ticks
   behind). Tests read a readout as the number its lamps show (an error for the overflow mark).
   Cost: about 20 combinators per readout, whatever its width (below).
-- [ ] **3. `display.Panel`.** A display panel whose icon and message the program chooses:
-  `output status: display.Panel({"ok": ("signal-check", "Running"), "low": ("signal-alert",
-  "Low on fuel")}) = port("Status")`, then `status = "low"` (or a `Signal` for the icon alone).
-  Each message is a panel condition on one internal value. The probe settles what shows when
-  (map, alt-mode, hover) and documents it.
+- [x] **3. `display.Panel`.** A display panel whose icon and message the program chooses
+  (`examples/readouts.ticky`): `output status: display.Panel({"ok": ("signal-check",
+  "Running"), "low": ("signal-alert", "Low on fuel"), "off": "Stopped"}, always_show=True,
+  show_in_chart=False) = port("Status")`, then `status = "low"`. A message is `(icon, text)`
+  or just a text; the panel's name is an `int` (0 = no message, `k` = the `k`-th message),
+  and its keys stand for their numbers wherever it's assigned or compared (`status ==
+  "low"`, also in tests). `always_show` (default on) is the panel's "Always show" setting
+  (text above it, not only on hover); `show_in_chart` puts it on the map. Hardware: one
+  display panel whose message `k` has the condition `value = k`, reading a one-element array
+  that assignments to the panel replace whole (no feedback); placed like a 1 × 1 screen
+  (`--display status=…`). Verified in-game (scenario `panelprobe`): the first message whose
+  condition holds is shown; it follows the wire like a lamp's on/off; a wildcard icon
+  (`each`, `anything`) is shown as the wildcard itself, so the icon can't come from the wire,
+  and `Signal` values aren't accepted. Difftests compare the message shown each tick.
 - [ ] **4. `speaker`.** A programmable speaker built in:
   `output siren: speaker.Alarm("Reactor too hot", icon="signal-fire") = port("Siren")`, `siren
   = heat > 900` (a global alert with that message and a sound while true), and

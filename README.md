@@ -126,8 +126,9 @@ off and on.
   `0xRRGGBB` (0 = off); see SPEC §8.3 and `examples/screen.ticky`.
   Drawing: `rect`, `hline`, `vline`, `digit`, `number` and `text` (a 3×5 font), at
   positions known when compiling or computed; `examples/dashboard.ticky`.
-- **Readouts** (`output temp: display.Digits(4)`): an `int` shown as digits on lamps;
-  `examples/readouts.ticky`.
+- **Readouts** (`output temp: display.Digits(4)`): an `int` shown as digits on lamps; and
+  **panels** (`display.Panel({"ok": ("signal-check", "Running"), …})`, then `status = "ok"`):
+  a display panel showing the chosen message; `examples/readouts.ticky`.
 - **Item data** (`import items`): `items.stack_size(b)`, `items.rocket_capacity(b)`, one
   selector combinator each (`--space-age` for Space Age's numbers); `examples/warehouse.ticky`.
 - **Quality** (`import quality`): `quality.set(b, "rare")`, `quality.merge(b)`,
