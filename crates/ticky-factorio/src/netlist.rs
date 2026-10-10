@@ -69,7 +69,7 @@ pub struct ConstComb {
 
 /// Selector combinator modes Ticky uses. It reads both input wires and has no network
 /// selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Selector {
     /// The input signal ranked `index` (0-based) by value, largest first if `max`.
     Select { max: bool, index: i32 },
@@ -78,6 +78,16 @@ pub enum Selector {
     SelectAt { max: bool, index: Sig },
     /// How many distinct signals the input has, on `out`.
     Count { out: Sig },
+    /// Each item's stack size (fluids and virtual signals dropped; quality kept).
+    StackSize,
+    /// Each item's rocket capacity (also dropping what can't be launched).
+    RocketCapacity,
+    /// The signals whose quality (an index into `QUALITIES`) satisfies `quality cmp q`.
+    QualityFilter { cmp: CmpOp, q: u8 },
+    /// Every signal at quality `q`; signals that then coincide are added together.
+    QualitySet { q: u8 },
+    /// One input signal at random, a new pick every `interval` ticks (0 = every tick).
+    Random { interval: u32 },
 }
 
 #[derive(Clone, Debug)]

@@ -13,6 +13,7 @@ pub mod lower;
 pub mod pipeline;
 pub mod place;
 pub mod program;
+pub mod stdlib;
 pub mod testrun;
 
 use serde_json::Value;
@@ -76,11 +77,13 @@ pub struct Options {
     pub checks: bool,
     /// Which side each screen (`import display`) goes on, by name (default north).
     pub screen_sides: Vec<(String, layout::Side)>,
+    /// Item data (`items.stack_size`, …) follows Space Age rather than the base game.
+    pub space_age: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new() }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false }
     }
 }
 
@@ -91,10 +94,13 @@ pub struct Compiled {
     pub warnings: Vec<Diag>,
     /// Built with quality signals inside (the game needs the Quality mod).
     pub quality: bool,
+    /// Built for Space Age item data.
+    pub space_age: bool,
 }
 
 pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     ticky_factorio::set_quality_pool(opts.quality);
+    ticky_factorio::items::set_space_age(opts.space_age);
     set_checks(opts.checks);
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
     let fast = compile_module(&module, opts, true)?;
@@ -160,7 +166,7 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     if opts.allow_unknown_signals {
         warnings.retain(|w| !w.message.starts_with("unknown signal"));
     }
-    Ok(Compiled { program, cg, layout, warnings, quality: opts.quality })
+    Ok(Compiled { program, cg, layout, warnings, quality: opts.quality, space_age: opts.space_age })
 }
 
 impl Compiled {

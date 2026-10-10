@@ -42,10 +42,10 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
     let mut body = Vec::new();
     for s in &m.body {
         match &s.kind {
-            StmtKind::Import(n) if n == "display" => {
+            // Checked by `stdlib::imports`.
+            StmtKind::Import(n) => {
                 imported.insert(n.clone());
             }
-            StmtKind::Import(n) => errs.push(Diag::error(s.span, format!("there is no library `{n}` (there is `display`)"))),
             StmtKind::Port { dir, name, ty, signal, label } if is_screen_type(ty) => {
                 if !imported.contains("display") {
                     errs.push(Diag::error(ty.span, "`display.Screen` needs `import display` first"));

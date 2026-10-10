@@ -53,6 +53,9 @@ enum Cmd {
         /// Compile with runtime checks (see `build --checks`).
         #[arg(long)]
         checks: bool,
+        /// Item data for Space Age (see `build --space-age`).
+        #[arg(long)]
+        space_age: bool,
     },
     /// Simulate and print output ports whenever they change.
     Sim {
@@ -72,6 +75,9 @@ enum Cmd {
         /// Compile with runtime checks (see `build --checks`).
         #[arg(long)]
         checks: bool,
+        /// Item data for Space Age (see `build --space-age`).
+        #[arg(long)]
+        space_age: bool,
     },
     /// Run the program in the simulator and in headless Factorio, and compare tick by tick.
     Difftest {
@@ -134,6 +140,10 @@ struct Placement {
     /// halt the process, light the error lamp and put a code on the `error` output (signal-E).
     #[arg(long)]
     checks: bool,
+    /// Item data (`items.stack_size`, `items.rocket_capacity`) as in Space Age rather than
+    /// the base game (a few items differ).
+    #[arg(long)]
+    space_age: bool,
     /// Where a screen (`import display`) goes: `NAME=north` (default), `south`, `east` or
     /// `west` of the rest of the blueprint. Repeat for several screens.
     #[arg(long = "display", value_parser = parse_display)]
@@ -237,7 +247,7 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
             (n.clone(), side)
         })
         .collect();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -435,7 +445,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new() }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false }
 }
 
 fn main() -> ExitCode {
@@ -460,7 +470,7 @@ fn main() -> ExitCode {
             }
         }),
         Cmd::Check { file, opt, place } => build(&file, false, opt, &place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file, allow_unknown_signals, checks } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, ..default_place() }).and_then(|(name, src, c)| {
+        Cmd::Test { file, allow_unknown_signals, checks, space_age } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(name, src, c)| {
             let results = run_tests(&c, &src);
             if results.is_empty() {
                 eprintln!("no tests in {name}");
@@ -483,7 +493,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals, checks } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, ..default_place() }).and_then(|(_, _, c)| {
+        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals, checks, space_age } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
@@ -513,6 +523,9 @@ fn main() -> ExitCode {
             if c.quality {
                 cmd.env("TICKY_QUALITY", "1");
             }
+            if c.space_age {
+                cmd.env("TICKY_SPACE_AGE", "1");
+            }
             let status = cmd.arg(&job).status();
             if !matches!(status, Ok(s) if s.success()) {
                 eprintln!("error: harness failed ({})", script.display());
@@ -527,8 +540,29 @@ fn main() -> ExitCode {
             for (row, px) in expected.iter_mut().zip(screen_trace(&c, &sets, ticks)) {
                 row.extend(px);
             }
-            let actual: Vec<Vec<String>> =
+            let mut actual: Vec<Vec<String>> =
                 trace.lines().map(|l| l.split_whitespace().skip(1).map(|v| v.to_string()).collect()).collect();
+            // Values that depend on random picks can't match: compared as `*`.
+            let cols: Vec<&str> = c
+                .program
+                .ports
+                .iter()
+                .filter(|p| p.dir == PortDir::Output)
+                .map(|p| p.name.as_str())
+                .chain(c.program.screens.iter().map(|s| s.name.as_str()))
+                .collect();
+            let skip: Vec<usize> = cols.iter().enumerate().filter(|(_, n)| c.program.random.contains(**n)).map(|(i, _)| i).collect();
+            if !skip.is_empty() {
+                let names: Vec<&str> = skip.iter().map(|&i| cols[i]).collect();
+                eprintln!("not compared (random): {}", names.join(", "));
+                for row in expected.iter_mut().chain(actual.iter_mut()) {
+                    for &i in &skip {
+                        if let Some(x) = row.get_mut(i) {
+                            *x = "*".into();
+                        }
+                    }
+                }
+            }
             // The harness script reads outputs one tick later than the simulator records them
             // (calibrated: every program shows exactly this shift), so game[i + 1] ~ sim[i].
             const OFFSET: usize = 1;

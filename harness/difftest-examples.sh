@@ -31,3 +31,5 @@ run examples/dispatch.ticky --ticks 100 --set 'demand=signal-A:3,signal-B:9,sign
 run examples/ranking.ticky --ticks 200 --set 'stock=iron-plate:3,copper-plate:5,coal:1' --set pick=iron-plate --set go=1@2 --set go=0@60 --set 'stock=wood:4,coal:4,signal-A:4,water:-2@70' --set pick=coal@70 --set go=1@80
 run examples/alarms.ticky --ticks 200 --set power=80 --set heat=300 --set 'faults=signal-A:2,signal-B:3@20' --set power=30@40 --set heat=750@60 --set 'faults=signal-A:1@80' --set power=2@100 --set heat=950@120 --set power=60@121 --set heat=100@140 --set 'faults=signal-C:9,signal-H:2@160'
 run examples/screen.ticky --ticks 200 --set level=50 --set level=100@40 --set level=0@80 --set level=73@120 --set level=-5@150 --set level=1000@170
+run examples/warehouse.ticky --ticks 80 --set 'stock=iron-plate:250,coal:50,water:500,nuclear-reactor:11@2' --set pick=iron-gear-wheel@epic --set 'stock=iron-plate:100,iron-plate@rare:3,iron-plate@epic:1,coal@legendary:7,stone@uncommon:2@30' --set pick=rocket-silo@40 --set pick=water@50 --set 'stock={}@60'
+run examples/dice.ticky --ticks 300 --set 'queue=iron-plate:10,coal:4' --set 'queue=wood:1@150'

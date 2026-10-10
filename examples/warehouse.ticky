@@ -1,0 +1,45 @@
+# Warehouse bookkeeping with game data (`import items`) and quality (`import quality`): how
+# many stacks each item fills, which items are rare or better, each item's total over all
+# qualities, and facts about one chosen item. Every line is one or two combinators.
+import items
+import quality
+
+input  stock: Bundle = port("Warehouse contents")
+input  pick: Signal = port("An item to look up")
+output stacks: Bundle = port("Stacks each item fills")
+output fancy: Bundle = port("Rare or better (more than one)")
+output merged: Bundle = port("Each item, all qualities together")
+output promoted: Bundle = port("Everything as legendary")
+output slots: int @ S
+output size: int @ Z
+output rocket: int @ R
+output level: int @ Q
+
+every tick:
+    sizes = items.stack_size(stock)
+    stacks = (stock + {s: v - 1 for s, v in sizes.items()}) // sizes
+    slots = stacks.total()
+    fancy = {s: v for s, v in stock.items() if s.quality >= "rare" and v > 1}
+    merged = quality.merge(stock)
+    promoted = quality.set(stock, "legendary")
+    size = items.stack_size(pick)
+    rocket = items.rocket_capacity(pick)
+    level = quality.of(pick)
+
+test "stacks":
+    set stock = Bundle(iron_plate=250, coal=50, water=500, nuclear_reactor=11)
+    run 10 ticks
+    assert stacks == Bundle(iron_plate=3, coal=1, nuclear_reactor=2)
+    assert slots == 6
+    assert len(fancy) == 0
+
+test "quality":
+    set stock = {S("iron-plate"): 100, S("iron-plate", quality="rare"): 3, S("iron-plate", quality="epic"): 1, S("coal", quality="legendary"): 7}
+    set pick = S("iron-gear-wheel", quality="epic")
+    run 10 ticks
+    assert merged == Bundle(iron_plate=104, coal=7)
+    assert fancy == {S("iron-plate", quality="rare"): 3, S("coal", quality="legendary"): 7}
+    assert promoted == {S("iron-plate", quality="legendary"): 104, S("coal", quality="legendary"): 7}
+    assert size == 100
+    assert rocket == 1000
+    assert level == 3

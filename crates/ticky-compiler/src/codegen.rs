@@ -505,6 +505,20 @@ impl Cg {
                 self.bread(ri, id, true);
                 self.bprod(out, id);
             }
+            Op::BSel(b, ref mode, _) => {
+                let label = match mode {
+                    Selector::StackSize => "stack sizes".to_string(),
+                    Selector::RocketCapacity => "rocket capacities".to_string(),
+                    Selector::QualityFilter { cmp, q } => format!("quality {} {}", cmp.symbol(), ticky_factorio::QUALITIES[*q as usize]),
+                    Selector::QualitySet { q } => format!("to quality {}", ticky_factorio::QUALITIES[*q as usize]),
+                    Selector::Random { .. } => "random pick".to_string(),
+                    _ => unreachable!("select and count have their own nodes"),
+                };
+                let id = self.loose(Kind::Selector(mode.clone()), format!("{what}: {label}"));
+                let rb = r(b).bun();
+                self.bread(rb, id, false);
+                self.bprod(out, id);
+            }
             _ => unreachable!("not a bundle node"),
         }
     }
@@ -580,7 +594,7 @@ impl Cg {
         let live: Vec<V> = g.reachable(roots);
         let is_scalar_op = |v: V| matches!(g.op(v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_));
         let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..));
-        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..));
+        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BSel(..));
         let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
 
         // Split the logic into clusters of consecutive combinators. A value whose consumers
@@ -1423,7 +1437,7 @@ fn pipelined_block(
             Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) => {
                 node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
             }
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) => {
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BSel(..) => {
                 node_ref.insert(v, Ref::Bun(cg.bnew()));
             }
             _ => {}
@@ -1478,7 +1492,7 @@ fn pipelined_block(
             continue;
         }
         let t = tau(v).unwrap() - 1;
-        if let Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) = g.op(v) {
+        if let Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BSel(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) = g.op(v) {
             // Operands as of this node's input tick, then the combinators.
             let mut ops: HashMap<V, Ref> = HashMap::new();
             for u in g.operands(v) {

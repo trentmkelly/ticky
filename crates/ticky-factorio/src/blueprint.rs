@@ -109,6 +109,18 @@ fn selector_json(t: &SignalTable, s: &Selector) -> Value {
         Selector::Select { max, index } => json!({ "operation": "select", "select_max": max, "index_constant": index }),
         Selector::SelectAt { max, index } => json!({ "operation": "select", "select_max": max, "index_signal": signal_json(t, *index) }),
         Selector::Count { out } => json!({ "operation": "count", "count_signal": signal_json(t, *out) }),
+        Selector::StackSize => json!({ "operation": "stack-size" }),
+        Selector::RocketCapacity => json!({ "operation": "rocket-capacity" }),
+        Selector::QualityFilter { cmp, q } => {
+            json!({ "operation": "quality-filter", "quality_filter": { "quality": crate::QUALITIES[*q as usize], "comparator": cmp.symbol() } })
+        }
+        Selector::QualitySet { q } => json!({
+            "operation": "quality-transfer",
+            "quality_source_static": { "name": crate::QUALITIES[*q as usize] },
+            "quality_destination_signal": { "type": "virtual", "name": "signal-each" },
+        }),
+        Selector::Random { interval: 0 } => json!({ "operation": "random" }),
+        Selector::Random { interval } => json!({ "operation": "random", "random_update_interval": interval }),
     }
 }
 

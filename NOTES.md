@@ -549,3 +549,23 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
   drops what can't be launched, e.g. the silo).
 - **Random**: one input signal (with its value), uniform-looking; `random_update_interval`
   0 or 1 = a new pick every tick, N = every N ticks; a single input passes through.
+
+## 2026-10-10 — Standard library: `items`, `quality`, `random` (SPEC §8.4 items 6–8)
+- `stdlib.rs`: `import NAME` for any library in `LIBRARIES`; before expansion `lib.f(…)`
+  becomes the builtin `#lib.f(…)` (expansion passes it through; `lower` calls
+  `stdlib::lower_call`). Type inference knows which return bundles/signals.
+- IR: `Op::BSel(b, Selector, nonce)`, one selector combinator in any of the new modes (folded
+  for constant bundles, except random picks; the nonce keeps two random calls apart).
+  Netlist `Selector` gained `StackSize`, `RocketCapacity`, `QualityFilter`, `QualitySet`,
+  `Random`; the simulator implements them from the probes (tests `selector_mode_tests`).
+- Item data: `ticky-factorio/data/items.tsv` from scenario `itemdump` (a selector reading every
+  item at once), base and Space Age columns; `--space-age` picks the column.
+- Pipeline fix: a node whose operands are all constants (a random pick from a constant
+  table) had no time slot and crashed codegen; it now runs just before its first use.
+- Random taint (`stdlib::random_names`): names assigned from random calls, from tainted names
+  or function results, or under tainted conditions (to a fixpoint); difftest prints them and
+  compares them as `*`. In-game (dice example): rolls 1–6 held for 60 ticks, 0 before the
+  first pick; coin 140/150; picks over all queued signals.
+- Runtime `quality.set(b, q)`: five transfers + `BDec` guards on `q`, rather than the
+  selector's "quality from signal" source (it drops the source signal from the output).
+- In-game difftests: warehouse and dice MATCH (dice: random columns skipped).

@@ -267,6 +267,10 @@ impl<'g> Fuser<'g> {
                 let (a, b) = (self.rebuild(a), self.rebuild(b));
                 self.g.bdot(a, b)
             }
+            Op::BSel(b, mode, nonce) => {
+                let b = self.rebuild(b);
+                self.g.intern_op(Op::BSel(b, mode, nonce))
+            }
             Op::SigOf(x) => {
                 let x = self.rebuild(x);
                 self.g.sigval(x)

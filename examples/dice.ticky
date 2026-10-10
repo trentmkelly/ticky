@@ -1,0 +1,37 @@
+# Random numbers (`import random`): the selector combinator's random mode. A die rolled
+# every second, a coin flipped every tick, and a random pick from a bundle (say, which
+# requester to serve next). A tally counts sixes; plain counters stay exact.
+import random
+
+input  queue: Bundle = port("Requests waiting")
+output die: int @ D
+output coin: int @ C
+output serve: Signal = port("Request to serve next")
+output amount: int @ A
+output sixes: int @ X
+output seconds: int @ T
+
+t = 0
+n = 0
+every tick:
+    die = random.randint(1, 6, every=60)
+    coin = random.randint(0, 1)
+    pick = random.choice(queue)
+    serve = pick.argmax()
+    amount = pick.total()
+
+every 60 ticks:
+    t += 1
+    seconds = t
+    if die == 6:
+        n += 1
+    sixes = n
+
+test "ranges":
+    set queue = Bundle(iron_plate=10, coal=4)
+    run 70 ticks
+    assert die >= 1 and die <= 6
+    assert coin == 0 or coin == 1
+    assert serve == S("iron-plate") or serve == S("coal")
+    assert (serve == S("iron-plate") and amount == 10) or (serve == S("coal") and amount == 4)
+    assert seconds >= 1

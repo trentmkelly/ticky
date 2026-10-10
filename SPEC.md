@@ -573,24 +573,39 @@ one) that difftest-matches the game, and a line in the README.
   be configured: `input go: controls.Switch("Start", on=False)` (a constant combinator the
   player toggles; `bool`) and `input target: controls.Setting("Target", 100)` (a constant
   combinator whose value the player edits; `int`). Placed with the ports.
-- [ ] **6. `items`.** Game data from the selector combinator: `items.stack_size(b)` and
-  `items.rocket_capacity(b)` (bundle → bundle, one combinator; fluids and virtual signals
-  dropped; quality kept), and `items.stack_size(sig)` for a `Signal`. The simulator needs the
-  stack sizes and rocket capacities dumped from the game (base, Space Age, quality mod).
-- [ ] **7. `quality`.** Selector quality modes (needs the Quality mod; a compile error with
-  `--no-quality`): `quality.set(b, "rare")` (everything re-tagged, values that coincide added;
-  one combinator), `quality.set(b, sig)` (to the highest quality of `sig` on the input),
-  `quality.merge(b)` (= `quality.set(b, "normal")`), and the filter
-  `{s: v for s, v in b.items() if s.quality >= "rare"}` (any comparison against a constant
-  quality; one combinator, combinable with conditions on `v`). Semantics as in NOTES
+- [x] **6. `items`.** Game data from the selector combinator (`examples/warehouse.ticky`):
+  `items.stack_size(b)` and `items.rocket_capacity(b)` (bundle → bundle, one combinator; the
+  value of each item replaced; fluids and virtual signals dropped, quality kept; rocket
+  capacity also drops what can't be launched, and the game reports −1 for a few tools), and
+  `items.stack_size(sig)` / `items.rocket_capacity(sig)` for a `Signal` (a number, 0 for
+  non-items; constant signals fold to a constant). A few items differ between the base game
+  and Space Age (space science stack size, artillery wagon rocket capacity): the compiler
+  uses the base game's data unless built with `--space-age` (`test`, `sim` and `difftest`
+  take it too). Data: `crates/ticky-factorio/data/items.tsv`, dumped from the game (harness
+  scenario `itemdump`).
+- [x] **7. `quality`.** Selector quality modes (`examples/warehouse.ticky`; they need the
+  Quality mod, so with `--no-quality` they're a compile error):
+  - `quality.set(b, q)`: every signal at quality `q`, values that then coincide added (one
+    combinator). `q` is a name (`"rare"`) or a number 0–4 (normal to legendary); a runtime
+    number costs one transfer per quality plus one decider each to choose (nothing comes out
+    for a number outside 0–4).
+  - `quality.merge(b)` = `quality.set(b, "normal")`: each item's total over all qualities.
+  - `quality.of(sig)`: a `Signal`'s quality as a number 0–4 (four filters and a sum).
+  - `{s: v for s, v in b.items() if s.quality >= "rare"}`: any comparison of `s.quality` with
+    a constant quality is one quality filter; combine it with other conditions with `and`.
+  (The selector's "quality from a signal" source drops that signal from its output, which
+  makes a poor primitive, so `quality.set` takes a number instead.) Semantics as in NOTES
   2026-10-10 (scenario `qprobe`).
-- [ ] **8. `random`.** The selector's random mode: `random.choice(b)` (a random present
-  signal with its value, as a `Bundle` of one signal; `random.key(b)` for the `Signal`),
-  `random.randint(lo, hi)` (constant bounds, at most one bank wide: a constant combinator of
-  `lo..hi` plus a selector), with an optional `every=N` keyword for the update interval. The
-  simulator uses a seeded generator; test assertions on random values should be ranges, and
-  difftest compares everything except values derived from random picks (the program declares
-  nothing; the compiler marks those outputs and the harness skips them).
+- [x] **8. `random`.** The selector's random mode (`examples/dice.ticky`):
+  `random.choice(b)` (one present signal with its value, as a bundle), `random.key(b)` (that
+  signal, as a `Signal`), `random.randint(lo, hi)` (constant bounds, at most one bank of
+  values: a constant combinator holding `1 … n` and a selector, plus `lo - 1`). Each call is
+  its own selector, independent of the others. `every=N` keeps a pick for `N` ticks (the game
+  shows nothing, so 0, until its first pick). The simulator uses a seeded generator, so tests
+  on random values should check ranges; the compiler tracks which outputs and screens may
+  depend on random picks (through variables, function results and conditions) and the
+  difftest compares those as `*` (checked in-game: dice rolls 1–6 held for 60 ticks, coin
+  flips about even, picks over every queued signal).
 - [ ] **9. Placement for every placed peripheral** (screens, digits, panels, speakers,
   controls). Either automatic, as screens are now (beside the logic on a chosen side), or a
   fixed offset the programmer picks: `output screen: display.Screen(16, 6) = port("Meter",

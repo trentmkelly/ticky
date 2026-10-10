@@ -259,6 +259,8 @@ pub struct Program {
     pub error_port: Option<usize>,
     /// Screens (`import display`): signal arrays shown on lamp grids.
     pub screens: Vec<crate::display::Screen>,
+    /// Outputs and screens whose values may depend on random picks (`import random`).
+    pub random: std::collections::HashSet<String>,
 }
 
 impl Program {
@@ -435,7 +437,7 @@ fn is_bundle_expr(e: &Expr, bundles: &HashSet<String>) -> bool {
         ExprKind::Dict(_) | ExprKind::DictComp { .. } => true,
         ExprKind::Name(n) => bundles.contains(n),
         ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n)
-            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx" | "#rank")),
+            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx" | "#rank") || crate::stdlib::returns_bundle(n)),
         ExprKind::Binary(_, a, b) => is_bundle_expr(a, bundles) || is_bundle_expr(b, bundles),
         ExprKind::Unary(_, a) => is_bundle_expr(a, bundles),
         ExprKind::IfExp { then, orelse, .. } => is_bundle_expr(then, bundles) || is_bundle_expr(orelse, bundles),
@@ -552,7 +554,7 @@ fn is_signal_expr(e: &Expr, sigs: &HashSet<String>) -> bool {
     match &e.kind {
         ExprKind::Name(n) => sigs.contains(n),
         ExprKind::Call { func, args, .. } => match &func.kind {
-            ExprKind::Name(n) => n == "S" || n == "#hot",
+            ExprKind::Name(n) => n == "S" || n == "#hot" || crate::stdlib::returns_signal(n),
             ExprKind::Attr(_, m) => args.is_empty() && (m == "argmax" || m == "argmin"),
             _ => false,
         },
@@ -708,12 +710,17 @@ pub fn timing(what: &str, since: std::time::Instant) {
 
 pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let t = std::time::Instant::now();
-    let (m, screens) = crate::display::desugar(m)?;
+    let imported = crate::stdlib::imports(m)?;
+    let mut m = m.clone();
+    crate::stdlib::rewrite_calls(&mut m, &imported)?;
+    let random = if imported.contains("random") { crate::stdlib::random_names(&m) } else { Default::default() };
+    let (m, screens) = crate::display::desugar(&m)?;
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.name.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
     let mut p = analyze_expanded(&expanded, pipeline)?;
     p.screens = screens;
+    p.random = random;
     timing("analyze", t);
     p.calls = calls;
     p.subroutines = subs;
@@ -1105,7 +1112,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         }
     }
     warnings.extend(crate::bundle::take_warnings());
-    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, screens: Vec::new(), checks: sites, error_port })
+    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, screens: Vec::new(), random: Default::default(), checks: sites, error_port })
 }
 
 /// What a process can see.

@@ -29,7 +29,8 @@ fn examples_compile_and_pass() {
         });
         assert!(c.cg.netlist.validate(true).is_empty());
         // The placement options give valid layouts too.
-        let other = Options { poles: false, outputs_west: true, quality: false, ..opts() };
+        // (Programs using `import quality` need quality signals.)
+        let other = Options { poles: false, outputs_west: true, quality: src.contains("import quality"), ..opts() };
         let c2 = compile(&src, &other).unwrap_or_else(|d| panic!("{name} (no poles, west outputs): {}", d[0].message));
         assert!(c2.cg.netlist.validate(false).is_empty());
         assert_eq!(c2.layout.poles, 0);
@@ -253,4 +254,46 @@ fn screens() {
     // Writes at constant positions are combined: a full repaint doesn't chain.
     let c = compile(&s("every tick:\n    for i in range(12):\n        s[i] = c + i\n"), &opts()).unwrap();
     assert!(c.cg.blocks[0].depth <= 3, "depth {}", c.cg.blocks[0].depth);
+}
+
+#[test]
+fn selector_libraries() {
+    use ticky_compiler::testrun::{Harness, PVal};
+    assert!(error_of("x = items.stack_size(Bundle())\n").contains("needs `import items`"));
+    assert!(error_of("import items\nx = items.weight(Bundle())\n").contains("no function `weight`"));
+    assert!(error_of("import random\noutput d: int @ D\nevery tick:\n    d = random.randint(1, 0)\n").contains("lo ≤ hi"));
+    assert!(error_of("import random\ninput n: int @ N\noutput d: int @ D\nevery tick:\n    d = random.randint(1, n)\n").contains("constant bounds"));
+    assert!(error_of("import quality\ninput b: Bundle\noutput o: Bundle\nevery tick:\n    o = quality.set(b, \"shiny\")\n").contains("unknown quality"));
+    assert!(error_of("input b: Bundle\noutput o: Bundle\nevery tick:\n    o = {s: v for s, v in b.items() if s.quality > 1 or v > 2}\n").contains("combined with `and`"));
+    let nq = Options { quality: false, ..opts() };
+    let src = "import quality\ninput b: Bundle\noutput o: Bundle\nevery tick:\n    o = quality.merge(b)\n";
+    assert!(compile(src, &nq).is_err_and(|d| d[0].message.contains("needs the Quality mod")));
+    // A runtime quality number: one transfer per level, chosen by it.
+    let src = "import quality\ninput b: Bundle\ninput q: int @ Q\noutput o: Bundle\nevery tick:\n    o = quality.set(b, q)\n";
+    let c = compile(src, &opts()).unwrap();
+    let t = ticky_factorio::SignalTable::base();
+    let iron = t.lookup("iron-plate").unwrap();
+    let mut h = Harness::new(&c);
+    h.set(c.program.port_index("b").unwrap(), PVal::Bun(vec![(iron, 5), (t.with_quality(iron, 2), 1)]));
+    h.set(c.program.port_index("q").unwrap(), PVal::Int(3));
+    for _ in 0..10 {
+        h.sim.step();
+    }
+    assert_eq!(h.get(c.program.port_index("o").unwrap()), PVal::Bun(vec![(t.with_quality(iron, 3), 6)]));
+    // Space Age item data differs for a few items.
+    let src = "import items\noutput z: int @ Z\nevery tick:\n    z = items.stack_size(S(\"space-science-pack\"))\n";
+    for (space_age, want) in [(false, 2000), (true, 200)] {
+        let c = compile(src, &Options { space_age, ..opts() }).unwrap();
+        let mut h = Harness::new(&c);
+        for _ in 0..5 {
+            h.sim.step();
+        }
+        assert_eq!(h.get(c.program.port_index("z").unwrap()), PVal::Int(want));
+    }
+    // Outputs that depend on random picks are known (the difftest skips them).
+    let src = "import random\noutput a: int @ A\noutput b: int @ B\noutput c: int @ C\nx = 0\nevery tick:\n    r = random.randint(1, 6)\n    if r > 3:\n        x += 1\n    a = x\n    b = 4\n    c = r\n";
+    let c = compile(src, &opts()).unwrap();
+    let mut r: Vec<&String> = c.program.random.iter().filter(|n| ["a", "b", "c"].contains(&n.as_str())).collect();
+    r.sort();
+    assert_eq!(r, ["a", "c"]);
 }

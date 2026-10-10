@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ticky_factorio::{ArOp, CmpOp, Sig, SignalTable};
+use ticky_factorio::{ArOp, CmpOp, Selector, Sig, SignalTable};
 
 pub type V = u32;
 
@@ -165,13 +165,18 @@ pub enum Op {
     BSelectAt(V, bool, V),
     /// Scalar: `Σ a[s] · b[s]` (with `b` one-hot: `a`'s value of that signal).
     BDot(V, V),
+    /// A selector combinator mode applied to a bundle: stack sizes, rocket capacities,
+    /// quality filter or transfer, a random pick (never `Select`/`Count`, which have their
+    /// own nodes). The number tells random picks apart (each call is its own selector); 0
+    /// for the other modes.
+    BSel(V, Selector, u32),
 }
 
 impl Op {
     /// Whether the node's value is a bundle.
     pub fn is_bundle(&self, src_bun: &[bool]) -> bool {
         match self {
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) => true,
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BSel(..) => true,
             Op::Src(s) => src_bun.get(*s as usize).copied().unwrap_or(false),
             _ => false,
         }
@@ -275,7 +280,7 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
         Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::AGet(..) | Op::Each | Op::SigK(_) => Iv::FULL,
-        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) | Op::BDec(_) => Iv::FULL,
+        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) | Op::BDec(_) | Op::BSel(..) => Iv::FULL,
         Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
@@ -373,6 +378,8 @@ pub struct Graph {
     pub path: Vec<V>,
     /// How many bundle comprehensions are being lowered: inside one, `//` and `%` truncate.
     pub in_comp: u32,
+    /// Random picks made so far (`Op::BSel` numbers).
+    pub nonce: u32,
 }
 
 impl Graph {
@@ -1025,6 +1032,43 @@ impl Graph {
         self.intern(Op::BSelectAt(b, max, ix))
     }
 
+    /// A selector mode applied to bundle `b` (folded when `b` is constant, except random picks).
+    pub fn bsel(&mut self, b: V, mode: Selector) -> V {
+        if let Some(vals) = self.as_bconst(b) {
+            let t = SignalTable::base();
+            let item = |s: Sig| t.info(s).kind == ticky_factorio::SignalKind::Item;
+            let folded: Option<Vec<(Sig, i32)>> = match &mode {
+                Selector::StackSize => Some(vals.iter().filter(|(s, _)| item(*s)).filter_map(|(s, _)| Some((*s, ticky_factorio::items::stack_size(t.name(*s))?))).collect()),
+                Selector::RocketCapacity => {
+                    Some(vals.iter().filter(|(s, _)| item(*s)).filter_map(|(s, _)| Some((*s, ticky_factorio::items::rocket_capacity(t.name(*s))?))).collect())
+                }
+                Selector::QualityFilter { cmp, q } => Some(vals.iter().filter(|(s, _)| cmp.apply(t.info(*s).quality as i32, *q as i32)).copied().collect()),
+                Selector::QualitySet { q } => {
+                    let mut m: Vec<(Sig, i32)> = Vec::new();
+                    for (s, v) in vals.iter() {
+                        let s = t.with_quality(*s, *q);
+                        match m.iter_mut().find(|x| x.0 == s) {
+                            Some(x) => x.1 = x.1.wrapping_add(*v),
+                            None => m.push((s, *v)),
+                        }
+                    }
+                    Some(m)
+                }
+                _ => None,
+            };
+            if let Some(v) = folded {
+                return self.bconst(v.into_iter().filter(|x| x.1 != 0));
+            }
+        }
+        let nonce = if matches!(mode, Selector::Random { .. }) {
+            self.nonce += 1;
+            self.nonce
+        } else {
+            0
+        };
+        self.intern(Op::BSel(b, mode, nonce))
+    }
+
     pub fn bselect(&mut self, b: V, max: bool) -> V {
         self.brank(b, max, 0)
     }
@@ -1297,7 +1341,7 @@ impl Graph {
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],
             Op::BDec(ref arms) => arms.iter().flat_map(|(d, x)| dnf_operands(d).into_iter().chain([*x])).collect(),
-            Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) | Op::SigOf(b) => vec![b],
+            Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) | Op::SigOf(b) | Op::BSel(b, ..) => vec![b],
             Op::AGet(b, ix) | Op::BSelectAt(b, _, ix) | Op::BDot(b, ix) => vec![b, ix],
         }
     }

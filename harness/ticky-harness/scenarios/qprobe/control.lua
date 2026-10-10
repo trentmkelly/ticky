@@ -76,6 +76,18 @@ script.on_event(defines.events.on_tick, function(e)
       out[#out + 1] = t[1] .. ": " .. dump(t[2])
       if t.seq then out[#out + 1] = "  seq: " .. table.concat(t.seq, " ", 1, 60) end
     end
+    -- How blueprints store these modes: the selector entities exported as JSON.
+    local inv = game.create_inventory(1)
+    inv.insert{name = "blueprint"}
+    local bp = inv[1]
+    bp.create_blueprint{surface = s, force = f, area = {{0, -2}, {x + 2, 2}}}
+    local seen = {}
+    for _, ent in ipairs(bp.get_blueprint_entities() or {}) do
+      if ent.name == "selector-combinator" and ent.control_behavior then
+        local j = helpers.table_to_json(ent.control_behavior)
+        if not seen[j] then seen[j] = true; out[#out + 1] = "bp: " .. j end
+      end
+    end
     helpers.write_file("ticky/q.txt", table.concat(out, "\n") .. "\n")
     helpers.write_file("ticky/done.txt", "ok")
   end

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use ticky_factorio::{Conn, Cond, EntId, Kind, Netlist, Nets, Operand, Selector, Sig, SignalTable};
+use ticky_factorio::{items, Conn, Cond, EntId, Kind, Netlist, Nets, Operand, Selector, Sig, SignalKind, SignalTable};
 
 /// Values on one wire network, stored densely with a list of touched signals.
 #[derive(Clone)]
@@ -64,6 +64,11 @@ pub struct Sim<'a> {
     each: Sig,
     everything: Sig,
     anything: Sig,
+    /// The random selectors' current picks.
+    picks: HashMap<EntId, Option<Sig>>,
+    /// Seed for the random selectors (the game's picks can't be reproduced; tests on random
+    /// values check ranges).
+    pub seed: u64,
     pub tick: u64,
 }
 
@@ -113,6 +118,8 @@ impl<'a> Sim<'a> {
             each: t.special("signal-each"),
             everything: t.special("signal-everything"),
             anything: t.special("signal-anything"),
+            picks: HashMap::new(),
+            seed: 0x7469636b79,
             tick: 0,
         }
     }
@@ -356,7 +363,7 @@ impl<'a> Sim<'a> {
                                     ins.retain(|(s, _)| s != index);
                                     (max, k)
                                 }
-                                Selector::Count { .. } => unreachable!(),
+                                _ => unreachable!(),
                             };
                             // Ties in the game's order (`SignalTable::rank`): min is max reversed.
                             let t = SignalTable::base();
@@ -372,6 +379,60 @@ impl<'a> Sim<'a> {
                                 vec![]
                             } else {
                                 vec![(*out, ins.len() as i32)]
+                            }
+                        }
+                        Selector::StackSize | Selector::RocketCapacity => {
+                            let t = SignalTable::base();
+                            let mut v: Vec<(Sig, i32)> = ins
+                                .iter()
+                                .filter(|(s, _)| t.info(*s).kind == SignalKind::Item)
+                                .filter_map(|(s, _)| {
+                                    let n = &t.info(*s).name;
+                                    let k = if matches!(sel, Selector::StackSize) { items::stack_size(n) } else { items::rocket_capacity(n) };
+                                    Some((*s, k?))
+                                })
+                                .collect();
+                            v.sort_by_key(|x| x.0);
+                            v
+                        }
+                        Selector::QualityFilter { cmp, q } => {
+                            let t = SignalTable::base();
+                            ins.retain(|(s, _)| cmp.apply(t.info(*s).quality as i32, *q as i32));
+                            ins.sort_by_key(|x| x.0);
+                            ins
+                        }
+                        Selector::QualitySet { q } => {
+                            let t = SignalTable::base();
+                            let mut m: Vec<(Sig, i32)> = Vec::new();
+                            for (s, v) in ins {
+                                let s = t.with_quality(s, *q);
+                                match m.iter_mut().find(|x| x.0 == s) {
+                                    Some(x) => x.1 = x.1.wrapping_add(v),
+                                    None => m.push((s, v)),
+                                }
+                            }
+                            m.retain(|x| x.1 != 0);
+                            m.sort_by_key(|x| x.0);
+                            m
+                        }
+                        Selector::Random { interval } => {
+                            // A new pick every `interval` ticks (every tick for 0 or 1), from
+                            // the inputs in the game's signal order; between picks, the picked
+                            // signal with its current value.
+                            let t = SignalTable::base();
+                            ins.sort_by_key(|(s, _)| t.rank(*s));
+                            let n = (*interval).max(1) as u64;
+                            if self.tick % n == 0 || !self.picks.contains_key(&e) {
+                                let mut h = self.seed ^ (e as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.tick.wrapping_mul(0xD1B5_4A32_D192_ED03);
+                                h ^= h >> 31;
+                                h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                                h ^= h >> 29;
+                                let pick = (!ins.is_empty()).then(|| ins[(h % ins.len() as u64) as usize].0);
+                                self.picks.insert(e, pick);
+                            }
+                            match self.picks[&e] {
+                                Some(s) => ins.into_iter().filter(|x| x.0 == s).collect(),
+                                None => vec![],
                             }
                         }
                     }
@@ -639,5 +700,88 @@ mod wildcard_tests {
             &[q("signal-A", 2), q("signal-A", 0), q("signal-B", 1), q("signal-A", 4), q("signal-A", 1), q("coal", 3)],
             &[q("coal", 3), q("signal-A", 0), q("signal-A", 1), q("signal-A", 2), q("signal-A", 4), q("signal-B", 1)],
         );
+    }
+}
+
+/// The selector modes from the `qprobe` and `itemdump` scenarios (Factorio 2.0.77, Quality mod).
+#[cfg(test)]
+mod selector_mode_tests {
+    use super::*;
+    use ticky_factorio::*;
+
+    fn probe(kind: Kind, red: &[(&str, i32)], green: &[(&str, i32)]) -> Vec<String> {
+        let t = SignalTable::base();
+        let mut n = Netlist::default();
+        let c = n.add(kind, Role::Core);
+        for (vals, conn) in [(red, Conn::InRed), (green, Conn::InGreen)] {
+            if vals.is_empty() {
+                continue;
+            }
+            let values = vals.iter().map(|(s, v)| (t.lookup_display(s).unwrap(), *v)).collect();
+            let k = n.add(Kind::Constant(ConstComb { values, on: true }), Role::Core);
+            n.wire((k, if conn == Conn::InRed { Conn::Red } else { Conn::Green }), (c, conn));
+        }
+        let mut sim = Sim::new(&n);
+        sim.step();
+        sim.step();
+        let mut out: Vec<String> = sim.outputs_of(c).iter().map(|(s, v)| format!("{}={v}", t.display(*s))).collect();
+        out.sort();
+        out
+    }
+
+    const B: &[(&str, i32)] = &[("iron-plate", 100), ("copper-plate", 50), ("signal-A", 7), ("water", 9)];
+    const MIXED: &[(&str, i32)] =
+        &[("iron-plate", 100), ("iron-plate@rare", 3), ("iron-plate@epic", 5), ("signal-A@uncommon", 7), ("signal-B@legendary", 11)];
+
+    #[test]
+    fn quality_modes_match_the_game() {
+        let set = |q| Kind::Selector(Selector::QualitySet { q });
+        assert_eq!(probe(set(4), B, &[]), ["copper-plate@legendary=50", "iron-plate@legendary=100", "signal-A@legendary=7", "water@legendary=9"]);
+        assert_eq!(probe(set(2), MIXED, &[]), ["iron-plate@rare=108", "signal-A@rare=7", "signal-B@rare=11"]);
+        assert_eq!(probe(set(0), MIXED, &[]), ["iron-plate=108", "signal-A=7", "signal-B=11"]);
+        let qf = |cmp| Kind::Selector(Selector::QualityFilter { cmp, q: 2 });
+        assert_eq!(probe(qf(CmpOp::Eq), MIXED, B), ["iron-plate@rare=3"]);
+        assert_eq!(probe(qf(CmpOp::Gt), MIXED, B), ["iron-plate@epic=5", "signal-B@legendary=11"]);
+        assert_eq!(
+            probe(qf(CmpOp::Lt), MIXED, B),
+            ["copper-plate=50", "iron-plate=200", "signal-A=7", "signal-A@uncommon=7", "water=9"]
+        );
+        assert_eq!(probe(qf(CmpOp::Ge), MIXED, B), ["iron-plate@epic=5", "iron-plate@rare=3", "signal-B@legendary=11"]);
+    }
+
+    #[test]
+    fn item_modes_match_the_game() {
+        items::set_space_age(false);
+        let ins = &[("iron-plate", 1), ("iron-gear-wheel@rare", -5), ("nuclear-reactor", 1), ("water", 3), ("signal-A", 1), ("iron-plate@epic", 2)];
+        assert_eq!(
+            probe(Kind::Selector(Selector::StackSize), ins, &[]),
+            ["iron-gear-wheel@rare=100", "iron-plate=100", "iron-plate@epic=100", "nuclear-reactor=10"]
+        );
+        let ins = &[("iron-plate", 1), ("iron-gear-wheel", 5), ("nuclear-reactor", 1), ("rocket-silo", 1)];
+        assert_eq!(
+            probe(Kind::Selector(Selector::RocketCapacity), ins, &[]),
+            ["iron-gear-wheel=1000", "iron-plate=1000", "nuclear-reactor=1"]
+        );
+    }
+
+    #[test]
+    fn random_picks_an_input() {
+        let eight: Vec<(String, i32)> = (1..=8).map(|k| (format!("signal-{k}"), k)).collect();
+        let t = SignalTable::base();
+        let mut n = Netlist::default();
+        let c = n.add(Kind::Selector(Selector::Random { interval: 0 }), Role::Core);
+        let k = n.add(Kind::Constant(ConstComb { values: eight.iter().map(|(s, v)| (t.lookup(s).unwrap(), *v)).collect(), on: true }), Role::Core);
+        n.wire((k, Conn::Red), (c, Conn::InRed));
+        let mut sim = Sim::new(&n);
+        let mut seen = [0; 9];
+        for _ in 0..400 {
+            sim.step();
+            let out = sim.outputs_of(c);
+            if let [(s, v)] = out {
+                assert_eq!(t.name(*s), format!("signal-{v}"));
+                seen[*v as usize] += 1;
+            }
+        }
+        assert!(seen[1..].iter().all(|n| *n > 20), "{seen:?}");
     }
 }

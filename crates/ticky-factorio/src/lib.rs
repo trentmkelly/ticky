@@ -2,6 +2,7 @@
 //! semantics, the entity/wire model ("netlist") and blueprint string encoding.
 
 pub mod blueprint;
+pub mod items;
 pub mod netlist;
 pub mod ops;
 pub mod signals;

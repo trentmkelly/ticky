@@ -124,6 +124,13 @@ off and on.
 - **Screens** (`import display`, then `output s: display.Screen(W, H)`): a grid of lamps north
   of the rest (or `--display s=east`, …), with poles above and below it. Pixels are colours
   `0xRRGGBB` (0 = off); see SPEC §8.3 and `examples/screen.ticky`.
+- **Item data** (`import items`): `items.stack_size(b)`, `items.rocket_capacity(b)`, one
+  selector combinator each (`--space-age` for Space Age's numbers); `examples/warehouse.ticky`.
+- **Quality** (`import quality`): `quality.set(b, "rare")`, `quality.merge(b)`,
+  `quality.of(sig)` and `if s.quality >= "rare"` in comprehensions; `examples/warehouse.ticky`.
+- **Random numbers** (`import random`): `random.randint(lo, hi)`, `random.choice(b)`,
+  `random.key(b)`, with `every=N`; `examples/dice.ticky`. Difftests skip values that depend on
+  random picks.
 - Every port's in-game description names it, e.g. *"Ticky output `half` (int): sends signal-H…"*.
 
 ## Layout of this directory

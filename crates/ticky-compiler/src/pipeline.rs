@@ -228,6 +228,20 @@ pub fn plan(g: &mut Graph, srcs: &[SrcKind], plans: &mut Vec<(usize, WriterPlan)
         let l = &mut latest[v as usize];
         *l = Some(l.map_or(at, |x| x.min(at)));
     }
+    // Nodes computed from constants alone (a random pick from a constant table) aren't
+    // timed by their operands: they run just before their first use.
+    for &v in live.iter().rev() {
+        if tau[v as usize].is_some() || matches!(g.op(v), Op::Const(_) | Op::BConst(_)) || g.operands(v).is_empty() {
+            continue;
+        }
+        let mut t = latest[v as usize];
+        for &w in &users[v as usize] {
+            if let Some(tw) = tau[w as usize] {
+                t = Some(t.map_or(tw - 1, |x| x.min(tw - 1)));
+            }
+        }
+        tau[v as usize] = Some(t.unwrap_or(1));
+    }
     let asap = tau.clone();
     for &v in live.iter().rev() {
         let movable = od[v as usize].is_none() && !matches!(g.op(v), Op::Const(_) | Op::Src(_) | Op::BConst(_));

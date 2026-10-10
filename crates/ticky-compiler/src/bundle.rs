@@ -377,10 +377,28 @@ pub fn comprehension(
     let b = lower::expr(g, names, base)?;
     let b = bundle(g, b, base.span)?;
     let each = g.each();
-    let mut cn = CompNames { inner: names, s, v, each };
     // The domain: the input's signals that pass every condition.
     let mut dom = b;
+    // `s.quality OP q` (also as a part of `and`): a quality filter on the input.
+    let mut rest = Vec::new();
     for c in conds {
+        let parts: Vec<&Expr> = match &c.kind {
+            ExprKind::BoolOp(ticky_syntax::ast::BoolOp::And, xs) => xs.iter().collect(),
+            _ => vec![c],
+        };
+        for p in parts {
+            match crate::stdlib::quality_cond(p, s)? {
+                Some(mode) => dom = g.bsel(dom, mode),
+                None if crate::stdlib::mentions_quality(p, s) => {
+                    return Err(Diag::error(p.span, "`s.quality` can only be compared with a constant quality, combined with `and`")
+                        .with_help("e.g. `if s.quality >= \"rare\" and v > 0`"))
+                }
+                None => rest.push(p.clone()),
+            }
+        }
+    }
+    let mut cn = CompNames { inner: names, s, v, each };
+    for c in &rest {
         let cv = lower::expr(g, &mut cn, c)?;
         let cv = int(g, cv, c.span)?;
         let cv = g.truth(cv);
