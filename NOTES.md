@@ -661,3 +661,13 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
 - Sweeps: dashboard 220 positions × grid/anneal, readouts 72 with three peripherals: no
   failures beyond the expected overlap errors. In-game MATCH: screen inside the grid
   (5, 9), 60 tiles away, annealed (3, 4), readouts+panel mixed, controls far away.
+
+## 2026-10-10: harness scenario `moddump`
+
+`TICKY_SCENARIO=moddump TICKY_SPACE_AGE=1 TICKY_EXTRA_MODS="name=path" harness/run.sh` writes
+`ticky/moddump.tsv`: every item, fluid and recipe with the mod that created it
+(`prototypes.get_history`, which wants the prototype *type*, e.g. `rail-planner`, not "item"),
+its localised_name as JSON, and for recipes the category, ingredients, products and time. It
+works for any mod, with no name-prefix filter (the old `names` scenario only did `nt-`). Used
+to write the user's `cubium-names.txt` / `cubium-recipes.txt` (Cubium 1.0.28: 13 items,
+10 fluids, 82 recipes). Those files are the user's reference, untracked; don't commit them.
