@@ -591,6 +591,18 @@ one) that difftest-matches the game, and a line in the README.
   simulator uses a seeded generator; test assertions on random values should be ranges, and
   difftest compares everything except values derived from random picks (the program declares
   nothing; the compiler marks those outputs and the harness skips them).
+- [ ] **9. Placement for every placed peripheral** (screens, digits, panels, speakers,
+  controls). Either automatic, as screens are now (beside the logic on a chosen side), or a
+  fixed offset the programmer picks: `output screen: display.Screen(16, 6) = port("Meter",
+  at=(0, 10))`, `output temp: display.Digits(4) = port("Temp", at=(10, 20))`. The offset is in
+  tiles from the top-left corner of the logic block (the combinators and ports, not counting
+  peripherals; x east, y south; negative allowed) to the peripheral's own top-left corner.
+  The logic grows east and south from that corner, so a peripheral keeps its place relative
+  to it as the program changes.
+  The CLI can override it (`--at NAME=X,Y`, beside `--display NAME=SIDE`). Fixed peripherals
+  reserve their tiles (and their power poles), so placement, annealing and wire relays work
+  around them; overlapping peripherals, or one too far from everything for its wires, are
+  compile errors naming both. Peripherals without `at=` keep automatic placement.
 
 ---
 
