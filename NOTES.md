@@ -630,3 +630,13 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
   current tick (unlike a panel's message, one tick later). Also writes
   `ticky/peripherals.txt`: every speaker's and panel's settings after import (all round-trip).
 - In-game: scratch program and `sounds` example MATCH.
+
+## 2026-10-10 — Controls: `import controls` (SPEC §8.4 item 5)
+- `stdlib::controls` rewrites `controls.Switch/Setting` ports into `bool`/`int` inputs
+  labelled by their first argument and records them (`Program.controls`); codegen adds a
+  constant combinator (`Role::Control { port }`) wired to the port's red input; layout puts
+  it 1.5 tiles west of the port (north with E-W ports).
+- Simulator: `set_constant_values` (a player editing a constant combinator).
+  `Harness::set` on a control switches/edits its combinator instead of injecting a value;
+  the difftest job lists `control`/`switch` per port and the Lua harness does the same.
+- In-game: scratch program and the example MATCH.

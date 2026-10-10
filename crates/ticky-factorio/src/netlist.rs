@@ -177,6 +177,8 @@ pub enum Role {
     ErrorLamp,
     /// A lamp of a screen (`import display`): pixel `index` of screen `screen`.
     Pixel { screen: usize, index: usize },
+    /// A control (`import controls`): the constant combinator feeding input port `port`.
+    Control { port: EntId },
     Power,
 }
 

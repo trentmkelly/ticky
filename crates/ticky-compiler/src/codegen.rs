@@ -113,6 +113,8 @@ pub struct Codegen {
     pub signals_used: usize,
     /// Each screen's lamps, pixel by pixel.
     pub screen_lamps: Vec<Vec<EntId>>,
+    /// Controls: (input port index, its constant combinator).
+    pub controls: Vec<(usize, EntId)>,
 }
 
 fn c(sig: Sig, cmp: CmpOp, k: i32) -> Cond {
@@ -1154,6 +1156,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
 
     // Input ports.
     let mut port_ents = vec![usize::MAX; p.ports.len()];
+    let mut controls = Vec::new();
     let mut input_raw: HashMap<usize, Ref> = HashMap::new();
     for (pi, port) in p.ports.iter().enumerate() {
         if port.dir != PortDir::Input {
@@ -1183,6 +1186,19 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
             _ => cg.nets[0].members.push((id, Conn::OutGreen)),
         }
         port_ents[pi] = id;
+        // A control: a constant combinator beside the port, wired to its input.
+        if let Some(ctl) = p.controls.iter().find(|c| c.name == port.name) {
+            let (value, on) = if ctl.switch { (1, ctl.initial != 0) } else { (ctl.initial, true) };
+            let k = cg.net.add(Kind::Constant(ConstComb { values: vec![(port.sig, value)], on }), Role::Control { port: id });
+            let label = port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
+            cg.net.entities[k].description = Some(if ctl.switch {
+                format!("Ticky control `{}`{label}: turn this constant combinator on or off.", port.name)
+            } else {
+                format!("Ticky control `{}`{label}: set the value of {} here.", port.name, t.name(port.sig))
+            });
+            cg.net.wire((k, Conn::Red), (id, Conn::InRed));
+            controls.push((pi, k));
+        }
     }
     let shared = Shared { state_sig, state_bun, input_raw, ticks };
     // Where combinational outputs are read from.
@@ -1413,7 +1429,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     }
     cg.bfinish();
 
-    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, procs, signals_used: cg.used, screen_lamps })
+    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, procs, signals_used: cg.used, screen_lamps, controls })
 }
 
 /// A block that runs every tick: logic is a balanced pipeline reading inputs directly.

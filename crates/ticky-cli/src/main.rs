@@ -410,8 +410,16 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
     };
     let mut ports = Vec::new();
     for (i, p) in c.program.ports.iter().enumerate() {
+        // A control: the constant combinator the harness switches or edits.
+        let control = match c.cg.controls.iter().find(|(pi, _)| *pi == i) {
+            Some(&(_, k)) => {
+                let switch = c.program.controls.iter().any(|x| x.name == p.name && x.switch);
+                format!(", control={}, switch={switch}", k + 1)
+            }
+            None => String::new(),
+        };
         ports.push(format!(
-            "{{name={}, dir={}, entity={}, signal={}, bundle={}}}",
+            "{{name={}, dir={}, entity={}, signal={}, bundle={}{control}}}",
             lua_str(&p.name),
             lua_str(if p.dir == PortDir::Input { "in" } else { "out" }),
             c.cg.port_ents[i] + 1,

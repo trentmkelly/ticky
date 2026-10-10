@@ -606,10 +606,15 @@ one) that difftest-matches the game, and a line in the README.
   (0-based ids), the blueprint format (settings read back after import), and each tick the
   speaker's condition (`fulfilled`) with the value it reads; whether the sound and alert
   appear can't be observed without a player, and isn't checked.
-- [ ] **5. `controls`.** Player inputs inside the blueprint, so a program needs no wiring to
-  be configured: `input go: controls.Switch("Start", on=False)` (a constant combinator the
-  player toggles; `bool`) and `input target: controls.Setting("Target", 100)` (a constant
-  combinator whose value the player edits; `int`). Placed with the ports.
+- [x] **5. `controls`.** Player inputs inside the blueprint, so a program needs no wiring to
+  be configured (`examples/controls.ticky`): `input go: controls.Switch("Start", on=False)`
+  (a `bool`: a constant combinator outputting 1 whose on/off switch the player flips) and
+  `input target: controls.Setting("Target", 100)` (an `int`: a constant combinator whose value
+  the player edits; the starting value is a constant). The first argument labels both the
+  combinator and the port; `@ SIG` picks the signal as for any input. Each is an ordinary
+  input port (so wires can add to it) with its constant combinator just west of it (north of
+  it with `--ports=ew`). Tests `set` a control by switching or editing its combinator, and the
+  difftest harness does the same in the game (MATCH).
 - [x] **6. `items`.** Game data from the selector combinator (`examples/warehouse.ticky`):
   `items.stack_size(b)` and `items.rocket_capacity(b)` (bundle → bundle, one combinator; the
   value of each item replaced; fluids and virtual signals dropped, quality kept; rocket

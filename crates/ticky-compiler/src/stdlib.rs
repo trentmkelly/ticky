@@ -18,6 +18,7 @@ use crate::lower::{self, Names};
 pub const LIBRARIES: &[(&str, &[&str])] = &[
     ("display", &[]),
     ("speaker", &[]),
+    ("controls", &[]),
     ("items", &["stack_size", "rocket_capacity"]),
     ("quality", &["set", "merge", "of"]),
     ("random", &["choice", "key", "randint"]),
@@ -75,6 +76,106 @@ pub fn rewrite_calls(m: &mut Module, imported: &HashSet<String>) -> Result<(), V
     }
     if errs.is_empty() {
         Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+/// A control (`import controls`): an input fed by a constant combinator the player edits.
+#[derive(Clone, Debug)]
+pub struct Control {
+    pub name: String,
+    /// `controls.Switch` (the combinator's on/off switch, value 1) rather than
+    /// `controls.Setting` (its value).
+    pub switch: bool,
+    /// The switch's position (0/1) or the setting's value when built.
+    pub initial: i32,
+}
+
+/// `input go: controls.Switch("Start", on=False)` and `input n: controls.Setting("Target",
+/// 100)` become ordinary `bool` / `int` inputs labelled `Start` / `Target`, with the controls.
+pub fn controls(m: &mut Module, imported: &HashSet<String>) -> Result<Vec<Control>, Vec<Diag>> {
+    let mut errs = Vec::new();
+    let mut out = Vec::new();
+    let mut consts: std::collections::HashMap<String, crate::ir::Cv> = Default::default();
+    for s in &mut m.body {
+        if let StmtKind::Assign { targets, value } = &s.kind {
+            if let [Expr { kind: ExprKind::Name(n), .. }] = targets.as_slice() {
+                match crate::program::eval_const(value, &consts, &[]) {
+                    Ok(v) => consts.insert(n.clone(), v),
+                    Err(_) => consts.remove(n),
+                };
+            }
+        }
+        let StmtKind::Port { dir, name, ty, label, .. } = &mut s.kind else { continue };
+        let ExprKind::Call { func, args, kwargs } = &ty.kind else { continue };
+        let ExprKind::Attr(lib, what) = &func.kind else { continue };
+        if !matches!(&lib.kind, ExprKind::Name(l) if l == "controls") {
+            continue;
+        }
+        let span = ty.span;
+        if !imported.contains("controls") {
+            errs.push(Diag::error(span, format!("`controls.{what}` needs `import controls` first")));
+            continue;
+        }
+        let switch = match what.as_str() {
+            "Switch" => true,
+            "Setting" => false,
+            _ => {
+                errs.push(Diag::error(span, format!("`controls` has no `{what}` (it has `Switch` and `Setting`)")));
+                continue;
+            }
+        };
+        if *dir != ticky_syntax::ast::PortDir::Input {
+            errs.push(Diag::error(span, "a control is an `input`"));
+            continue;
+        }
+        let usage = if switch { "expected `controls.Switch(\"label\", on=False)`" } else { "expected `controls.Setting(\"label\", value)`" };
+        let Some(Expr { kind: ExprKind::Str(text), span: lsp }) = args.first() else {
+            errs.push(Diag::error(span, usage));
+            continue;
+        };
+        let (text, lsp) = (text.clone(), *lsp);
+        let num = |e: &Expr| crate::program::eval_const(e, &consts, &[]).ok().and_then(|v| v.int());
+        let initial = if switch {
+            if args.len() != 1 || kwargs.iter().any(|(k, _)| k != "on") {
+                errs.push(Diag::error(span, usage));
+                continue;
+            }
+            match kwargs.first() {
+                None => 0,
+                Some((_, e)) => match num(e) {
+                    Some(v) => (v != 0) as i32,
+                    None => {
+                        errs.push(Diag::error(e.span, "`on` must be a constant"));
+                        continue;
+                    }
+                },
+            }
+        } else {
+            if args.len() != 2 || !kwargs.is_empty() {
+                errs.push(Diag::error(span, usage));
+                continue;
+            }
+            match num(&args[1]) {
+                Some(v) => v,
+                None => {
+                    errs.push(Diag::error(args[1].span, "a setting's starting value must be a constant"));
+                    continue;
+                }
+            }
+        };
+        if label.is_some() {
+            errs.push(Diag::error(span, "a control is labelled by its first argument, not `= port(…)`"));
+            continue;
+        }
+        out.push(Control { name: name.clone(), switch, initial });
+        *ty = Expr { kind: ExprKind::Name(if switch { "bool" } else { "int" }.into()), span };
+        let port = Expr { kind: ExprKind::Name("port".into()), span: lsp };
+        *label = Some(Expr { kind: ExprKind::Call { func: Box::new(port), args: vec![Expr { kind: ExprKind::Str(text), span: lsp }], kwargs: vec![] }, span: lsp });
+    }
+    if errs.is_empty() {
+        Ok(out)
     } else {
         Err(errs)
     }

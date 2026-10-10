@@ -118,6 +118,15 @@ script.on_event(defines.events.on_tick, function(e)
       for k, v in ipairs(st.values) do
         section.set_slot(k, {value = {type = v.type, name = v.name, quality = v.quality or "normal"}, min = v.value})
       end
+    elseif st.t == i and job.ports[st.port].control then
+      -- A control: switch its constant combinator, or edit its value, as a player would.
+      local p = job.ports[st.port]
+      local cb = storage.ents[p.control].get_control_behavior()
+      if p.switch then
+        cb.enabled = st.value ~= 0
+      else
+        cb.get_section(1).set_slot(1, {value = {type = p.signal.type, name = p.signal.name, quality = "normal"}, min = st.value})
+      end
     elseif st.t == i then
       local p = job.ports[st.port]
       local section = storage.injectors[st.port].get_control_behavior().get_section(1)

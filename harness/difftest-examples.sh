@@ -36,3 +36,4 @@ run examples/dice.ticky --ticks 300 --set 'queue=iron-plate:10,coal:4' --set 'qu
 run examples/dashboard.ticky --ticks 300 --set temp=345 --set level=50 --set temp=950@60 --set level=100@100 --set temp=-42@150 --set level=-5@180 --set temp=123456@200 --set level=33@230 --set temp=0@260
 run examples/readouts.ticky --ticks 400 --set heat=873 --set items=1 --set heat=-45@100 --set items=0@130 --set heat=99999@200 --set items=3@220 --set heat=-999@260 --set heat=0@300 --set items=17@320
 run examples/sounds.ticky --ticks 300 --set heat=950@5 --set bell=1@20 --set heat=100@60 --set bell=0@120 --set bell=1@150 --set bell=0@151 --set heat=901@200 --set heat=900@260
+run examples/controls.ticky --ticks 120 --set stock=50 --set target=40@20 --set enabled=0@40 --set target=500@50 --set enabled=1@60 --set stock=-30@80 --set target=0@100

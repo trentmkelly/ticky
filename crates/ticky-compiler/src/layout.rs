@@ -171,6 +171,13 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             }
         }
     }
+    // Controls beside their input ports: west of them (in a row: north).
+    for i in 0..net.entities.len() {
+        if let Role::Control { port } = net.entities[i].role {
+            let (x, y) = net.entities[port].pos;
+            net.entities[i].pos = if ew { (x, y - 1.5) } else { (x - 1.5, y) };
+        }
+    }
     let north_w = 1 + inputs.len() + if north_outs { n_out } else { 0 };
 
     let n = core.len().max(1);

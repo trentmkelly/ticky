@@ -64,6 +64,8 @@ pub struct Sim<'a> {
     each: Sig,
     everything: Sig,
     anything: Sig,
+    /// Constant combinators whose signals were changed (`set_constant_values`).
+    const_values: HashMap<EntId, Vec<(Sig, i32)>>,
     /// The random selectors' current picks.
     picks: HashMap<EntId, Option<Sig>>,
     /// Seed for the random selectors (the game's picks can't be reproduced; tests on random
@@ -118,6 +120,7 @@ impl<'a> Sim<'a> {
             each: t.special("signal-each"),
             everything: t.special("signal-everything"),
             anything: t.special("signal-anything"),
+            const_values: HashMap::new(),
             picks: HashMap::new(),
             seed: 0x7469636b79,
             tick: 0,
@@ -135,6 +138,11 @@ impl<'a> Sim<'a> {
 
     pub fn set_constant_on(&mut self, e: EntId, on: bool) {
         self.const_on[e] = on;
+    }
+
+    /// A constant combinator's signals, as if the player edited them.
+    pub fn set_constant_values(&mut self, e: EntId, values: Vec<(Sig, i32)>) {
+        self.const_values.insert(e, values);
     }
 
     /// The value of `s` in entity `e`'s own output.
@@ -247,7 +255,8 @@ impl<'a> Sim<'a> {
                 }
                 Kind::Constant(c) if self.const_on[e] => {
                     let (r, g) = (self.net(e, Conn::Red), self.net(e, Conn::Green));
-                    for &(s, v) in &c.values {
+                    let values = self.const_values.get(&e).unwrap_or(&c.values);
+                    for &(s, v) in values {
                         self.nets[r].add(s, v);
                         if g != r {
                             self.nets[g].add(s, v);

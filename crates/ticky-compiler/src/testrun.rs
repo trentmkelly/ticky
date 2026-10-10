@@ -74,6 +74,21 @@ impl<'a> Harness<'a> {
     }
 
     pub fn set(&mut self, port: usize, v: PVal) {
+        // A control: its constant combinator changes (switched, or its value set).
+        if let Some(&(_, k)) = self.c.cg.controls.iter().find(|(pi, _)| *pi == port) {
+            let ctl = &self.c.program.controls.iter().find(|c| c.name == self.c.program.ports[port].name).expect("control");
+            let x = match &v {
+                PVal::Int(x) => *x,
+                PVal::Bun(_) => 0,
+            };
+            if ctl.switch {
+                self.sim.set_constant_on(k, x != 0);
+            } else {
+                self.sim.set_constant_values(k, vec![(self.c.program.ports[port].sig, x)]);
+            }
+            self.inputs.insert(port, v);
+            return;
+        }
         let p = &self.c.program.ports[port];
         let vals = match &v {
             PVal::Int(k) => vec![(p.sig, *k)],

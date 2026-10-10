@@ -261,6 +261,8 @@ pub struct Program {
     pub screens: Vec<crate::display::Screen>,
     /// Outputs and screens whose values may depend on random picks (`import random`).
     pub random: std::collections::HashSet<String>,
+    /// Inputs fed by controls in the blueprint (`import controls`).
+    pub controls: Vec<crate::stdlib::Control>,
 }
 
 impl Program {
@@ -713,6 +715,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let imported = crate::stdlib::imports(m)?;
     let mut m = m.clone();
     crate::stdlib::rewrite_calls(&mut m, &imported)?;
+    let controls = crate::stdlib::controls(&mut m, &imported)?;
     let random = if imported.contains("random") { crate::stdlib::random_names(&m) } else { Default::default() };
     let (m, screens) = crate::display::desugar(&m)?;
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
@@ -721,6 +724,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mut p = analyze_expanded(&expanded, pipeline)?;
     p.screens = screens;
     p.random = random;
+    p.controls = controls;
     timing("analyze", t);
     p.calls = calls;
     p.subroutines = subs;
@@ -1115,7 +1119,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         }
     }
     warnings.extend(crate::bundle::take_warnings());
-    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, screens: Vec::new(), random: Default::default(), checks: sites, error_port })
+    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, screens: Vec::new(), random: Default::default(), controls: Vec::new(), checks: sites, error_port })
 }
 
 /// What a process can see.

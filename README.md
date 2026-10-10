@@ -132,6 +132,9 @@ off and on.
 - **Sounds** (`import speaker`): `speaker.Alarm("Too hot", icon="signal-fire")` (a `bool`:
   a global alert and siren while true) and `speaker.Notes("piano")` (`tune.play(n)`);
   `examples/sounds.ticky`.
+- **Controls** (`import controls`): `controls.Switch("Start")` and `controls.Setting("Target",
+  100)`, constant combinators in the blueprint the player flips or edits;
+  `examples/controls.ticky`.
 - **Item data** (`import items`): `items.stack_size(b)`, `items.rocket_capacity(b)`, one
   selector combinator each (`--space-age` for Space Age's numbers); `examples/warehouse.ticky`.
 - **Quality** (`import quality`): `quality.set(b, "rare")`, `quality.merge(b)`,

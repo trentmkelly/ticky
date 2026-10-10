@@ -1,0 +1,31 @@
+# Controls (`import controls`): settings in the blueprint itself, so the program needs no
+# wiring to be configured. `controls.Switch` is a constant combinator to turn on or off (a
+# `bool`); `controls.Setting` one whose value you edit (an `int`). Each sits beside its input
+# port, which still takes wires too. Here: a top-up requester with an on/off switch and a
+# target amount.
+import controls
+
+input  enabled: controls.Switch("Requests on", on=True)
+input  target: controls.Setting("Target amount", 200)
+input  stock: int @ S = port("Amount in the chest")
+output request: int @ R = port("Amount to request")
+
+every tick:
+    request = max(target - stock, 0) if enabled else 0
+
+test "requests up to the target":
+    set stock = 50
+    run 10 ticks
+    assert request == 150
+    set target = 40
+    run 10 ticks
+    assert request == 0
+
+test "switched off":
+    set stock = 0
+    set enabled = False
+    run 10 ticks
+    assert request == 0
+    set enabled = True
+    run 10 ticks
+    assert request == 200
