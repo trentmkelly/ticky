@@ -531,3 +531,21 @@ for colours and this tick for on/off (`screen_trace` in the CLI).
 - Fixed (pre-existing, found by fuzz_bundles): inside a comprehension, `//`/`%` in parts that
   don't involve the element (`{s: -2 % k …}`) floored instead of truncating as SPEC §4.3.5
   says (`Graph::in_comp`).
+
+## 2026-10-10 — The other selector modes (scenario `qprobe`, Factorio 2.0.77)
+Ticky uses `select` (with constant or signal index) and `count`. 2.0.77 also has `random`,
+`stack-size`, `rocket-capacity`, `quality-filter` and `quality-transfer` (the wiki's "time"
+and "quality select" modes aren't in 2.0.77). The quality modes need the Quality mod. Findings:
+- **Quality transfer**, target `each`: every input signal re-tagged to one quality, with
+  values of signals that now coincide summed (`iron@normal=100, @rare=3, @epic=5` → `iron@rare=108`).
+  Static quality via the API needs a table (`quality_source_static = {name = "rare"}`; a bare
+  string is silently ignored, giving normal). From a signal: the highest quality of that signal
+  on the inputs, and the source signal is left out of the output; absent → no output.
+  Specific target: just that signal, read at its own quality. `anything`/`everything` refused.
+- **Quality filter**: passes the signals whose quality satisfies `cmp q` (`=`, `≠`, `<`, `>`,
+  `≤`, `≥`), summing both wires.
+- **Stack size** / **rocket capacity**: per item, the value replaced by the stack size
+  (rocket capacity), quality kept; fluids and virtual signals dropped (rocket capacity also
+  drops what can't be launched, e.g. the silo).
+- **Random**: one input signal (with its value), uniform-looking; `random_update_interval`
+  0 or 1 = a new pick every tick, N = every N ticks; a single input passes through.
