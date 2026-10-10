@@ -121,6 +121,9 @@ off and on.
 - **Error lamp** (`--checks` only): the lamp beside the RUN switch lights red when a runtime
   check fails (an `assert`, an index out of range, a division by zero); the `error` output
   (signal-E) gives the check's code, and the build report lists what each code means.
+- **Screens** (`import display`, then `output s: display.Screen(W, H)`): a grid of lamps north
+  of the rest (or `--display s=east`, …), with poles above and below it. Pixels are colours
+  `0xRRGGBB` (0 = off); see SPEC §8.3 and `examples/screen.ticky`.
 - Every port's in-game description names it, e.g. *"Ticky output `half` (int): sends signal-H…"*.
 
 ## Layout of this directory

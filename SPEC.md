@@ -504,6 +504,37 @@ in-game description.
   program state. Pipelines are latency-balanced so that no output ever briefly mixes new and old
   values. Several outputs written in the same step change on the same tick.
 
+### 8.3 Screens (`import display`)
+
+```python
+import display
+
+output screen: display.Screen(16, 6) = port("Level meter")
+
+screen.fill(0x202020)                 # every pixel
+screen[x, y] = 0xFF8800               # one pixel, x and y constant or computed
+c = screen[3, 1]
+```
+
+- A screen is a grid of lamps, built into the blueprint beside the rest (`ticky build
+  --display screen=north|south|east|west`, default north; several screens on one side sit side
+  by side). Each lamp shows its pixel's low 24 bits as `0xRRGGBB` (the lamp's packed-RGB
+  colour mode); a pixel of 0 is off.
+- In code it is an array of `width × height` numbers, pixel `(x, y)` at index `y * width + x`
+  (`screen[i]` also works), all 0 to begin with. It is a signal array (§4.4): a runtime write
+  takes about 3 ticks; writes at constant positions in one step are combined into a few
+  combinators, however many pixels (pixels set to the same value share them). `screen.width`
+  and `screen.height` are constants. At most 4096 pixels.
+- Like any variable, a screen has one writer (a process or `every` block); anything can read
+  it. Tests read pixels with `screen[x, y]` (the value the lamp receives).
+- **Power.** A row of medium poles runs just above and just below each screen, which powers
+  screens up to 6 rows tall; taller screens need substations (the compiler warns), and with
+  `--no-poles` powering everything is up to you.
+- **Verified in-game** (scenario `rgbprobe`, difftests): the lamp shows `value & 0xFFFFFF`
+  (so `-1` is white and `0x1000000` black), with "on while ≠ 0" as its condition; quality
+  signals work as colour signals; the colour follows the network on the same tick, on/off one
+  tick later.
+
 ---
 
 ## 9. Sequential code: processes
@@ -1116,9 +1147,8 @@ Factorio differential harness.
 2. **Array ↔ bundle conversion.** Should `xs.as_bundle()` / `Bundle → list` be exposed, given
    that it leaks the internal signal table? Alternative: arrays declared with explicit signals,
    e.g. `list[int] @ [A, B, C, …]`.
-3. **Displays.** Factorio 2.0 display panels show icons and text chosen by conditions **[verify
-   whether they can render numeric values]**. Numeric output may need a lamp-based
-   seven-segment library.
+3. ~~**Displays.**~~ Lamp screens: §8.3. Display panels only show a fixed label on hover, so
+   they're low priority. Still to do: drawing helpers (rectangles, digits, text).
 4. **Floor division default.** This spec picks Python semantics for `//` and `%`. If negative
    numbers turn out to be common in real programs, reconsider making truncation the default.
 5. **`every tick` naming.** Since `P` can be > 1, should the as-fast-as-possible form be named

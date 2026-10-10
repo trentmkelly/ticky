@@ -257,6 +257,8 @@ pub struct Program {
     pub checks: Vec<CheckSite>,
     /// With `--checks`: the `error` output port (signal-E) carrying the first failed check's code.
     pub error_port: Option<usize>,
+    /// Screens (`import display`): signal arrays shown on lamp grids.
+    pub screens: Vec<crate::display::Screen>,
 }
 
 impl Program {
@@ -706,9 +708,12 @@ pub fn timing(what: &str, since: std::time::Instant) {
 
 pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let t = std::time::Instant::now();
-    let (expanded, (calls, subs)) = crate::expand::expand_module(m)?;
+    let (m, screens) = crate::display::desugar(m)?;
+    let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.name.clone()).collect();
+    let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
     let mut p = analyze_expanded(&expanded, pipeline)?;
+    p.screens = screens;
     timing("analyze", t);
     p.calls = calls;
     p.subroutines = subs;
@@ -1100,7 +1105,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         }
     }
     warnings.extend(crate::bundle::take_warnings());
-    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, checks: sites, error_port })
+    Ok(Program { calls: Default::default(), subroutines: Default::default(), ports, states, consts, blocks, procs, tests, warnings, screens: Vec::new(), checks: sites, error_port })
 }
 
 /// What a process can see.

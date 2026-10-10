@@ -99,8 +99,9 @@ pub enum BTerm {
     /// Scalar arithmetic `a op b` written straight onto signal `s` of the bundle (instead of
     /// computing it on the bus and copying it with `One`).
     Ar(ArOp, V, V, Sig),
-    /// Scalar conditions (as [`Op::Dec`]) written straight onto signal `s` of the bundle.
-    Dec(Vec<(Dnf, i32)>, Sig),
+    /// Constant signals under conditions: each arm's constants while its condition holds (a
+    /// decider per arm). Made by fusion from conditions written into bundles.
+    Dec(Vec<(Dnf, BVals)>),
 }
 
 /// Index of a block-level source (own state register or sampled input).
@@ -200,7 +201,7 @@ impl BTerm {
             BTerm::K(_) => vec![],
             BTerm::Shift(_, x, _) => vec![*x],
             BTerm::Ar(_, a, b, _) => vec![*a, *b],
-            BTerm::Dec(arms, _) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
+            BTerm::Dec(arms) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
             BTerm::Hot(t, ix, _) => vec![*t, *ix],
             BTerm::Fold(b, ..) => vec![*b],
         }
@@ -370,6 +371,8 @@ pub struct Graph {
     /// Conditions under which the code being lowered runs (the branches of `if`s and of
     /// `x if c else y`, the right side of `and`/`or`): a check only fails where it runs.
     pub path: Vec<V>,
+    /// How many bundle comprehensions are being lowered: inside one, `//` and `%` truncate.
+    pub in_comp: u32,
 }
 
 impl Graph {
@@ -1221,6 +1224,11 @@ impl Graph {
             let mut sigs: Vec<Sig> = pa.keys().chain(pb.keys()).copied().collect();
             sigs.sort();
             sigs.dedup();
+            // Only for a few signals (each becomes a decider or two; a bundle select costs a
+            // decider per side however many signals).
+            if sigs.len() > 8 {
+                return self.intern(Op::BMux { t, f, a, b });
+            }
             let z = self.konst(0);
             let mut terms = Vec::new();
             for s in sigs {
@@ -1251,6 +1259,22 @@ impl Graph {
             return self.bun(terms);
         }
         let z = self.konst(0);
+        // Write combining: if `b` is itself `b0` with some signals set, set this one on `b0`
+        // too (replacing an earlier write to it), so a run of writes stays one stage deep.
+        if let Op::Bun(terms) = self.op(b).clone() {
+            let base = terms.iter().find_map(|t| match t {
+                BTerm::Map(ArOp::Add, b0, k) if *k == z => Some(*b0),
+                _ => None,
+            });
+            if let Some(b0) = base {
+                let sets_on_b0 = |t: &BTerm| matches!(t, BTerm::Set(bb, _, _) if *bb == b0) || matches!(t, BTerm::Map(ArOp::Add, bb, k) if *bb == b0 && *k == z);
+                if terms.iter().all(sets_on_b0) {
+                    let mut new: Vec<BTerm> = terms.into_iter().filter(|t| !matches!(t, BTerm::Set(_, s2, _) if *s2 == s)).collect();
+                    new.push(BTerm::Set(b0, s, x));
+                    return self.bun(new);
+                }
+            }
+        }
         self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Set(b, s, x)])
     }
 

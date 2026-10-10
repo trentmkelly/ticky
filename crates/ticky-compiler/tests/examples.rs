@@ -229,3 +229,28 @@ test "functions":
         assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
     }
 }
+
+#[test]
+fn screens() {
+    let s = |body: &str| format!("import display\ninput c: int @ C\noutput s: display.Screen(4, 3)\n{body}");
+    assert!(error_of("output s: display.Screen(4, 3)\n").contains("needs `import display`"));
+    assert!(error_of("import graphics\n").contains("no library `graphics`"));
+    assert!(error_of("import display\ninput s: display.Screen(4, 3)\n").contains("is an `output`"));
+    assert!(error_of("import display\noutput s: display.Screen(100, 100)\n").contains("at most 4096"));
+    assert!(error_of("import display\ninput c: int @ C\noutput s: display.Screen(c, 3)\n").contains("positive constants"));
+    assert!(error_of(&s("every tick:\n    s.blink()\n")).contains("has no `blink`"));
+    assert!(error_of(&s("every tick:\n    s[1, 2, 3] = 1\n")).contains("screen[x, y]"));
+    // A lamp per pixel, sizes as constants, each pixel on its own signal.
+    let c = compile(&s("W = 4\nevery tick:\n    s.fill(c)\n    s[s.width - 1, s.height - 1] = 0xFF0000\n"), &opts()).unwrap();
+    assert_eq!(c.cg.screen_lamps[0].len(), 12);
+    let mut h = ticky_compiler::testrun::Harness::new(&c);
+    h.set(c.program.port_index("c").unwrap(), ticky_compiler::testrun::PVal::Int(0x123456));
+    for _ in 0..10 {
+        h.sim.step();
+    }
+    assert_eq!(h.pixel(0, 0), 0x123456);
+    assert_eq!(h.pixel(0, 11), 0xFF0000);
+    // Writes at constant positions are combined: a full repaint doesn't chain.
+    let c = compile(&s("every tick:\n    for i in range(12):\n        s[i] = c + i\n"), &opts()).unwrap();
+    assert!(c.cg.blocks[0].depth <= 3, "depth {}", c.cg.blocks[0].depth);
+}

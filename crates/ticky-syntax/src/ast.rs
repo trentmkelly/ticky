@@ -153,6 +153,8 @@ pub enum StmtKind {
     Every { period: Option<Expr>, body: Vec<Stmt> },
     Process { name: String, body: Vec<Stmt> },
     Test { name: String, body: Vec<Stmt> },
+    /// `import display`: a library module (only at the top level).
+    Import(String),
     /// Test-only: `set port = value`.
     TestSet { name: String, value: Expr },
     /// Test-only: `run N ticks`.

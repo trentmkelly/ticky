@@ -88,7 +88,9 @@ pub enum Kind {
     Constant(ConstComb),
     Pole,
     /// A small lamp lit (red) while its circuit condition holds.
-    Lamp(Cond),
+    /// A small lamp, on while the condition holds; with a colour signal, it shows that
+    /// signal's low 24 bits as `0xRRGGBB` (packed-RGB colour mode), otherwise red.
+    Lamp(Cond, Option<Sig>),
 }
 
 impl Kind {
@@ -99,7 +101,7 @@ impl Kind {
             Kind::Selector(_) => "selector-combinator",
             Kind::Constant(_) => "constant-combinator",
             Kind::Pole => "medium-electric-pole",
-            Kind::Lamp(_) => "small-lamp",
+            Kind::Lamp(..) => "small-lamp",
         }
     }
 
@@ -129,6 +131,8 @@ pub enum Role {
     RunSwitch,
     /// With `--checks`: lit while the error code is nonzero.
     ErrorLamp,
+    /// A lamp of a screen (`import display`): pixel `index` of screen `screen`.
+    Pixel { screen: usize, index: usize },
     Power,
 }
 

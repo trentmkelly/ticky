@@ -155,6 +155,21 @@ script.on_event(defines.events.on_tick, function(e)
       row[#row + 1] = tostring(v or 0)
     end
   end
+  -- Screens: each pixel's colour as shown (0xRRGGBB as a number, 0 while off).
+  for _, lamps in ipairs(job.screens or {}) do
+    local px = {}
+    for k, id in ipairs(lamps) do
+      local cb = storage.ents[id].get_control_behavior()
+      local c = (not cb.disabled) and cb.color
+      if c then
+        local function b(x) return math.floor(x * 255 + 0.5) end
+        px[k] = tostring(b(c.r) * 65536 + b(c.g) * 256 + b(c.b))
+      else
+        px[k] = "0"
+      end
+    end
+    row[#row + 1] = table.concat(px, ",")
+  end
   storage.lines[#storage.lines + 1] = table.concat(row, " ")
   if i == job.ticks - 1 then
     if job.screenshot then

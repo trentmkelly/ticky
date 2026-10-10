@@ -1,0 +1,34 @@
+# A lamp screen (`import display`): a level meter. Each column of the bar lights when the
+# level reaches it, green, then yellow, then red near the top; a blinking pixel in the
+# corner shows the program is running.
+import display
+
+input  level: int @ L = port("Level, 0-100")
+output screen: display.Screen(16, 6) = port("Level meter")
+
+GREEN = 0x00C000
+YELLOW = 0xE0C000
+RED = 0xE00000
+GREY = 0x202020
+
+t = 0
+
+every tick:
+    t = (t + 1) % 60
+    for x in range(16):
+        lit = level * 16 > x * 100
+        colour = GREEN if x < 10 else (YELLOW if x < 13 else RED)
+        for y in range(1, 5):
+            screen[x, y] = colour if lit else GREY
+    screen[15, 0] = 0xFFFFFF if t < 30 else 0
+
+test "meter":
+    set level = 50
+    run 20 ticks
+    assert screen[0, 1] == GREEN
+    assert screen[7, 4] == GREEN
+    assert screen[8, 2] == GREY
+    set level = 100
+    run 20 ticks
+    assert screen[11, 3] == YELLOW
+    assert screen[15, 1] == RED

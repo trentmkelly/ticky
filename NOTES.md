@@ -490,3 +490,44 @@ programs 100, CHECKS 80, procs 60, blocks 100, exprs 6900; level2 only the layou
 Considered and not done: forwarding bundle reads (`b[s]` → `BGet`, 58 in enf) into their
 consumers — almost all feed select guards whose red input already carries the selected
 bundle, and each read is already shared, so little to gain.
+
+## 2026-10-10 — Screens (`import display`), write combining
+
+### Verified first (scenario `rgbprobe`)
+A lamp in packed-RGB colour mode (`use_colors`, `color_mode = 2`, `rgb_signal`) shows the
+signal's low 24 bits (`0x1000000` → black, `-1` → white). Without a condition it's always on
+(0 = lit black); with `≠ 0` it's off at 0. Quality signals work as the colour signal. Timing
+(difftest): the colour follows the network on the same tick, on/off the tick after; outputs
+are read as of the tick before, so the screen columns of a trace use the simulator's next tick
+for colours and this tick for on/off (`screen_trace` in the CLI).
+
+### Screens
+- Syntax: `import display` (new statement; only `display` exists), then
+  `output s: display.Screen(W, H) = port("…")`. `display.rs` rewrites the module before
+  expansion: the screen becomes a module variable `s = [0] * (W*H)` (a prologue value, so it's
+  shared like a port) that expansion is told to make a signal array (`expand_module(m, mem)`);
+  `s[x, y]` → `s[y*W + x]`; `s.fill(c)` → `s = [c] * N`; `s.width`/`s.height` → constants.
+  Banks `s#0`, `s#1`, … are kept live (`live_states`).
+- Codegen: a lamp per pixel (`Kind::Lamp(cond, Some(sig))`, `Role::Pixel`) on its bank's red
+  wire, colour signal = condition signal = `Graph::slot(j)`. Layout (`place_screens`): beside
+  everything else on the chosen side (`--display NAME=SIDE`), with pole rows above and below
+  (and a pole column for tall screens so the rows join up); sizes use the bounding box.
+- Tests read `screen[x, y]` (the value at the lamp's input; `Harness::pixel`); the harness
+  writes each screen's colours per tick, and difftest compares them.
+
+### Making screens cheap (also helps every array/bundle program)
+- `#arr` (array → bundle): elements with the same value share a term, `ones × x` (`[x] * n`
+  is one combinator, not n), constants one constant combinator. `fill(c)`: 132 → 5.
+- `bmux_tf` only splits a select of small bundles into per-signal selects up to 8 signals
+  (a select between two 128-pixel constants was 260 combinators; now 7).
+- **Write combining** (`bset`): a write to a bundle that's already "`b0` copied plus some
+  `Set`s" becomes one more `Set` on `b0` (replacing a write to the same signal), so a run of
+  constant-position writes is one stage deep instead of a chain (screen example depth 67 → 5).
+- **Grouped writes** (fuse `combine_writes`): the `Set`s on one base become one combinator
+  that takes the old values out (`b0 × (-1 on the written signals)`, a `Zip`) plus one term
+  per distinct value; a value that is constants under conditions becomes `BTerm::Dec`, now
+  a decider per arm outputting a constant on *all* its signals (also used for `ones × cond`).
+  Screen example 120 → 56 combinators; enf 319 → 309.
+- Fixed (pre-existing, found by fuzz_bundles): inside a comprehension, `//`/`%` in parts that
+  don't involve the element (`{s: -2 % k …}`) floored instead of truncating as SPEC §4.3.5
+  says (`Graph::in_comp`).

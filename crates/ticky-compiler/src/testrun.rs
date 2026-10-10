@@ -99,7 +99,77 @@ impl<'a> Harness<'a> {
         format!("at tick {}: {}", self.sim.tick, vals.join(", "))
     }
 
+    /// Pixel `k` of screen `si`: what its lamp sees.
+    pub fn pixel(&self, si: usize, k: usize) -> i32 {
+        let lamp = self.c.cg.screen_lamps[si][k];
+        match self.c.cg.netlist.entities[lamp].kind {
+            ticky_factorio::netlist::Kind::Lamp(_, Some(sig)) => self.sim.net_value(lamp, ticky_factorio::netlist::Conn::Red, sig),
+            _ => unreachable!("a pixel is a colour lamp"),
+        }
+    }
+
+    /// `e` with screen pixels (`screen[i]`) replaced by their values.
+    fn pixels_in(&mut self, e: &ticky_syntax::ast::Expr) -> Result<ticky_syntax::ast::Expr, Diag> {
+        use ticky_syntax::ast::{Expr, ExprKind};
+        let mut e = e.clone();
+        let mut err = None;
+        fn walk(h: &mut Harness, e: &mut Expr, err: &mut Option<Diag>) {
+            if let ExprKind::Index(base, idx) = &mut e.kind {
+                if let ExprKind::Name(n) = &base.kind {
+                    if let Some(si) = h.c.program.screens.iter().position(|s| &s.name == n) {
+                        walk(h, idx, err);
+                        let n = h.c.program.screens[si].pixels();
+                        match h.eval_int(idx) {
+                            Ok(k) if (0..n as i32).contains(&k) => e.kind = ExprKind::Int(h.pixel(si, k as usize) as i64),
+                            Ok(k) => *err = Some(Diag::error(idx.span, format!("pixel {k} is off the screen ({n} pixels)"))),
+                            Err(d) => *err = Some(d),
+                        }
+                        return;
+                    }
+                }
+            }
+            match &mut e.kind {
+                ExprKind::Unary(_, a) | ExprKind::Not(a) | ExprKind::Attr(a, _) => walk(h, a, err),
+                ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+                    walk(h, a, err);
+                    walk(h, b, err);
+                }
+                ExprKind::Compare(a, rest) => {
+                    walk(h, a, err);
+                    for (_, b) in rest {
+                        walk(h, b, err);
+                    }
+                }
+                ExprKind::BoolOp(_, xs) | ExprKind::Tuple(xs) | ExprKind::List(xs) => {
+                    for x in xs {
+                        walk(h, x, err);
+                    }
+                }
+                ExprKind::IfExp { cond, then, orelse } => {
+                    walk(h, cond, err);
+                    walk(h, then, err);
+                    walk(h, orelse, err);
+                }
+                ExprKind::Call { args, kwargs, .. } => {
+                    for a in args {
+                        walk(h, a, err);
+                    }
+                    for (_, a) in kwargs {
+                        walk(h, a, err);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(self, &mut e, &mut err);
+        match err {
+            Some(d) => Err(d),
+            None => Ok(e),
+        }
+    }
+
     fn eval(&mut self, e: &ticky_syntax::ast::Expr) -> Result<Cv, Diag> {
+        let e = &if self.c.program.screens.is_empty() { e.clone() } else { self.pixels_in(e)? };
         struct TestNames<'b, 'c>(&'b Harness<'c>);
         impl Names for TestNames<'_, '_> {
             fn lookup(&mut self, g: &mut Graph, name: &str, span: Span) -> Result<V, Diag> {

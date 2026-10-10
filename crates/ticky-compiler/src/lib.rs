@@ -2,6 +2,7 @@
 
 pub mod bundle;
 pub mod cfg;
+pub mod display;
 pub mod codegen;
 pub mod consteval;
 pub mod expand;
@@ -73,11 +74,13 @@ pub struct Options {
     /// Runtime checks (SPEC §13): failed `assert`s, out-of-range runtime indexes and
     /// division by zero halt the process, light the error lamp and output a code.
     pub checks: bool,
+    /// Which side each screen (`import display`) goes on, by name (default north).
+    pub screen_sides: Vec<(String, layout::Side)>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new() }
     }
 }
 
@@ -112,7 +115,27 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     let gates = opts.outputs_west && !opts.ports_ew;
     let mut cg = codegen::codegen(&program, opts.autostart, gates).map_err(|d| vec![d])?;
     program::timing("codegen", t);
-    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal };
+    let mut warnings = Vec::new();
+    for (name, _) in &opts.screen_sides {
+        if !program.screens.iter().any(|s| &s.name == name) {
+            return Err(vec![Diag::error(Default::default(), format!("there is no screen `{name}` to place"))]);
+        }
+    }
+    let screens = program
+        .screens
+        .iter()
+        .map(|s| {
+            let side = opts.screen_sides.iter().find(|(n, _)| *n == s.name).map(|x| x.1).unwrap_or_default();
+            if opts.poles && s.h > 6 {
+                warnings.push(Diag::warning(
+                    s.span,
+                    format!("screen `{}` is {} rows tall: the poles above and below it power 3 rows each, so place substations to power the rest", s.name, s.h),
+                ));
+            }
+            (s.w, s.h, side)
+        })
+        .collect();
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal, screens };
     let layout = layout::layout(&mut cg.netlist, &cg.nets, &lo)
         .map_err(|e| vec![Diag::error(Default::default(), format!("internal layout error: {e}"))])?;
     let problems = cg.netlist.validate(opts.poles);
@@ -133,7 +156,7 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
         }
     }
     cg.netlist.description = desc;
-    let mut warnings = std::mem::take(&mut program.warnings);
+    warnings.extend(std::mem::take(&mut program.warnings));
     if opts.allow_unknown_signals {
         warnings.retain(|w| !w.message.starts_with("unknown signal"));
     }

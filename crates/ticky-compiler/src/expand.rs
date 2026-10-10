@@ -125,7 +125,7 @@ pub struct Expander<'a> {
 }
 
 /// Elements per bank of a signal array: one signal table.
-fn bank_size() -> usize {
+pub fn bank_size() -> usize {
     ticky_factorio::SignalTable::base().array_signals().len()
 }
 
@@ -2264,7 +2264,8 @@ pub fn flattenable(s: &Stmt) -> bool {
 /// Call counts per function, and which functions became subroutines.
 pub type CallInfo = (BTreeMap<String, usize>, std::collections::BTreeSet<String>);
 
-pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
+/// `mem`: arrays that must be signal arrays (screens).
+pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallInfo), Vec<Diag>> {
     let mut fns = HashMap::new();
     let mut errs = Vec::new();
     for s in &m.body {
@@ -2291,7 +2292,7 @@ pub fn expand_module(m: &Module) -> Result<(Module, CallInfo), Vec<Diag>> {
             _ => None,
         })
         .collect();
-    let mut mem_keys: HashSet<String> = HashSet::new();
+    let mut mem_keys: HashSet<String> = mem.clone();
     let mut procs: HashMap<String, Span> = HashMap::new();
     for s in &m.body {
         if let StmtKind::Process { name, .. } = &s.kind {

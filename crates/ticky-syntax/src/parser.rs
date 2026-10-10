@@ -270,7 +270,13 @@ impl Parser {
                 self.in_test = was;
                 StmtKind::Test { name, body: body? }
             }
-            "class" | "lambda" | "yield" | "async" | "await" | "try" | "except" | "raise" | "with" | "import"
+            "import" => {
+                self.bump();
+                let (name, _) = self.name()?;
+                self.end_of_statement()?;
+                StmtKind::Import(name)
+            }
+            "class" | "lambda" | "yield" | "async" | "await" | "try" | "except" | "raise" | "with"
             | "from" | "nonlocal" | "del" => {
                 return Err(Diag::error(start, format!("`{kw}` is not part of Ticky")));
             }

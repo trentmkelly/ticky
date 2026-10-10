@@ -111,6 +111,8 @@ pub struct Codegen {
     /// Sequential processes, in `Program::procs` order.
     pub procs: Vec<MainStats>,
     pub signals_used: usize,
+    /// Each screen's lamps, pixel by pixel.
+    pub screen_lamps: Vec<Vec<EntId>>,
 }
 
 fn c(sig: Sig, cmp: CmpOp, k: i32) -> Cond {
@@ -231,6 +233,13 @@ impl Cg {
             }
         };
         self.nets[ni].members.push((e, if on_green { Conn::InGreen } else { Conn::InRed }));
+    }
+
+    /// Connects single-sided entity `e` (a lamp) to bundle `r`'s red wire.
+    fn bread_single(&mut self, r: BRef, e: EntId) {
+        self.bread(r, e, false);
+        let ni = self.bvals[r].red.unwrap();
+        self.nets[ni].members.last_mut().unwrap().1 = Conn::Red;
     }
 
     /// Wires every bundle's producers to the bundle's wires.
@@ -379,13 +388,17 @@ impl Cg {
                             let ((x, xn), (y, yn)) = (scal(a), scal(b));
                             (Kind::Arith(Arith { first: x, first_nets: xn, second: y, second_nets: yn, op, out: sig }), vec![], true, "arithmetic")
                         }
-                        BTerm::Dec(arms, sig) => {
-                            for (d, k) in arms {
+                        BTerm::Dec(arms) => {
+                            for (d, vals) in arms {
+                                if vals.is_empty() {
+                                    continue;
+                                }
                                 let terms: CDnf = d
                                     .iter()
                                     .map(|t| t.iter().map(|l| green(Cond { second: r(l.b).op(), ..cnd(r(l.a).sig(), l.op) })).collect())
                                     .collect();
-                                let id = self.loose(dec_const(distribute(&[], &terms), sig, k), format!("{what}: condition"));
+                                let outs = vals.iter().map(|(s, k)| out_const(*s, *k)).collect();
+                                let id = self.loose(dec(distribute(&[], &terms), outs), format!("{what}: condition"));
                                 self.on_bus_in(id);
                                 self.bprod(out, id);
                             }
@@ -993,7 +1006,9 @@ impl Shared {
 
 /// States some process reads, or that drive an output. Others need no register at all.
 fn live_states(p: &Program) -> Vec<bool> {
-    let mut live: Vec<bool> = p.states.iter().map(|s| s.port.is_some()).collect();
+    // Outputs, and screens' banks (`name#b`).
+    let screen_bank = |n: &str| n.split_once('#').is_some_and(|(a, b)| b.parse::<usize>().is_ok() && p.screens.iter().any(|s| s.name == a));
+    let mut live: Vec<bool> = p.states.iter().map(|s| s.port.is_some() || screen_bank(&s.name)).collect();
     let mut mark = |srcs: &[SrcKind]| {
         for k in srcs {
             if let SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) = *k {
@@ -1110,7 +1125,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         let e = cg.alloc()?;
         cg.err = Some(e);
         cg.core(dec_copy(vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], e), "checks: error code (hold)");
-        let lamp = cg.net.add(Kind::Lamp(c(e, CmpOp::Ne, 0)), Role::ErrorLamp);
+        let lamp = cg.net.add(Kind::Lamp(c(e, CmpOp::Ne, 0), None), Role::ErrorLamp);
         cg.net.entities[lamp].description =
             Some("Ticky error lamp (--checks): lights when a runtime check fails; the `error` output port gives the code.".into());
         cg.nets[0].members.push((lamp, Conn::Green));
@@ -1335,9 +1350,32 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
             port_ents[pi] = out;
         }
     }
+    // Screens: a lamp per pixel on its bank's wire, showing the pixel's signal (packed RGB),
+    // off while it's 0.
+    let mut screen_lamps = Vec::new();
+    for (k, sc) in p.screens.iter().enumerate() {
+        let bs = crate::expand::bank_size();
+        let mut lamps = Vec::new();
+        for b in 0..sc.pixels().div_ceil(bs) {
+            let bank = format!("{}#{b}", sc.name);
+            let reg = p.states.iter().position(|s| s.name == bank).and_then(|si| shared.state_bun.get(&si).copied());
+            for j in 0..bs.min(sc.pixels() - b * bs) {
+                let sig = crate::ir::Graph::slot(j);
+                let i = b * bs + j;
+                let id = cg.net.add(Kind::Lamp(c(sig, CmpOp::Ne, 0), Some(sig)), Role::Pixel { screen: k, index: i });
+                let label = sc.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
+                cg.net.entities[id].description = Some(format!("Ticky screen `{}`{label}: pixel ({}, {})", sc.name, i % sc.w, i / sc.w));
+                if let Some(x) = reg {
+                    cg.bread_single(x, id);
+                }
+                lamps.push(id);
+            }
+        }
+        screen_lamps.push(lamps);
+    }
     cg.bfinish();
 
-    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, procs, signals_used: cg.used })
+    Ok(Codegen { netlist: cg.net, nets: cg.nets, port_ents, run_switch, blocks, procs, signals_used: cg.used, screen_lamps })
 }
 
 /// A block that runs every tick: logic is a balanced pipeline reading inputs directly.

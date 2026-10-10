@@ -230,7 +230,7 @@ impl Builder<'_> {
             StmtKind::Global(_) => return Err(Diag::error(s.span, "`global` is only meaningful inside a function")),
             StmtKind::Def { .. } => return Err(Diag::error(s.span, "`def` isn't supported yet (planned for level 2)")),
             StmtKind::Process { .. } => return Err(Diag::error(s.span, "processes must be declared at the top level of the file")),
-            StmtKind::Every { .. } | StmtKind::Port { .. } | StmtKind::Test { .. } => {
+            StmtKind::Every { .. } | StmtKind::Port { .. } | StmtKind::Test { .. } | StmtKind::Import(_) => {
                 return Err(Diag::error(s.span, "declarations must be at the top level of the file"))
             }
             StmtKind::TestSet { .. } | StmtKind::TestRun { .. } | StmtKind::TestRunUntil { .. } => {

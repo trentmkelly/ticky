@@ -165,7 +165,7 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                 Kind::Selector(sel) => Some(selector_json(t, sel)),
                 Kind::Constant(c) => Some(constant_json(t, c)),
                 Kind::Pole => None,
-                Kind::Lamp(c) => {
+                Kind::Lamp(c, rgb) => {
                     let mut cond = Map::new();
                     cond.insert("first_signal".into(), signal_json(t, c.first));
                     match c.second {
@@ -173,8 +173,14 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                         Operand::Const(k) => cond.insert("constant".into(), json!(k)),
                     };
                     cond.insert("comparator".into(), json!(c.cmp.symbol()));
-                    m.insert("color".into(), json!({ "r": 1, "g": 0, "b": 0, "a": 1 }));
-                    Some(json!({ "circuit_enabled": true, "circuit_condition": cond }))
+                    match rgb {
+                        // color_mode 2: packed RGB (verified in-game, scenario rgbprobe).
+                        Some(s) => Some(json!({ "circuit_enabled": true, "circuit_condition": cond, "use_colors": true, "color_mode": 2, "rgb_signal": signal_json(t, *s) })),
+                        None => {
+                            m.insert("color".into(), json!({ "r": 1, "g": 0, "b": 0, "a": 1 }));
+                            Some(json!({ "circuit_enabled": true, "circuit_condition": cond }))
+                        }
+                    }
                 }
             };
             if let Some(cb) = cb {

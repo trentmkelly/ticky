@@ -77,6 +77,18 @@ pub struct LayoutOpts {
     pub ports_ew: bool,
     /// Experimental placement by simulated annealing instead of the grid.
     pub anneal: Option<crate::place::AnnealOpts>,
+    /// Each screen's size (`width`, `height`) and which side of the blueprint it goes on.
+    pub screens: Vec<(usize, usize, Side)>,
+}
+
+/// A side of the blueprint.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Side {
+    #[default]
+    North,
+    South,
+    East,
+    West,
 }
 
 /// An annealed placement: the slot grid and each entity's slot.
@@ -292,6 +304,9 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     }
 
+    // Screens: lamp grids beside everything else, each with a row of poles just above and
+    // just below it (lamps need power; poles inside would cost pixels).
+    let screens_at = place_screens(net, opts, &mut poles, if opts.outputs_west && !ew && !gates_move { n_out } else { 0 }, w + 3.0);
     if !opts.poles {
         poles.clear();
     }
@@ -392,7 +407,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     };
 
-    let (width, height) = if ew || gates_move {
+    let (width, height) = if ew || gates_move || screens_at {
         // The bounding box of everything placed.
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for i in 0..net.entities.len() {
@@ -411,6 +426,73 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         (width, height)
     };
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
+}
+
+/// Places the screens' lamps (and their poles, added to `poles`) around what's placed so far.
+/// `lines` return lines run north of the block, up to `lines_x` east. Whether there are any.
+fn place_screens(net: &mut Netlist, opts: &LayoutOpts, poles: &mut Vec<(f64, f64)>, lines: usize, lines_x: f64) -> bool {
+    let mut pixels: Vec<Vec<(usize, EntId)>> = vec![Vec::new(); opts.screens.len()];
+    for (id, e) in net.entities.iter().enumerate() {
+        if let Role::Pixel { screen, index } = e.role {
+            pixels[screen].push((index, id));
+        }
+    }
+    if pixels.iter().all(|p| p.is_empty()) {
+        return false;
+    }
+    // The bounding box of everything so far (tile edges).
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut grow = |x: f64, y: f64, w: f64, h: f64| {
+        (x0, x1, y0, y1) = (x0.min(x - w / 2.0), x1.max(x + w / 2.0), y0.min(y - h / 2.0), y1.max(y + h / 2.0));
+    };
+    for i in 0..net.entities.len() {
+        if !matches!(net.entities[i].role, Role::Pixel { .. }) {
+            let (fw, fh) = net.footprint(i);
+            grow(net.entities[i].pos.0, net.entities[i].pos.1, fw as f64, fh as f64);
+        }
+    }
+    for p in poles.iter() {
+        grow(p.0, p.1, 1.0, 1.0);
+    }
+    if lines > 0 {
+        grow(lines_x - 0.5, -(lines as f64) + 0.5, 1.0, 1.0);
+    }
+    let mut along: std::collections::HashMap<Side, f64> = std::collections::HashMap::new();
+    for (k, px) in pixels.iter_mut().enumerate() {
+        px.sort();
+        let (sw, sh, side) = opts.screens[k];
+        let (swf, shf) = (sw as f64, sh as f64);
+        let cur = along.entry(side).or_insert(0.0);
+        // The screen's top-left tile corner; a pole row takes the tile row above and below.
+        let (ox, oy) = match side {
+            Side::North => (x0 + *cur, y0 - shf - 1.0),
+            Side::South => (x0 + *cur, y1 + 1.0),
+            Side::West => (x0 - swf - 1.0, y0 + 1.0 + *cur),
+            Side::East => (x1 + 1.0, y0 + 1.0 + *cur),
+        };
+        *cur += match side {
+            Side::North | Side::South => swf + 1.0,
+            Side::East | Side::West => shf + 3.0,
+        };
+        for &(i, id) in px.iter() {
+            net.entities[id].pos = (ox + (i % sw) as f64 + 0.5, oy + (i / sw) as f64 + 0.5);
+        }
+        // Poles every 7 columns (each powers 3 tiles either side), in the rows next to it.
+        let n = sw.div_ceil(7);
+        for j in 0..n {
+            let x = (ox + 3.5 + 7.0 * j as f64).min(ox + swf - 0.5);
+            poles.push((x, oy - 0.5));
+            poles.push((x, oy + shf + 0.5));
+        }
+        // Tall screens: a column of poles beside them too, so the rows stay connected.
+        let (cx, n) = (if side == Side::West { ox + swf + 0.5 } else { ox - 0.5 }, sh.div_ceil(7));
+        if sh > 6 {
+            for j in 0..=n {
+                poles.push((cx, (oy - 0.5 + 7.0 * j as f64).min(oy + shf + 0.5)));
+            }
+        }
+    }
+    true
 }
 
 /// Wires every network in `order`, through relay poles on free tiles where a hop is too long.

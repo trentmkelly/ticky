@@ -72,8 +72,8 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 return bundle::binop(g, *op, x, y, e.span);
             }
             let (x, y) = (bundle::int(g, x, a.span)?, bundle::int(g, y, b.span)?);
-            // Per-signal arithmetic (inside a bundle comprehension) truncates like Factorio.
-            if g.uses_each(x) || g.uses_each(y) {
+            // Inside a bundle comprehension, `//` and `%` truncate like Factorio (SPEC §4.3.5).
+            if g.in_comp > 0 || g.uses_each(x) || g.uses_each(y) {
                 match op {
                     BinOp::FloorDiv => return Ok(g.ar(ArOp::Div, x, y)),
                     BinOp::Mod => return Ok(g.ar(ArOp::Mod, x, y)),
@@ -254,11 +254,29 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 // bundle with element `k` on `Graph::slot(k)`; the last argument (a literal) is
                 // the bank's length.
                 "#arr" => {
-                    let mut terms = Vec::new();
+                    // Elements with the same value share a term: a table of ones on their
+                    // slots times the value (`[x] * n` is one combinator, not n).
+                    let mut groups: Vec<(V, Vec<usize>)> = Vec::new();
+                    let mut konst = Vec::new();
                     for (k, a) in args.iter().enumerate() {
                         let x = expr(g, names, a)?;
                         let x = bundle::int(g, x, a.span)?;
-                        terms.push(BTerm::One(Graph::slot(k), x));
+                        match g.as_const(x) {
+                            Some(c) => konst.push((Graph::slot(k), c)),
+                            None => match groups.iter_mut().find(|(v, _)| *v == x) {
+                                Some((_, ks)) => ks.push(k),
+                                None => groups.push((x, vec![k])),
+                            },
+                        }
+                    }
+                    let mut terms = vec![BTerm::K(crate::ir::normalize(konst))];
+                    for (x, ks) in groups {
+                        if let [k] = ks[..] {
+                            terms.push(BTerm::One(Graph::slot(k), x));
+                        } else {
+                            let ones = g.bconst(ks.iter().map(|&k| (Graph::slot(k), 1)));
+                            terms.push(BTerm::Map(ArOp::Mul, ones, x));
+                        }
                     }
                     return Ok(g.bun(terms));
                 }
@@ -428,7 +446,10 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
         }
         ExprKind::Dict(items) => bundle::dict(g, names, items)?,
         ExprKind::DictComp { key, value, target, iter, conds } => {
-            bundle::comprehension(g, names, key, value, target, iter, conds, e.span)?
+            g.in_comp += 1;
+            let r = bundle::comprehension(g, names, key, value, target, iter, conds, e.span);
+            g.in_comp -= 1;
+            r?
         }
         ExprKind::Tuple(_) | ExprKind::List(_) | ExprKind::ListComp { .. } => {
             return Err(Diag::error(e.span, "tuples and lists can only be used in assignments like `a, b = b, a`"))

@@ -134,6 +134,15 @@ struct Placement {
     /// halt the process, light the error lamp and put a code on the `error` output (signal-E).
     #[arg(long)]
     checks: bool,
+    /// Where a screen (`import display`) goes: `NAME=north` (default), `south`, `east` or
+    /// `west` of the rest of the blueprint. Repeat for several screens.
+    #[arg(long = "display", value_parser = parse_display)]
+    displays: Vec<(String, Side)>,
+}
+
+fn parse_display(s: &str) -> Result<(String, Side), String> {
+    let (name, side) = s.split_once('=').ok_or("expected NAME=SIDE, e.g. `screen=east`")?;
+    Ok((name.to_string(), parse_side(side)?))
 }
 
 impl Placement {
@@ -215,7 +224,20 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
         eprintln!("error: {e}");
         ExitCode::FAILURE
     })?;
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks };
+    let screen_sides = place
+        .displays
+        .iter()
+        .map(|(n, s)| {
+            let side = match s {
+                Side::North => ticky_compiler::layout::Side::North,
+                Side::South => ticky_compiler::layout::Side::South,
+                Side::East => ticky_compiler::layout::Side::East,
+                Side::West => ticky_compiler::layout::Side::West,
+            };
+            (n.clone(), side)
+        })
+        .collect();
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -319,6 +341,38 @@ fn sim_trace(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> Vec<Vec<P
     rows
 }
 
+/// Each screen's pixels at each tick, as the harness writes them: the colours shown
+/// (`value & 0xFFFFFF`, 0 while a lamp is off), comma-separated. Calibrated in-game: outputs
+/// are read as of the tick before, a lamp's colour as of the current tick, and whether it's on
+/// from the tick before that; so row `i` shows the colour at `i + 1` if the pixel was nonzero
+/// at `i`.
+fn screen_trace(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> Vec<Vec<String>> {
+    let mut h = Harness::new(c);
+    let read = |h: &Harness| -> Vec<Vec<i32>> {
+        c.program.screens.iter().enumerate().map(|(si, s)| (0..s.pixels()).map(|k| h.pixel(si, k)).collect()).collect()
+    };
+    let mut rows = Vec::new();
+    for i in 0..ticks {
+        for (_, pi, v) in sets.iter().filter(|s| s.0 == i) {
+            if *pi == usize::MAX {
+                h.sim.set_constant_on(c.cg.run_switch, *v != PVal::Int(0));
+            } else {
+                h.set(*pi, v.clone());
+            }
+        }
+        let on = read(&h);
+        h.sim.step();
+        let now = read(&h);
+        rows.push(
+            on.iter()
+                .zip(&now)
+                .map(|(on, now)| on.iter().zip(now).map(|(o, v)| if *o != 0 { (v & 0xFF_FFFF).to_string() } else { "0".into() }).collect::<Vec<_>>().join(","))
+                .collect(),
+        );
+    }
+    rows
+}
+
 fn harness_dir() -> PathBuf {
     std::env::var_os("TICKY_HARNESS")
         .map(PathBuf::from)
@@ -364,17 +418,24 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
             }
         })
         .collect();
+    let screens: Vec<String> = c
+        .cg
+        .screen_lamps
+        .iter()
+        .map(|lamps| format!("{{{}}}", lamps.iter().map(|e| (e + 1).to_string()).collect::<Vec<_>>().join(",")))
+        .collect();
     format!(
-        "return {{\n  bp = {},\n  ticks = {ticks},\n  run = {},\n  ports = {{{}}},\n  sets = {{{}}},\n}}\n",
+        "return {{\n  bp = {},\n  ticks = {ticks},\n  run = {},\n  ports = {{{}}},\n  sets = {{{}}},\n  screens = {{{}}},\n}}\n",
         lua_str(&c.blueprint_string()),
         c.cg.run_switch + 1,
         ports.join(", "),
-        sets.join(", ")
+        sets.join(", "),
+        screens.join(", ")
     )
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new() }
 }
 
 fn main() -> ExitCode {
@@ -461,7 +522,11 @@ fn main() -> ExitCode {
                 eprintln!("error: no trace from the game: {e}");
                 ExitCode::FAILURE
             })?;
-            let expected: Vec<Vec<String>> = expected.iter().map(|r| r.iter().map(canonical).collect()).collect();
+            let mut expected: Vec<Vec<String>> = expected.iter().map(|r| r.iter().map(canonical).collect()).collect();
+            // Screens: every pixel's colour as shown (0 while off), one column per screen.
+            for (row, px) in expected.iter_mut().zip(screen_trace(&c, &sets, ticks)) {
+                row.extend(px);
+            }
             let actual: Vec<Vec<String>> =
                 trace.lines().map(|l| l.split_whitespace().skip(1).map(|v| v.to_string()).collect()).collect();
             // The harness script reads outputs one tick later than the simulator records them
