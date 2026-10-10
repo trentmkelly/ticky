@@ -78,8 +78,9 @@ pub enum BTerm {
     Zip(ArOp, V, V),
     /// A single signal carrying a scalar's value.
     One(Sig, V),
-    /// One signal of bundle `b`, times a constant.
-    Pick(V, Sig, i32),
+    /// `x - b[s]` on signal `s`: next to a copy of `b`, sets `s` to `x` (one arithmetic
+    /// combinator reading `x` on green and `b` on red).
+    Set(V, Sig, V),
     /// The signals of `b` passing a per-signal condition, copied or set to a constant.
     Filter(V, BDnf, FOut),
     /// The signals of the domain `d` (first) where a per-signal condition on bundle `b`
@@ -95,6 +96,11 @@ pub enum BTerm {
     Hot(V, V, i32),
     /// `each(b) op k`, summed onto one signal.
     Fold(V, ArOp, i32, Sig),
+    /// Scalar arithmetic `a op b` written straight onto signal `s` of the bundle (instead of
+    /// computing it on the bus and copying it with `One`).
+    Ar(ArOp, V, V, Sig),
+    /// Scalar conditions (as [`Op::Dec`]) written straight onto signal `s` of the bundle.
+    Dec(Vec<(Dnf, i32)>, Sig),
 }
 
 /// Index of a block-level source (own state register or sampled input).
@@ -131,6 +137,10 @@ pub enum Op {
     Bun(Vec<BTerm>),
     /// Bundle select: `t ? a : b` with complementary boolean conditions.
     BMux { t: V, f: V, a: V, b: V },
+    /// Bundle select with mutually exclusive guards: the bundle of the arm whose guard holds
+    /// (nothing if none does). One decider per arm, evaluating its guard itself, so an
+    /// `if`/`elif` chain of selects is one stage.
+    BDec(Vec<(Dnf, V)>),
     /// The single signal of a bundle ranked `index` (0-based) from the largest (`true`) or
     /// the smallest value.
     BSelect(V, bool, u32),
@@ -160,7 +170,7 @@ impl Op {
     /// Whether the node's value is a bundle.
     pub fn is_bundle(&self, src_bun: &[bool]) -> bool {
         match self {
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) => true,
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) => true,
             Op::Src(s) => src_bun.get(*s as usize).copied().unwrap_or(false),
             _ => false,
         }
@@ -171,7 +181,8 @@ impl BTerm {
     pub fn operands(&self) -> Vec<V> {
         match self {
             BTerm::Map(_, a, b) | BTerm::RMap(_, a, b) | BTerm::Zip(_, a, b) => vec![*a, *b],
-            BTerm::One(_, x) | BTerm::Pick(x, _, _) => vec![*x],
+            BTerm::One(_, x) => vec![*x],
+            BTerm::Set(b, _, x) => vec![*b, *x],
             BTerm::Filter(b, d, _) | BTerm::DFilter(_, b, d, _) => {
                 let mut v = vec![*b];
                 if let BTerm::DFilter(dom, ..) = self {
@@ -188,6 +199,8 @@ impl BTerm {
             }
             BTerm::K(_) => vec![],
             BTerm::Shift(_, x, _) => vec![*x],
+            BTerm::Ar(_, a, b, _) => vec![*a, *b],
+            BTerm::Dec(arms, _) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
             BTerm::Hot(t, ix, _) => vec![*t, *ix],
             BTerm::Fold(b, ..) => vec![*b],
         }
@@ -261,7 +274,7 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
         Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::AGet(..) | Op::Each | Op::SigK(_) => Iv::FULL,
-        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) => Iv::FULL,
+        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) | Op::BDec(_) => Iv::FULL,
         Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
@@ -718,7 +731,7 @@ impl Graph {
                 normalize(sigs.into_iter().map(|s| (s, op.apply(bval(x, s), bval(y, s)))))
             }
             BTerm::One(s, x) => normalize([(*s, k(*x)?)]),
-            BTerm::Pick(x, s, m) => normalize([(*s, bval(b(*x)?, *s).wrapping_mul(*m))]),
+            BTerm::Set(x, s, v) => normalize([(*s, k(*v)?.wrapping_sub(bval(b(*x)?, *s)))]),
             BTerm::Filter(x, d, out) => {
                 let x = b(*x)?;
                 let val = |o: BOp, cur: i32| -> Option<i32> {
@@ -776,6 +789,8 @@ impl Graph {
             }
             BTerm::K(vals) => vals.clone(),
             BTerm::Shift(s, x, c) => normalize([(*s, k(*x)?.wrapping_add(*c))]),
+            // Made by fusion from non-constant nodes.
+            BTerm::Ar(..) | BTerm::Dec(..) => return None,
             BTerm::Hot(t, ix, c) => {
                 let (t, ix) = (b(*t)?, b(*ix)?);
                 let i = bval(ix, SignalTable::base().index_signal());
@@ -1178,6 +1193,17 @@ impl Graph {
         self.bun(terms)
     }
 
+    /// Bundle select over mutually exclusive guards (see [`Op::BDec`]).
+    pub fn bdec(&mut self, arms: Vec<(Dnf, V)>) -> V {
+        let arms: Vec<(Dnf, V)> =
+            arms.into_iter().filter(|(d, x)| !d.is_empty() && self.as_bconst(*x).is_none_or(|b| !b.is_empty())).collect();
+        match arms.as_slice() {
+            [] => self.bconst([]),
+            [(d, x)] if d.iter().any(|t| t.is_empty()) => *x,
+            _ => self.intern(Op::BDec(arms)),
+        }
+    }
+
     /// Bundle select from complementary conditions.
     pub fn bmux_tf(&mut self, t: V, f: V, a: V, b: V) -> V {
         if a == b {
@@ -1225,7 +1251,7 @@ impl Graph {
             return self.bun(terms);
         }
         let z = self.konst(0);
-        self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Pick(b, s, -1), BTerm::One(s, x)])
+        self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Set(b, s, x)])
     }
 
     /// The bundle mux shape `(t, f, a, b)` of a node, scalar or bundle.
@@ -1246,6 +1272,7 @@ impl Graph {
             Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],
+            Op::BDec(ref arms) => arms.iter().flat_map(|(d, x)| dnf_operands(d).into_iter().chain([*x])).collect(),
             Op::BSelect(b, ..) | Op::BGet(b, _) | Op::BTotal(b) | Op::BCount(b) | Op::SigOf(b) => vec![b],
             Op::AGet(b, ix) | Op::BSelectAt(b, _, ix) | Op::BDot(b, ix) => vec![b, ix],
         }

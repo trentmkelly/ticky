@@ -16,6 +16,9 @@ use crate::ir::{dnf_operands, BLit, BOp, BTerm, Dnf, Graph, Iv, Lit, Op, V};
 /// Most guarded loads one register update is split into.
 const MAX_LOADS: usize = 8;
 
+/// Most arms a tree of bundle selects is flattened into.
+const MAX_ARMS: usize = 8;
+
 /// Upper bounds on a fused condition, to keep deciders reasonable.
 const MAX_TERMS: usize = 12;
 const MAX_LITS: usize = 32;
@@ -242,10 +245,14 @@ impl<'g> Fuser<'g> {
                 let terms = terms.into_iter().map(|t| self.rebuild_term(t)).collect();
                 self.g.bun(terms)
             }
-            Op::BMux { t, f, a, b } => {
-                let (t, f) = (self.cond_node(t), self.cond_node(f));
-                let (a, b) = (self.rebuild(a), self.rebuild(b));
-                self.g.bmux_tf(t, f, a, b)
+            Op::BMux { .. } => {
+                let mut arms = Vec::new();
+                self.barms(v, vec![vec![]], &mut arms);
+                self.g.bdec(arms)
+            }
+            Op::BDec(arms) => {
+                let arms = arms.into_iter().map(|(d, x)| (self.rebuild_dnf(&d), self.rebuild(x))).collect();
+                self.g.bdec(arms)
             }
             Op::BSelect(b, max, index) => {
                 let b = self.rebuild(b);
@@ -329,8 +336,19 @@ impl<'g> Fuser<'g> {
             BTerm::Map(op, b, k) => BTerm::Map(op, self.rebuild(b), self.rebuild(k)),
             BTerm::RMap(op, k, b) => BTerm::RMap(op, self.rebuild(k), self.rebuild(b)),
             BTerm::Zip(op, a, b) => BTerm::Zip(op, self.rebuild(a), self.rebuild(b)),
-            BTerm::One(s, x) => BTerm::One(s, self.rebuild(x)),
-            BTerm::Pick(b, s, m) => BTerm::Pick(self.rebuild(b), s, m),
+            BTerm::One(s, x) => {
+                // The combinator that computes `x` can write the bundle's signal itself.
+                let x = self.rebuild(x);
+                match self.g.op(x).clone() {
+                    Op::Ar(op, a, b) => BTerm::Ar(op, a, b, s),
+                    Op::Dec(arms) => BTerm::Dec(arms, s),
+                    Op::Cmp(op, a, b) if self.g.as_const(a).is_none() => BTerm::Dec(vec![(vec![vec![Lit { op, a, b }]], 1)], s),
+                    _ => BTerm::One(s, x),
+                }
+            }
+            BTerm::Ar(op, a, b, s) => BTerm::Ar(op, self.rebuild(a), self.rebuild(b), s),
+            BTerm::Dec(arms, s) => BTerm::Dec(arms.into_iter().map(|(d, k)| (self.rebuild_dnf(&d), k)).collect(), s),
+            BTerm::Set(b, s, x) => BTerm::Set(self.rebuild(b), s, self.rebuild(x)),
             BTerm::Filter(b, d, out) => {
                 let mut op = |o: BOp| match o {
                     BOp::Each => BOp::Each,
@@ -345,6 +363,36 @@ impl<'g> Fuser<'g> {
             BTerm::Hot(t, ix, c) => BTerm::Hot(self.rebuild(t), self.rebuild(ix), c),
             BTerm::Fold(b, op, c, s) => BTerm::Fold(self.rebuild(b), op, c, s),
         }
+    }
+
+    /// The arms of a tree of bundle selects under `guard`: nested selects become arms whose
+    /// guards are the conditions along their path (a priority mux, one stage deep).
+    fn barms(&mut self, v: V, guard: Dnf, arms: &mut Vec<(Dnf, V)>) {
+        if let Op::BMux { t, f, a, b } = *self.g.op(v) {
+            let dt = self.dnf(t, false).unwrap_or_else(|| self.node_lit(t));
+            let df = self.dnf(f, false).unwrap_or_else(|| self.node_lit(f));
+            // Deeper selects only while the guards stay small enough for one decider.
+            if arms.len() < MAX_ARMS {
+                if let (Some(gt), Some(gf)) = (and(&guard, &dt), and(&guard, &df)) {
+                    self.barms(a, gt, arms);
+                    self.barms(b, gf, arms);
+                    return;
+                }
+            }
+        }
+        let x = self.rebuild(v);
+        arms.push((guard, x));
+    }
+
+    /// `v != 0` as a condition list, with `v` as a single decider where possible.
+    fn node_lit(&mut self, v: V) -> Dnf {
+        let n = self.cond_node(v);
+        let z = self.g.konst(0);
+        self.lit(CmpOp::Ne, n, z)
+    }
+
+    fn rebuild_dnf(&mut self, d: &Dnf) -> Dnf {
+        d.iter().map(|t| t.iter().map(|l| Lit { op: l.op, a: self.rebuild(l.a), b: self.rebuild(l.b) }).collect()).collect()
     }
 
     /// A boolean node as a single decider where possible.

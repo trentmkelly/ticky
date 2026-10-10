@@ -450,3 +450,43 @@ over tiles ranked by (distance outside the block's bounding box, pole cost — r
 free connector is cheaper than a new pole — then distance from the straight line). enf at
 `--max-width 56 --no-poles`: ew/north 56×18 → 56×14 (3 → 4 relays), ew/south 60×24 → 56×22,
 west 59×35 → 54×35.
+
+## 2026-10-10 — Optimisation round: next-PC offsets, priority muxes, direct bundle writes
+
+Measured first (combinators by role): in sequential programs control dominated (calculator:
+23 PC-load deciders and 13 commits vs 17 doing arithmetic); in enf (bundle-heavy `every`
+blocks) copies and bundle selects did. Before → after (tools/bench.sh): enf 390 → 319
+(depth 10 → 6, 152 → 86 signals), calculator 125 → 112, handshake 54 → 43, sorting
+298 → 276, primes 55 → 49, every sequential example −3 to −13.
+
+- **Next-PC as an offset** (codegen `main_proc`). The PC hold runs whenever RUN is on (no
+  longer dropped by ANY); each commit decider also outputs `PC += fall - here` (goto, call,
+  halt, or the branch's else-target), so gotos cost nothing. A branch adds `taken - else`
+  one tick later, from `CM ∧ cond` as before, so conditions are still read on the commit
+  tick and no step got longer; the transient PC value sits under ANY ≠ 0, when nothing reads
+  it. Returns drop to 0 by offset, then add the return address (`ret × CM`) as before.
+  Error deciders also drop the PC to 0.
+- **Priority muxes** (`Op::BDec`, fuse `barms`): a tree of bundle selects (`if/elif` chains)
+  becomes one decider per leaf, each checking its whole path condition as a DNF over the
+  original comparisons (≤ 12 terms, ≤ 8 arms) — one stage instead of one per level, and the
+  condition deciders vanish. New example `alarms` (two if/elif bundle chains): 80 → 60.
+- **Direct bundle writes**: `One(s, x)` with `x` an arithmetic, comparison or decider node
+  becomes `BTerm::Ar`/`BTerm::Dec`, which write `s` on the bundle's wire themselves (no
+  copy, one tick less; a duplicate if `x` has other users, which costs what the copy did).
+- **Key writes** `b[s] = x`: copy + `Set(b, s, x)` = one arithmetic `x(green) − s(red) → s`
+  (was copy + `Pick(b, s, -1)` + `One`/constant).
+- **Relay routing**: relays reuse their own network's poles; each member joins the nearest
+  part of its network's tree (members and relays so far, Steiner-style); a hop that can't
+  start falls back to a search around the whole block; a network that still fails is moved
+  to the front and everything is routed again (rip-up and reroute, ≤ 8 times). Needed after
+  enf's netlist changed and hit congestion in the grid.
+- **Known limit**: the default grid layout runs out of relay room on very large programs
+  (fuzz programs of ~1900 and ~5000 combinators; both failed before this round too).
+  `--place=anneal` lays them out (the 750-combinator one with 2 relays instead of 167).
+
+Verified: all 28 examples difftest-match the game; fuzzers clean (bundles 150, signals 100,
+programs 100, CHECKS 80, procs 60, blocks 100, exprs 6900; level2 only the layout limit).
+
+Considered and not done: forwarding bundle reads (`b[s]` → `BGet`, 58 in enf) into their
+consumers — almost all feed select guards whose red input already carries the selected
+bundle, and each read is already shared, so little to gain.

@@ -1,0 +1,53 @@
+# An alarm panel: `if`/`elif` chains that choose between bundles. Each chain is one stage
+# of deciders, one per branch, each checking its whole path condition itself.
+input  power: int @ P = port("Accumulator charge, 0-100")
+input  heat: int @ H = port("Reactor temperature")
+input  faults: Bundle = port("Fault counts by signal")
+output lamp: Bundle = port("Colour for a lamp set to 'use colours'")
+output report: Bundle = port("Faults worth reporting")
+output level: int @ L
+
+every tick:
+    if heat > 900 or power < 5:
+        lamp = Bundle(signal_red=1)
+        level = 3
+    elif heat > 700 and power < 50:
+        lamp = Bundle(signal_yellow=1, signal_red=1)
+        level = 2
+    elif len(faults) > 0:
+        lamp = Bundle(signal_yellow=1)
+        level = 1
+    else:
+        lamp = Bundle(signal_green=1)
+        level = 0
+    if level >= 3:
+        report = faults * 2
+    elif level == 2:
+        report = faults + Bundle(signal_H=heat)
+    elif level == 1 and faults.total() > 3:
+        report = faults
+    else:
+        report = Bundle()
+
+test "calm":
+    set power = 80
+    set heat = 300
+    run 12 ticks
+    assert lamp == Bundle(signal_green=1)
+    assert len(report) == 0
+
+test "escalates":
+    set power = 30
+    set heat = 300
+    set faults = Bundle(signal_A=2, signal_B=3)
+    run 12 ticks
+    assert lamp == Bundle(signal_yellow=1)
+    assert report == Bundle(signal_A=2, signal_B=3)
+    set heat = 750
+    run 12 ticks
+    assert level == 2
+    assert report == Bundle(signal_A=2, signal_B=3, signal_H=750)
+    set power = 2
+    run 12 ticks
+    assert lamp == Bundle(signal_red=1)
+    assert report == Bundle(signal_A=4, signal_B=6)

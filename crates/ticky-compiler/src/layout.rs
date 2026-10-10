@@ -347,14 +347,13 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     }
     // The block's tiles, which relays and output lines should keep within.
     let bbox = used.iter().fold((i64::MAX, i64::MAX, i64::MIN, i64::MIN), |b, t| (b.0.min(t.0), b.1.min(t.1), b.2.max(t.0), b.3.max(t.1)));
-    let mut relays = 0;
     let mut carriers = 0;
     for (gate, port, pts) in &lines {
         let mut prev = (*gate, Conn::OutRed);
         let mut prev_pos = net.entities[*gate].pos;
         for &p in pts {
             // The climb can be longer than one wire: relay through free tiles on the way.
-            for t in route(&|t| (!used.contains(&t)).then_some(1), bbox, prev_pos, p).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
+            for t in route(&|t| (!used.contains(&t)).then_some(1), bbox, &[prev_pos], p).map(|r| r.1).ok_or_else(|| format!("no room for an output line near {prev_pos:?}"))? {
                 used.insert(t);
                 let pos = (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
                 let id = net.add(Kind::Pole, Role::Power);
@@ -372,66 +371,26 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
         net.wire(prev, (*port, Conn::InRed));
     }
-    // Poles (power, output lines) by tile, with whether their red and green connectors are
-    // taken: a relay can use a pole whose connector of the wire's colour is free.
-    let mut pole_at: std::collections::HashMap<(i64, i64), (EntId, [bool; 2])> = std::collections::HashMap::new();
-    for (i, e) in net.entities.iter().enumerate() {
-        if matches!(e.kind, Kind::Pole) {
-            pole_at.insert(tile(e.pos), (i, [false, false]));
-        }
-    }
-    for w in &net.wires {
-        for (e, c) in [w.a, w.b] {
-            if matches!(net.entities[e].kind, Kind::Pole) {
-                if let Some(p) = pole_at.get_mut(&tile(net.entities[e].pos)) {
-                    p.1[(c == Conn::Green) as usize] = true;
+    // Relays for long hops. When a network can't get through (relays of earlier networks
+    // have taken every spot near one of its members), start again with that network first:
+    // rip-up and reroute, as chip routers do.
+    let base = net.clone();
+    let mut order: Vec<usize> = (0..nets.len()).collect();
+    let mut attempts = 0;
+    let relays = loop {
+        match relay_nets(net, &nets, &order, used.clone(), bbox) {
+            Ok(n) => break n,
+            Err((ni, msg)) => {
+                attempts += 1;
+                if attempts > 8 || order[0] == ni {
+                    return Err(msg);
                 }
+                *net = base.clone();
+                order.retain(|&x| x != ni);
+                order.insert(0, ni);
             }
         }
-    }
-    for spec in &nets {
-        let points: Vec<(f64, f64)> = spec.members.iter().map(|(e, _)| net.entities[*e].pos).collect();
-        for (a, b) in mst(&points) {
-            let d = dist(points[a], points[b]);
-            if d <= MAX_WIRE {
-                net.wire(spec.members[a], spec.members[b]);
-                continue;
-            }
-            // Too far for one wire: relay through the fewest medium poles on free tiles.
-            let conn = if spec.red { Conn::Red } else { Conn::Green };
-            let mut prev = spec.members[a];
-            let ci = (conn == Conn::Green) as usize;
-            // A pole already there with this colour free is cheaper than a new one.
-            let cost = |t: (i64, i64)| match pole_at.get(&t) {
-                Some(p) if !p.1[ci] => Some(0),
-                _ if !used.contains(&t) => Some(1),
-                _ => None,
-            };
-            let path = route(&cost, bbox, points[a], points[b]).ok_or_else(|| format!("no room for a wire relay near {:?}", points[a]))?;
-            for tile in path {
-                let id = match pole_at.get_mut(&tile) {
-                    Some(p) => {
-                        p.1[ci] = true;
-                        p.0
-                    }
-                    None => {
-                        used.insert(tile);
-                        let id = net.add(Kind::Pole, Role::Power);
-                        net.entities[id].pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
-                        net.entities[id].description = Some("Ticky wire relay".into());
-                        relays += 1;
-                        let mut taken = [false, false];
-                        taken[ci] = true;
-                        pole_at.insert(tile, (id, taken));
-                        id
-                    }
-                };
-                net.wire(prev, (id, conn));
-                prev = (id, conn);
-            }
-            net.wire(prev, spec.members[b]);
-        }
-    }
+    };
 
     let (width, height) = if ew || gates_move {
         // The bounding box of everything placed.
@@ -454,40 +413,160 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
 }
 
-/// Relay tiles for a wire from `from` to `to`, or empty if `to` is already in reach; `None` if
-/// there's no way through. `cost` prices a tile for a pole (`None`: taken). Paths are ranked by
-/// how far their poles stick out of `bbox` (the block, which they'd otherwise grow), then by
-/// pole cost, then by how far they stray from the straight line.
-fn route(cost: &dyn Fn((i64, i64)) -> Option<i64>, bbox: (i64, i64, i64, i64), from: (f64, f64), to: (f64, f64)) -> Option<Vec<(i64, i64)>> {
+/// Wires every network in `order`, through relay poles on free tiles where a hop is too long.
+/// Returns the number of relays, or the network that couldn't be routed.
+fn relay_nets(
+    net: &mut Netlist,
+    nets: &[crate::codegen::NetSpec],
+    order: &[usize],
+    mut used: std::collections::HashSet<(i64, i64)>,
+    bbox: (i64, i64, i64, i64),
+) -> Result<usize, (usize, String)> {
+    let tile = |p: (f64, f64)| (p.0.floor() as i64, p.1.floor() as i64);
+    let mut relays = 0;
+    // Poles (power, output lines) by tile, with the network on their red and green
+    // connectors: a relay can use a pole whose connector of the wire's colour is free or
+    // already on the same network.
+    const LINE: usize = usize::MAX;
+    let mut pole_at: std::collections::HashMap<(i64, i64), (EntId, [Option<usize>; 2])> = std::collections::HashMap::new();
+    for (i, e) in net.entities.iter().enumerate() {
+        if matches!(e.kind, Kind::Pole) {
+            pole_at.insert(tile(e.pos), (i, [None, None]));
+        }
+    }
+    for w in &net.wires {
+        for (e, c) in [w.a, w.b] {
+            if matches!(net.entities[e].kind, Kind::Pole) {
+                if let Some(p) = pole_at.get_mut(&tile(net.entities[e].pos)) {
+                    p.1[(c == Conn::Green) as usize] = Some(LINE);
+                }
+            }
+        }
+    }
+    for &ni in order {
+        let spec = &nets[ni];
+        let points: Vec<(f64, f64)> = spec.members.iter().map(|(e, _)| net.entities[*e].pos).collect();
+        let edges = mst(&points);
+        let conn = if spec.red { Conn::Red } else { Conn::Green };
+        let ci = (conn == Conn::Green) as usize;
+        // What's connected so far (Prim's tree grows from one end of the first edge): members
+        // and this network's relays. Each new member joins the nearest part of it.
+        let mut tree: Vec<((f64, f64), (EntId, Conn))> = edges.first().map(|e| vec![(points[e.0], spec.members[e.0])]).unwrap_or_default();
+        for (a, b) in edges {
+            let d = dist(points[a], points[b]);
+            if d <= MAX_WIRE {
+                net.wire(spec.members[a], spec.members[b]);
+                tree.push((points[b], spec.members[b]));
+                continue;
+            }
+            // Too far for one wire: relay through the fewest medium poles on free tiles.
+            // A pole already there with this colour free is cheaper than a new one.
+            let cost = |t: (i64, i64)| match pole_at.get(&t) {
+                Some(p) if p.1[ci].is_none_or(|n| n == ni) => Some(0),
+                _ if !used.contains(&t) => Some(1),
+                _ => None,
+            };
+            // Start from the parts of the tree nearest `b`.
+            let mut near: Vec<usize> = (0..tree.len()).collect();
+            near.sort_by(|x, y| dist(tree[*x].0, points[b]).total_cmp(&dist(tree[*y].0, points[b])));
+            let reach = dist(tree[near[0]].0, points[b]) + 2.0 * MAX_WIRE;
+            near.retain(|&x| dist(tree[x].0, points[b]) <= reach);
+            near.truncate(16);
+            let froms: Vec<(f64, f64)> = near.iter().map(|&x| tree[x].0).collect();
+            let (k, path) = route(&cost, bbox, &froms, points[b]).ok_or_else(|| (ni, format!("no room for a wire relay near {:?}", points[b])))?;
+            let mut prev = tree[near[k]].1;
+            for tile in path {
+                let id = match pole_at.get_mut(&tile) {
+                    Some(p) => {
+                        p.1[ci] = Some(ni);
+                        p.0
+                    }
+                    None => {
+                        used.insert(tile);
+                        let id = net.add(Kind::Pole, Role::Power);
+                        net.entities[id].pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
+                        net.entities[id].description = Some("Ticky wire relay".into());
+                        relays += 1;
+                        let mut taken = [None, None];
+                        taken[ci] = Some(ni);
+                        pole_at.insert(tile, (id, taken));
+                        id
+                    }
+                };
+                net.wire(prev, (id, conn));
+                prev = (id, conn);
+                tree.push((net.entities[id].pos, prev));
+            }
+            net.wire(prev, spec.members[b]);
+            tree.push((points[b], spec.members[b]));
+        }
+    }
+
+    Ok(relays)
+}
+
+/// Relay tiles for a wire from the nearest of `froms` to `to`: which one it starts from, and
+/// the tiles (empty if `to` is already in reach); `None` if there's no way through. `cost`
+/// prices a tile for a pole (`None`: taken). Paths are ranked by how far their poles stick
+/// out of `bbox` (the block, which they'd otherwise grow), then by pole cost, then by how far
+/// they stray from the straight line.
+fn route(
+    cost: &dyn Fn((i64, i64)) -> Option<i64>,
+    bbox: (i64, i64, i64, i64),
+    froms: &[(f64, f64)],
+    to: (f64, f64),
+) -> Option<(usize, Vec<(i64, i64)>)> {
+    // Near the ends first; failing that (a crowded area), anywhere around the block.
+    let near = 2 * MAX_WIRE as i64 + 2;
+    route_within(cost, bbox, froms, to, near).or_else(|| {
+        let far = (bbox.2 - bbox.0).max(bbox.3 - bbox.1) + near;
+        route_within(cost, bbox, froms, to, far)
+    })
+}
+
+fn route_within(
+    cost: &dyn Fn((i64, i64)) -> Option<i64>,
+    bbox: (i64, i64, i64, i64),
+    froms: &[(f64, f64)],
+    to: (f64, f64),
+    margin: i64,
+) -> Option<(usize, Vec<(i64, i64)>)> {
     use std::cmp::Reverse;
-    if dist(from, to) <= MAX_WIRE {
-        return Some(vec![]);
+    if let Some(k) = (0..froms.len()).find(|&k| dist(froms[k], to) <= MAX_WIRE) {
+        return Some((k, vec![]));
     }
     let centre = |t: (i64, i64)| (t.0 as f64 + 0.5, t.1 as f64 + 0.5);
     let outside = |t: (i64, i64)| (bbox.0 - t.0).max(t.0 - bbox.2).max(0) + (bbox.1 - t.1).max(t.1 - bbox.3).max(0);
-    let (sx, sy) = (to.0 - from.0, to.1 - from.1);
-    let len2 = sx * sx + sy * sy;
-    let stray = |p: (f64, f64)| {
-        let k = (((p.0 - from.0) * sx + (p.1 - from.1) * sy) / len2).clamp(0.0, 1.0);
+    let stray = |from: (f64, f64), p: (f64, f64)| {
+        let (sx, sy) = (to.0 - from.0, to.1 - from.1);
+        let k = (((p.0 - from.0) * sx + (p.1 - from.1) * sy) / (sx * sx + sy * sy)).clamp(0.0, 1.0);
         dist(p, (from.0 + k * sx, from.1 + k * sy))
     };
-    let price = |t: (i64, i64)| cost(t).map(|c| outside(t) * 1_000_000 + c * 1000 + (stray(centre(t)) * 10.0) as i64);
-    // Search the area around both ends, with room to go around.
-    let margin = 2 * MAX_WIRE as i64 + 2;
-    let (x0, x1) = (from.0.min(to.0) as i64 - margin, from.0.max(to.0) as i64 + margin);
-    let (y0, y1) = (from.1.min(to.1) as i64 - margin, from.1.max(to.1) as i64 + margin);
+    let price = |k: usize, t: (i64, i64)| cost(t).map(|c| outside(t) * 1_000_000 + c * 1000 + (stray(froms[k], centre(t)) * 10.0) as i64);
+    // Search the area around the ends, with room to go around.
+    let (mut x0, mut x1, mut y0, mut y1) = (to.0 as i64, to.0 as i64, to.1 as i64, to.1 as i64);
+    for f in froms {
+        (x0, x1, y0, y1) = (x0.min(f.0 as i64), x1.max(f.0 as i64), y0.min(f.1 as i64), y1.max(f.1 as i64));
+    }
+    let (x0, x1, y0, y1) = (x0 - margin, x1 + margin, y0 - margin, y1 + margin);
     let r = MAX_WIRE.floor() as i64;
     let near = |p: (f64, f64)| {
         let (px, py) = (p.0.floor() as i64, p.1.floor() as i64);
         (-r..=r).flat_map(move |dx| (-r..=r).map(move |dy| (px + dx, py + dy)))
     };
-    let mut best: std::collections::HashMap<(i64, i64), (i64, Option<(i64, i64)>)> = std::collections::HashMap::new();
+    // Per tile: cost so far, the tile before, and which start it came from.
+    type Best = std::collections::HashMap<(i64, i64), (i64, Option<(i64, i64)>, usize)>;
+    let mut best: Best = std::collections::HashMap::new();
     let mut heap = std::collections::BinaryHeap::new();
-    for t in near(from) {
-        if dist(centre(t), from) <= MAX_WIRE {
-            if let Some(c) = price(t) {
-                best.insert(t, (c, None));
-                heap.push(Reverse((c, t)));
+    for (k, &from) in froms.iter().enumerate() {
+        for t in near(from) {
+            if dist(centre(t), from) <= MAX_WIRE {
+                if let Some(c) = price(k, t) {
+                    if best.get(&t).is_none_or(|b| c < b.0) {
+                        best.insert(t, (c, None, k));
+                        heap.push(Reverse((c, t)));
+                    }
+                }
             }
         }
     }
@@ -496,23 +575,24 @@ fn route(cost: &dyn Fn((i64, i64)) -> Option<i64>, bbox: (i64, i64, i64, i64), f
         if !done.insert(t) {
             continue;
         }
+        let k = best[&t].2;
         if dist(centre(t), to) <= MAX_WIRE {
             let mut path = vec![t];
             let mut cur = t;
-            while let Some((_, Some(p))) = best.get(&cur) {
+            while let Some((_, Some(p), _)) = best.get(&cur) {
                 path.push(*p);
                 cur = *p;
             }
             path.reverse();
-            return Some(path);
+            return Some((k, path));
         }
         for u in near(centre(t)) {
             if u.0 < x0 || u.0 > x1 || u.1 < y0 || u.1 > y1 || done.contains(&u) || dist(centre(u), centre(t)) > MAX_WIRE {
                 continue;
             }
-            let Some(cu) = price(u) else { continue };
+            let Some(cu) = price(k, u) else { continue };
             if best.get(&u).is_none_or(|b| c + cu < b.0) {
-                best.insert(u, (c + cu, Some(t)));
+                best.insert(u, (c + cu, Some(t), k));
                 heap.push(Reverse((c + cu, u)));
             }
         }

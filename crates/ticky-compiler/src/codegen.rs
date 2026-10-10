@@ -303,9 +303,10 @@ impl Cg {
                             };
                             (Kind::Arith(ar), vec![(a, false), (b, true)], false, "signal by signal")
                         }
-                        BTerm::Pick(b, sig, m) => {
-                            let a = arith(Operand::Sig(sig), ArOp::Mul, Operand::Const(m), sig);
-                            (a, vec![(b, false)], false, "one signal")
+                        BTerm::Set(b, sig, x) => {
+                            let (o, n) = scal(x);
+                            let a = Arith { first: o, first_nets: n, second: Operand::Sig(sig), second_nets: Nets::RED, op: ArOp::Sub, out: sig };
+                            (Kind::Arith(a), vec![(b, false)], matches!(o, Operand::Sig(_)), "set one signal")
                         }
                         BTerm::One(sig, x) => {
                             let a = arith(r(x).op(), ArOp::Add, Operand::Const(0), sig);
@@ -374,6 +375,22 @@ impl Cg {
                             self.bprod(out, k);
                             continue;
                         }
+                        BTerm::Ar(op, a, b, sig) => {
+                            let ((x, xn), (y, yn)) = (scal(a), scal(b));
+                            (Kind::Arith(Arith { first: x, first_nets: xn, second: y, second_nets: yn, op, out: sig }), vec![], true, "arithmetic")
+                        }
+                        BTerm::Dec(arms, sig) => {
+                            for (d, k) in arms {
+                                let terms: CDnf = d
+                                    .iter()
+                                    .map(|t| t.iter().map(|l| green(Cond { second: r(l.b).op(), ..cnd(r(l.a).sig(), l.op) })).collect())
+                                    .collect();
+                                let id = self.loose(dec_const(distribute(&[], &terms), sig, k), format!("{what}: condition"));
+                                self.on_bus_in(id);
+                                self.bprod(out, id);
+                            }
+                            continue;
+                        }
                         BTerm::Shift(sig, x, c) => {
                             let a = arith(r(x).op(), ArOp::Add, Operand::Const(c), sig);
                             (a, vec![], true, "index")
@@ -419,6 +436,31 @@ impl Cg {
                             let o = DOut { sig: self.everything, copy: true, constant: 1, nets: Nets::RED };
                             let id = self.loose(dec(vec![cond], vec![o]), format!("{what}: select"));
                             let rb = r(x).bun();
+                            self.bread(rb, id, false);
+                            id
+                        }
+                    };
+                    self.on_bus_in(id);
+                    self.bprod(out, id);
+                }
+            }
+            Op::BDec(ref arms) => {
+                for (d, x) in arms {
+                    // The guard reads the bus (green); the bundle comes in on red.
+                    let terms: CDnf = d
+                        .iter()
+                        .map(|t| t.iter().map(|l| green(Cond { second: r(l.b).op(), ..cnd(r(l.a).sig(), l.op) })).collect())
+                        .collect();
+                    let conds = distribute(&[], &terms);
+                    let id = match g.as_bconst(*x) {
+                        Some(vals) => {
+                            let outs = vals.iter().map(|(s, k)| out_const(*s, *k)).collect();
+                            self.loose(dec(conds, outs), format!("{what}: select"))
+                        }
+                        None => {
+                            let o = DOut { sig: self.everything, copy: true, constant: 1, nets: Nets::RED };
+                            let id = self.loose(dec(conds, vec![o]), format!("{what}: select"));
+                            let rb = r(*x).bun();
                             self.bread(rb, id, false);
                             id
                         }
@@ -525,7 +567,7 @@ impl Cg {
         let live: Vec<V> = g.reachable(roots);
         let is_scalar_op = |v: V| matches!(g.op(v), Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_));
         let is_read = |v: V| matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..));
-        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..));
+        let is_bun_op = |v: V| matches!(g.op(v), Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..));
         let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
 
         // Split the logic into clusters of consecutive combinators. A value whose consumers
@@ -846,7 +888,7 @@ impl Cg {
     /// conditions `base` when no earlier check of the same group fails and no error is recorded
     /// yet. It loads the check's code into the error register (and pulses `also`, e.g. a
     /// process's ANY so that it halts).
-    fn error_deciders(&mut self, base: &[Cond], also: Option<Sig>, fails: &[(Option<Sig>, i32)], what: &str) {
+    fn error_deciders(&mut self, base: &[Cond], also: &[(Sig, i32)], fails: &[(Option<Sig>, i32)], what: &str) {
         let Some(e) = self.err else { return };
         for (k, (bad, code)) in fails.iter().enumerate() {
             let mut conds = base.to_vec();
@@ -856,7 +898,7 @@ impl Cg {
             }
             conds.push(c(e, CmpOp::Eq, 0));
             let mut outs = vec![out_const(e, *code)];
-            outs.extend(also.map(|a| out_const(a, 1)));
+            outs.extend(also.iter().map(|&(a, k)| out_const(a, k)));
             self.core(dec(conds, outs), format!("{what}: check {code} failed (error code)"));
         }
     }
@@ -1179,7 +1221,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         let lit = |l: &Lit| lit_cond(l, &loc);
         // Checks are read with the commit; the block keeps running.
         let fails = fail_sigs(&b.checks, &loc);
-        cg.error_deciders(&es_prefix, None, &fails, &what);
+        cg.error_deciders(&es_prefix, &[], &fails, &what);
         for (si, s) in p.states.iter().enumerate() {
             if s.owner != Some(bi) || !live[si] {
                 continue;
@@ -1343,7 +1385,7 @@ fn pipelined_block(
             Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) => {
                 node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
             }
-            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) => {
+            Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) => {
                 node_ref.insert(v, Ref::Bun(cg.bnew()));
             }
             _ => {}
@@ -1398,7 +1440,7 @@ fn pipelined_block(
             continue;
         }
         let t = tau(v).unwrap() - 1;
-        if let Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BSelectAt(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) = g.op(v) {
+        if let Op::Bun(_) | Op::BMux { .. } | Op::BDec(_) | Op::BSelect(..) | Op::BSelectAt(..) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) = g.op(v) {
             // Operands as of this node's input tick, then the combinators.
             let mut ops: HashMap<V, Ref> = HashMap::new();
             for u in g.operands(v) {
@@ -1654,12 +1696,27 @@ fn main_proc(
         }
     };
 
+    // The program counter holds while RUN is on and moves by adding offsets: the commit
+    // decider adds the offset to `fall[i]` (the jump, call, halt or the branch's `else`
+    // target) when it pulses ANY; a branch taken adds the difference one tick later (when its
+    // condition is read, as before); a return drops to 0 and then adds the return address.
+    let fall: Vec<Option<i32>> = steps
+        .iter()
+        .map(|s| match &s.kind {
+            StepKind::Run(Next::Goto(t)) | StepKind::WaitUntil(_, t) | StepKind::WaitTicks(_, t) => Some(pc_of(*t)),
+            StepKind::Run(Next::Branch(_, _, b)) => Some(pc_of(*b)),
+            StepKind::Run(Next::Call { entry, .. }) => Some(pc_of(Some(*entry))),
+            StepKind::Run(Next::Return { .. }) => Some(0),
+        })
+        .collect();
+
     // Commit deciders.
     let mut cm: Vec<Option<(Sig, Vec<Cond>)>> = Vec::new();
     let mut stats = Vec::new();
     for (i, s) in steps.iter().enumerate() {
         let line = format!("{} step {}", m.name, i + 1);
-        let mut prefix = vec![c(pc, CmpOp::Eq, i as i32 + 1), c(any, CmpOp::Eq, 0)];
+        let here = i as i32 + 1;
+        let mut prefix = vec![c(pc, CmpOp::Eq, here), c(any, CmpOp::Eq, 0)];
         let mut extra: CDnf = vec![vec![]];
         // Commits land `depth` ticks after the step starts (at least one), when everything
         // they load is ready: the decider fires one tick before.
@@ -1703,9 +1760,14 @@ fn main_proc(
         for (f, _) in &fails {
             prefix.push(cg.passes(*f));
         }
-        cg.error_deciders(&base, Some(any), &fails, &line);
+        // A failure halts: the PC drops to 0.
+        cg.error_deciders(&base, &[(any, 1), (pc, -here)], &fails, &line);
         let cms = cg.alloc()?;
-        cg.core(dec(distribute(&prefix, &extra), vec![out_const(cms, 1), out_const(any, 1)]), format!("{line}: commit"));
+        let mut outs = vec![out_const(cms, 1), out_const(any, 1)];
+        if let Some(t) = fall[i] {
+            outs.push(out_const(pc, t - here));
+        }
+        cg.core(dec(distribute(&prefix, &extra), outs), format!("{line}: commit"));
         cm.push(Some((cms, prefix)));
         let self_loop = s.targets().contains(&Some(i));
         stats.push(StepStats { span: s.span, duration, self_loop });
@@ -1728,20 +1790,13 @@ fn main_proc(
         let Some((cms, _)) = &cm[i] else { continue };
         let on = [c(*cms, CmpOp::Ne, 0)];
         match &s.kind {
-            StepKind::Run(Next::Goto(t)) | StepKind::WaitUntil(_, t) | StepKind::WaitTicks(_, t) => {
-                if t.is_some() {
-                    pc_loads.push(dec_const(on.to_vec(), pc, pc_of(*t)));
-                }
-            }
+            StepKind::Run(Next::Goto(_)) | StepKind::WaitUntil(..) | StepKind::WaitTicks(..) | StepKind::Run(Next::Call { .. }) => {}
             StepKind::Run(Next::Branch(plan, a, b)) => {
-                for (target, neg) in [(a, false), (b, true)] {
-                    let terms = cond_terms(plan, neg);
-                    if target.is_some() && !terms.is_empty() {
-                        pc_loads.push(dec_const(distribute(&on, &terms), pc, pc_of(*target)));
-                    }
+                let terms = cond_terms(plan, false);
+                if a != b && !terms.is_empty() {
+                    pc_loads.push(dec_const(distribute(&on, &terms), pc, pc_of(*a) - pc_of(*b)));
                 }
             }
-            StepKind::Run(Next::Call { entry, .. }) => pc_loads.push(dec_const(on.to_vec(), pc, pc_of(Some(*entry)))),
             // Jump to the step the return-address register holds (if never called, never reached).
             StepKind::Run(Next::Return { func }) => {
                 if let Some(&r) = ret_sig.get(func) {
@@ -1750,7 +1805,7 @@ fn main_proc(
             }
         }
     }
-    cg.core(dec_copy(vec![c(any, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], pc), format!("{}: program counter (hold)", m.name));
+    cg.core(dec_copy(vec![c(run, CmpOp::Ne, 0)], pc), format!("{}: program counter (hold)", m.name));
     cg.core(dec_const(vec![c(st, CmpOp::Ne, 0)], pc, pc_of(Some(m.entry))), format!("{}: program counter (start)", m.name));
     for k in pc_loads {
         cg.core(k, format!("{}: program counter (next step)", m.name));
