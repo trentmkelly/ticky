@@ -262,6 +262,12 @@ fn screens() {
         }
         assert_eq!(h.pixel(0, 0), want);
     }
+    // Speakers.
+    assert!(error_of("output s: speaker.Alarm(\"x\")\n").contains("needs `import speaker`"));
+    assert!(error_of("import speaker\noutput s: speaker.Alarm(\"x\", sound=\"moo\")\n").contains("unknown alarm sound"));
+    assert!(error_of("import speaker\noutput s: speaker.Notes(\"kazoo\")\n").contains("unknown instrument"));
+    assert!(error_of("import speaker\noutput s: speaker.Notes(\"piano\", volume=200)\n").contains("0 to 100"));
+    assert!(error_of("import speaker\noutput s: speaker.Alarm(\"x\")\nevery tick:\n    s.play(3)\n").contains("an alarm is a `bool`"));
     // Readouts.
     assert!(error_of("import display\ninput d: display.Digits(3)\n").contains("is an `output`"));
     assert!(error_of("import display\noutput d: display.Digits(11)\n").contains("1 to 10 digits"));

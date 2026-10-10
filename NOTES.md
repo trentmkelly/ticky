@@ -616,3 +616,17 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
 - Harness: a screen whose entity is a display panel reports the index of the message shown
   (matching text and icon); the simulator side uses the previous tick's value. MATCH on a
   scratch program (including a one-tick message) and on the readouts example.
+
+## 2026-10-10 — Speakers: `import speaker` (SPEC §8.4 item 4)
+- Probe `speakerprobe`: 12 instruments (alarms … steel-drum) with their notes; ids 0-based (a
+  new speaker is instrument 0, note 0; 12 resets to 0); blueprint keys `parameters`,
+  `alert_parameters`, `control_behavior.{circuit_condition, circuit_parameters}`; entity
+  status says "working" regardless; `circuit_condition.fulfilled` is readable.
+- `Kind::Speaker` (netlist, blueprint); `speaker.Alarm` (condition `≠ 0`, global, alert) and
+  `speaker.Notes` (pitch from the value, condition `> 0`) are 1 × 1 `Screen`s of kind
+  `Speaker` on the panel machinery (generalized: name → hidden array); `tune.play(n)` →
+  `tune = n`.
+- Harness: a speaker reports its signal's value while `fulfilled`, else 0; both as of the
+  current tick (unlike a panel's message, one tick later). Also writes
+  `ticky/peripherals.txt`: every speaker's and panel's settings after import (all round-trip).
+- In-game: scratch program and `sounds` example MATCH.

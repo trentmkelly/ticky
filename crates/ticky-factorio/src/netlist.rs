@@ -103,6 +103,25 @@ pub enum Kind {
     Lamp(Cond, Option<Sig>),
     /// A display panel showing the first message whose value equals signal `sig`.
     Panel(Panel),
+    Speaker(Speaker),
+}
+
+/// A programmable speaker playing while `sig` (from the red wire) is above 0 (`!= 0` for
+/// alarms).
+#[derive(Clone, Debug)]
+pub struct Speaker {
+    pub sig: Sig,
+    /// A global alert while it plays: `(message, icon, show on map)`.
+    pub alert: Option<(String, Option<Sig>, bool)>,
+    /// 0-based, as the game numbers them (verified: scenario speakerprobe).
+    pub instrument: u32,
+    pub note: u32,
+    /// The signal's value picks the note.
+    pub pitch: bool,
+    /// Heard everywhere (global playback) rather than nearby.
+    pub global: bool,
+    /// 0 to 100.
+    pub volume: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +145,7 @@ impl Kind {
             Kind::Pole => "medium-electric-pole",
             Kind::Lamp(..) => "small-lamp",
             Kind::Panel(_) => "display-panel",
+            Kind::Speaker(_) => "programmable-speaker",
         }
     }
 

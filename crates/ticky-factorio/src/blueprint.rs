@@ -194,6 +194,34 @@ pub fn to_json(n: &Netlist, t: &SignalTable, icons: &[Sig]) -> Value {
                         }
                     }
                 }
+                // Format from the game's own blueprints (scenario speakerprobe).
+                Kind::Speaker(sp) => {
+                    let cmp = if sp.alert.is_some() { "≠" } else { ">" };
+                    m.insert(
+                        "parameters".into(),
+                        json!({
+                            "playback_volume": sp.volume as f64 / 100.0,
+                            "playback_mode": if sp.global { "global" } else { "local" },
+                            "allow_polyphony": false,
+                            "volume_controlled_by_signal": false,
+                        }),
+                    );
+                    let alert = match &sp.alert {
+                        Some((msg, icon, map)) => {
+                            let mut a = json!({ "show_alert": true, "show_on_map": map, "alert_message": msg });
+                            if let Some(i) = icon {
+                                a["icon_signal_id"] = signal_json(t, *i);
+                            }
+                            a
+                        }
+                        None => json!({ "show_alert": false, "show_on_map": false, "alert_message": "" }),
+                    };
+                    m.insert("alert_parameters".into(), alert);
+                    Some(json!({
+                        "circuit_condition": { "first_signal": signal_json(t, sp.sig), "constant": 0, "comparator": cmp },
+                        "circuit_parameters": { "signal_value_is_pitch": sp.pitch, "stop_playing_sounds": false, "instrument_id": sp.instrument, "note_id": sp.note },
+                    }))
+                }
                 // Verified in-game (scenario panelprobe).
                 Kind::Panel(p) => {
                     let msgs: Vec<Value> = p

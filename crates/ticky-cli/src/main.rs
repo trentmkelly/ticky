@@ -377,10 +377,13 @@ fn screen_trace(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> Vec<Ve
             on.iter()
                 .zip(&now)
                 .zip(&c.program.screens)
-                .map(|((on, now), sc)| match &sc.panel {
+                .map(|((on, now), sc)| match (&sc.panel, &sc.speaker) {
                     // A panel: the message it shows (as of the tick before).
-                    Some(p) => (if (1..=p.messages.len() as i32).contains(&on[0]) { on[0] } else { 0 }).to_string(),
-                    None => on.iter().zip(now).map(|(o, v)| if *o != 0 { (v & 0xFF_FFFF).to_string() } else { "0".into() }).collect::<Vec<_>>().join(","),
+                    (Some(p), _) => (if (1..=p.messages.len() as i32).contains(&on[0]) { on[0] } else { 0 }).to_string(),
+                    // A speaker: the value on its wire while its condition holds (both read
+                    // as of this tick), else 0.
+                    (_, Some(s)) => (if (s.alert.is_some() && now[0] != 0) || now[0] > 0 { now[0] } else { 0 }).to_string(),
+                    _ => on.iter().zip(now).map(|(o, v)| if *o != 0 { (v & 0xFF_FFFF).to_string() } else { "0".into() }).collect::<Vec<_>>().join(","),
                 })
                 .collect(),
         );

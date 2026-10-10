@@ -591,11 +591,21 @@ one) that difftest-matches the game, and a line in the README.
   condition holds is shown; it follows the wire like a lamp's on/off; a wildcard icon
   (`each`, `anything`) is shown as the wildcard itself, so the icon can't come from the wire,
   and `Signal` values aren't accepted. Difftests compare the message shown each tick.
-- [ ] **4. `speaker`.** A programmable speaker built in:
-  `output siren: speaker.Alarm("Reactor too hot", icon="signal-fire") = port("Siren")`, `siren
-  = heat > 900` (a global alert with that message and a sound while true), and
-  `output tune: speaker.Notes(instrument="piano")`, `tune.play(note)` (note number, 0 = silent).
-  The probe settles which instruments/notes and alert options exist in 2.0.
+- [x] **4. `speaker`.** A programmable speaker built in (`examples/sounds.ticky`):
+  `output siren: speaker.Alarm("Reactor too hot", icon="signal-fire", sound="siren",
+  map=True, volume=100) = port("Siren")` is a `bool` (`siren = heat > 900`): while true, the
+  speaker plays the alarm sound everywhere and raises a global alert with that message and
+  icon (marked on the map unless `map=False`). Sounds: `alarm-1`, `alarm-2`, `buzzer-1` …
+  `buzzer-3`, `ring`, `siren` (default). `output tune: speaker.Notes("piano", everywhere=False,
+  volume=100)` is an `int`, the note playing (`tune.play(n)` or `tune = n`; 0 or less is
+  silent; the speaker's "signal value is pitch" mode, numbered from 1 by the game, which a
+  headless test can't hear). Instruments: `alarms`, `miscellaneous`, `drum-kit`, `piano`,
+  `bass`, `lead`, `saw`, `square`, `celesta`, `vibraphone`, `plucked`, `steel-drum`. Like a
+  panel, the speaker reads a one-element array that assignments replace; it's placed like a
+  1 × 1 screen. Verified in-game (scenario `speakerprobe`, difftests): instruments and notes
+  (0-based ids), the blueprint format (settings read back after import), and each tick the
+  speaker's condition (`fulfilled`) with the value it reads; whether the sound and alert
+  appear can't be observed without a player, and isn't checked.
 - [ ] **5. `controls`.** Player inputs inside the blueprint, so a program needs no wiring to
   be configured: `input go: controls.Switch("Start", on=False)` (a constant combinator the
   player toggles; `bool`) and `input target: controls.Setting("Target", 100)` (a constant

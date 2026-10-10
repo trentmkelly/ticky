@@ -1373,6 +1373,17 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         for b in 0..sc.pixels().div_ceil(bs) {
             let bank = format!("{}#{b}", sc.var);
             let reg = p.states.iter().position(|s| s.name == bank).and_then(|si| shared.state_bun.get(&si).copied());
+            if let Some(spec) = &sc.speaker {
+                let sig = crate::ir::Graph::slot(0);
+                let id = cg.net.add(Kind::Speaker(ticky_factorio::netlist::Speaker { sig, ..spec.clone() }), Role::Pixel { screen: k, index: 0 });
+                let label = sc.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default();
+                cg.net.entities[id].description = Some(format!("Ticky speaker `{}`{label}", sc.name));
+                if let Some(x) = reg {
+                    cg.bread_single(x, id);
+                }
+                lamps.push(id);
+                continue;
+            }
             if let Some(spec) = &sc.panel {
                 let sig = crate::ir::Graph::slot(0);
                 let messages = spec.messages.iter().enumerate().map(|(k, (_, icon, text))| (k as i32 + 1, *icon, text.clone())).collect();

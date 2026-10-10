@@ -170,6 +170,13 @@ script.on_event(defines.events.on_tick, function(e)
       end
       px[1] = tostring(shown)
       lamps = {}
+    elseif first and first.name == "programmable-speaker" then
+      -- A speaker: the value of its condition's signal while the condition holds (it plays),
+      -- else 0.
+      local cond = first.get_control_behavior().circuit_condition
+      local net = first.get_circuit_network(defines.wire_connector_id.circuit_red)
+      px[1] = tostring(cond.fulfilled and net and net.get_signal(cond.first_signal) or 0)
+      lamps = {}
     end
     for k, id in ipairs(lamps) do
       local cb = storage.ents[id].get_control_behavior()
@@ -207,6 +214,16 @@ script.on_event(defines.events.on_tick, function(e)
       end
     end
     helpers.write_file("ticky/lamps.txt", table.concat(lamps, " ") .. "\n")
+    -- Speakers and panels as built from the blueprint: their settings.
+    local per = {}
+    for _, ent in pairs(storage.ents) do
+      if ent.valid and ent.name == "programmable-speaker" then
+        per[#per + 1] = "speaker " .. helpers.table_to_json({ent.parameters, ent.alert_parameters, ent.get_control_behavior().circuit_parameters, ent.get_control_behavior().circuit_condition})
+      elseif ent.valid and ent.name == "display-panel" then
+        per[#per + 1] = "panel " .. helpers.table_to_json({ent.display_panel_always_show, ent.display_panel_show_in_chart, ent.get_control_behavior().messages})
+      end
+    end
+    helpers.write_file("ticky/peripherals.txt", table.concat(per, "\n") .. "\n")
     helpers.write_file("ticky/done.txt", "ok")
   end
 end)

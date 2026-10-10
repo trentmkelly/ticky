@@ -1,0 +1,43 @@
+# Sounds (`import speaker`): an alarm that sounds everywhere and raises a global alert (with
+# a map marker) while the reactor is too hot, and a doorbell that plays a three-note chime
+# each time it's pressed. Notes are numbered from 1, the instrument's lowest (0 is silent).
+import speaker
+
+input  heat: int @ H = port("Reactor temperature")
+input  bell: bool @ B = port("Doorbell button")
+output alarm: speaker.Alarm("Reactor too hot!", icon="signal-fire", sound="siren") = port("Alarm")
+output chime: speaker.Notes("celesta", volume=80) = port("Chime")
+
+CHIME = [20, 16, 13]
+
+every tick:
+    alarm = heat > 900
+
+while True:
+    wait until bell
+    for note in CHIME:
+        chime.play(note)
+        wait 12 ticks
+    chime.play(0)
+    wait until not bell
+
+test "alarm":
+    set heat = 950
+    run 20 ticks
+    assert alarm
+    set heat = 400
+    run 20 ticks
+    assert not alarm
+
+test "chime":
+    run 10 ticks
+    assert chime == 0
+    set bell = True
+    run 14 ticks
+    assert chime == 20
+    run 16 ticks
+    assert chime == 16
+    run 20 ticks
+    assert chime == 13
+    run 30 ticks
+    assert chime == 0

@@ -29,6 +29,8 @@ pub struct Screen {
     pub span: Span,
     /// A panel's messages and settings.
     pub panel: Option<PanelSpec>,
+    /// A speaker's settings (`sig` unused: chosen by codegen).
+    pub speaker: Option<ticky_factorio::netlist::Speaker>,
 }
 
 /// `display.Panel({key: (icon, text), …})`: the value `k + 1` shows message `k`.
@@ -55,6 +57,8 @@ pub enum ScreenKind {
     Digits,
     /// `display.Panel(…)`: an `int` choosing a display panel's message (0: none).
     Panel,
+    /// `speaker.Alarm(…)` (a `bool`) or `speaker.Notes(…)` (an `int`, the note).
+    Speaker,
 }
 
 impl Screen {
@@ -82,14 +86,15 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
                 imported.insert(n.clone());
             }
             StmtKind::Port { dir, name, ty, signal, label } if display_type(ty).is_some() => {
-                let what = display_type(ty).unwrap();
-                if !imported.contains("display") {
-                    errs.push(Diag::error(ty.span, format!("`display.{what}` needs `import display` first")));
+                let (lib, what) = display_type(ty).unwrap();
+                if !imported.contains(lib) {
+                    errs.push(Diag::error(ty.span, format!("`{lib}.{what}` needs `import {lib}` first")));
                     continue;
                 }
                 let r = match what {
                     "Screen" => screen(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
                     "Panel" => panel(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
+                    "Alarm" | "Notes" => speaker(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span),
                     _ => digits(*dir, name, ty, signal.is_some(), label.as_ref(), &consts, s.span).map(|(sc, colour)| {
                         readouts.push((sc.clone(), colour));
                         sc
@@ -141,20 +146,24 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
         draw_all.push(call("fill", vec![int(0, sp)], vec![]));
         draw_all.push(call("number", vec![int(0, sp), int(0, sp), ex(ExprKind::Name(sc.name.clone()), sp), colour.clone()], vec![("width".into(), int(n as i64, sp))]));
     }
-    // A panel's keys stand for their values where it's assigned or compared; outside tests,
-    // the panel's name is element 0 of the one-element array it shows.
+    // Panels and speakers are values on a one-element array (what the entity reads): outside
+    // tests, the name is that element; a panel's keys stand for their numbers where it's
+    // assigned or compared; `tune.play(n)` is `tune = n`.
     let panels: HashMap<String, PanelSpec> = screens.iter().filter_map(|s| Some((s.name.clone(), s.panel.clone()?))).collect();
-    if !panels.is_empty() {
+    let values: HashMap<String, String> =
+        screens.iter().filter(|s| matches!(s.kind, ScreenKind::Panel | ScreenKind::Speaker)).map(|s| (s.name.clone(), s.var.clone())).collect();
+    if !values.is_empty() {
         for s in &mut body {
+            play_calls(s, &screens, &mut errs);
             panel_keys(s, &panels, &mut errs);
             if !matches!(s.kind, StmtKind::Test { .. }) {
-                panel_assigns(s, &panels);
+                panel_assigns(s, &values);
                 crate::stdlib::stmt_exprs_mut(s, &mut |e| {
                     crate::stdlib::walk_mut(e, &mut |x| {
                         if let ExprKind::Name(n) = &x.kind {
-                            if panels.contains_key(n) {
+                            if let Some(var) = values.get(n) {
                                 let sp = x.span;
-                                let arr = ex(ExprKind::Name(format!("_panel_{n}")), sp);
+                                let arr = ex(ExprKind::Name(var.clone()), sp);
                                 x.kind = ExprKind::Index(Box::new(arr), Box::new(int(0, sp)));
                             }
                         }
@@ -196,17 +205,17 @@ pub fn desugar(m: &Module) -> Result<(Module, Vec<Screen>), Vec<Diag>> {
 /// internal name: the expansion leaves periods alone).
 pub const NATURAL: &str = "#natural";
 
-/// `display.Screen(…)` → `Screen`, `display.Digits(…)` → `Digits`.
-fn display_type(ty: &Expr) -> Option<&'static str> {
+/// Peripheral port types: `display.Screen(…)` → `("display", "Screen")`, …
+fn display_type(ty: &Expr) -> Option<(&'static str, &'static str)> {
     let ExprKind::Call { func, .. } = &ty.kind else { return None };
     let ExprKind::Attr(b, a) = &func.kind else { return None };
-    if !matches!(&b.kind, ExprKind::Name(n) if n == "display") {
-        return None;
-    }
-    match a.as_str() {
-        "Screen" => Some("Screen"),
-        "Digits" => Some("Digits"),
-        "Panel" => Some("Panel"),
+    let ExprKind::Name(lib) = &b.kind else { return None };
+    match (lib.as_str(), a.as_str()) {
+        ("display", "Screen") => Some(("display", "Screen")),
+        ("display", "Digits") => Some(("display", "Digits")),
+        ("display", "Panel") => Some(("display", "Panel")),
+        ("speaker", "Alarm") => Some(("speaker", "Alarm")),
+        ("speaker", "Notes") => Some(("speaker", "Notes")),
         _ => None,
     }
 }
@@ -248,7 +257,7 @@ fn digits(
         },
     };
     let label = port_label(label)?;
-    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span, panel: None };
+    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span, panel: None, speaker: None };
     Ok((sc, colour))
 }
 
@@ -314,25 +323,25 @@ fn panel(
     }
     let label = port_label(label)?;
     let spec = PanelSpec { messages, always_show, show_in_chart };
-    Ok(Screen { name: name.to_string(), var: format!("_panel_{name}"), kind: ScreenKind::Panel, w: 1, h: 1, label, span, panel: Some(spec) })
+    Ok(Screen { name: name.to_string(), var: format!("_panel_{name}"), kind: ScreenKind::Panel, w: 1, h: 1, label, span, panel: Some(spec), speaker: None })
 }
 
 /// `panel = e` → `panel = [e]` and `panel op= e` → `panel = [panel op e]` (whole-array
 /// writes: no feedback through the old value); the names then become the array's.
-fn panel_assigns(s: &mut Stmt, panels: &HashMap<String, PanelSpec>) {
+fn panel_assigns(s: &mut Stmt, panels: &HashMap<String, String>) {
     let is_panel = |e: &Expr| matches!(&e.kind, ExprKind::Name(n) if panels.contains_key(n));
     match &mut s.kind {
         StmtKind::Assign { targets, value } if targets.len() == 1 && is_panel(&targets[0]) => {
             let ExprKind::Name(n) = &targets[0].kind else { unreachable!() };
             let sp = value.span;
-            targets[0].kind = ExprKind::Name(format!("_panel_{n}"));
+            targets[0].kind = ExprKind::Name(panels[n].clone());
             *value = ex(ExprKind::List(vec![value.clone()]), sp);
         }
         StmtKind::AugAssign { target, op, value } if is_panel(target) => {
             let ExprKind::Name(n) = &target.kind else { unreachable!() };
             let sp = value.span;
             let new = bin(*op, target.clone(), value.clone(), sp);
-            let t = ex(ExprKind::Name(format!("_panel_{n}")), target.span);
+            let t = ex(ExprKind::Name(panels[n].clone()), target.span);
             s.kind = StmtKind::Assign { targets: vec![t], value: ex(ExprKind::List(vec![new]), sp) };
         }
         StmtKind::If { body, orelse, .. } => {
@@ -353,6 +362,138 @@ fn panel_assigns(s: &mut Stmt, panels: &HashMap<String, PanelSpec>) {
         }
         _ => {}
     }
+}
+
+/// `tune.play(n)` → `tune = n`, for `speaker.Notes`.
+fn play_calls(s: &mut Stmt, screens: &[Screen], errs: &mut Vec<Diag>) {
+    if let StmtKind::Expr(Expr { kind: ExprKind::Call { func, args, kwargs }, span }) = &s.kind {
+        if let ExprKind::Attr(base, m) = &func.kind {
+            if let ExprKind::Name(n) = &base.kind {
+                if let Some(sc) = screens.iter().find(|sc| &sc.name == n && sc.kind == ScreenKind::Speaker) {
+                    let notes = sc.speaker.as_ref().is_some_and(|sp| sp.pitch);
+                    if m != "play" || !notes || args.len() != 1 || !kwargs.is_empty() {
+                        errs.push(Diag::error(*span, if notes { "expected `tune.play(note)`" } else { "an alarm is a `bool`: assign it, e.g. `siren = heat > 900`" }));
+                        return;
+                    }
+                    s.kind = StmtKind::Assign { targets: vec![(**base).clone()], value: args[0].clone() };
+                    return;
+                }
+            }
+        }
+    }
+    let rec = |b: &mut Vec<Stmt>, errs: &mut Vec<Diag>| {
+        for x in b {
+            play_calls(x, screens, errs);
+        }
+    };
+    match &mut s.kind {
+        StmtKind::If { body, orelse, .. } => {
+            rec(body, errs);
+            rec(orelse, errs);
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Def { body, .. }
+        | StmtKind::Every { body, .. }
+        | StmtKind::Process { body, .. }
+        | StmtKind::Block { body, .. }
+        | StmtKind::Sub { body, .. } => rec(body, errs),
+        _ => {}
+    }
+}
+
+/// The alarm sounds (`speaker.Alarm(sound=…)`): the game's "alarms" instrument.
+const ALARM_SOUNDS: &[&str] = &["alarm-1", "alarm-2", "buzzer-1", "buzzer-2", "buzzer-3", "ring", "siren"];
+
+/// Instruments for `speaker.Notes`, in the game's order (scenario speakerprobe).
+const INSTRUMENTS: &[&str] =
+    &["alarms", "miscellaneous", "drum-kit", "piano", "bass", "lead", "saw", "square", "celesta", "vibraphone", "plucked", "steel-drum"];
+
+/// `output siren: speaker.Alarm("message", icon="signal-fire", sound="siren", map=True,
+/// volume=100)` or `output tune: speaker.Notes("piano", everywhere=False, volume=100)`.
+fn speaker(
+    dir: PortDir,
+    name: &str,
+    ty: &Expr,
+    has_signal: bool,
+    label: Option<&Expr>,
+    consts: &HashMap<String, Cv>,
+    span: Span,
+) -> Result<Screen, Diag> {
+    if dir != PortDir::Output {
+        return Err(Diag::error(span, "a speaker is an `output`"));
+    }
+    if has_signal {
+        return Err(Diag::error(span, "a speaker has no `@ signal`"));
+    }
+    let ExprKind::Call { func, args, kwargs } = &ty.kind else { unreachable!() };
+    let ExprKind::Attr(_, what) = &func.kind else { unreachable!() };
+    let alarm = what == "Alarm";
+    let allowed: &[&str] = if alarm { &["icon", "sound", "map", "volume"] } else { &["everywhere", "volume"] };
+    if let Some((k, e)) = kwargs.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
+        let all: Vec<String> = allowed.iter().map(|a| format!("`{a}`")).collect();
+        return Err(Diag::error(e.span, format!("`speaker.{what}` has no setting `{k}` (it has {})", all.join(", "))));
+    }
+    let kw = |k: &str| kwargs.iter().find(|(n, _)| n == k).map(|x| &x.1);
+    let string = |e: &Expr, what: &str| -> Result<String, Diag> {
+        match &e.kind {
+            ExprKind::Str(s) => Ok(s.clone()),
+            _ => Err(Diag::error(e.span, format!("{what} must be a string"))),
+        }
+    };
+    let number = |e: &Expr, what: &str| -> Result<i64, Diag> {
+        crate::program::eval_const(e, consts, &[]).ok().and_then(|v| v.int()).map(|v| v as i64).ok_or_else(|| Diag::error(e.span, format!("{what} must be a constant")))
+    };
+    let volume = match kw("volume") {
+        None => 100,
+        Some(e) => match number(e, "`volume`")? {
+            v @ 0..=100 => v as u32,
+            _ => return Err(Diag::error(e.span, "`volume` is 0 to 100 (percent)")),
+        },
+    };
+    let t = ticky_factorio::SignalTable::base();
+    let sp = if alarm {
+        let [msg] = args.as_slice() else {
+            return Err(Diag::error(ty.span, "expected `speaker.Alarm(\"message\", icon=\"signal\", sound=\"siren\")`"));
+        };
+        let msg = string(msg, "the alert's message")?;
+        let icon = match kw("icon") {
+            None => None,
+            Some(e) => {
+                let n = string(e, "`icon`")?;
+                Some(t.lookup_display(&n).or_else(|| t.resolve_ident(&n)).ok_or_else(|| Diag::error(e.span, format!("unknown signal \"{n}\" for an icon")))?)
+            }
+        };
+        let note = match kw("sound") {
+            None => 6,
+            Some(e) => {
+                let n = string(e, "`sound`")?;
+                ALARM_SOUNDS.iter().position(|s| *s == n).ok_or_else(|| {
+                    Diag::error(e.span, format!("unknown alarm sound \"{n}\"")).with_help(format!("the sounds are {}", ALARM_SOUNDS.join(", ")))
+                })? as u32
+            }
+        };
+        let map = match kw("map") {
+            None => true,
+            Some(e) => number(e, "`map`")? != 0,
+        };
+        ticky_factorio::netlist::Speaker { sig: crate::ir::Graph::slot(0), alert: Some((msg, icon, map)), instrument: 0, note, pitch: false, global: true, volume }
+    } else {
+        let [ins] = args.as_slice() else {
+            return Err(Diag::error(ty.span, "expected `speaker.Notes(\"instrument\")`"));
+        };
+        let n = string(ins, "the instrument")?;
+        let instrument = INSTRUMENTS.iter().position(|s| *s == n).ok_or_else(|| {
+            Diag::error(ins.span, format!("unknown instrument \"{n}\"")).with_help(format!("the instruments are {}", INSTRUMENTS.join(", ")))
+        })? as u32;
+        let global = match kw("everywhere") {
+            None => false,
+            Some(e) => number(e, "`everywhere`")? != 0,
+        };
+        ticky_factorio::netlist::Speaker { sig: crate::ir::Graph::slot(0), alert: None, instrument, note: 0, pitch: true, global, volume }
+    };
+    let label = port_label(label)?;
+    Ok(Screen { name: name.to_string(), var: format!("_speaker_{name}"), kind: ScreenKind::Speaker, w: 1, h: 1, label, span, panel: None, speaker: Some(sp) })
 }
 
 /// Replaces a panel's keys (strings) by their values in assignments to it and comparisons
@@ -502,7 +643,7 @@ fn screen(
         return Err(Diag::error(ty.span, format!("a screen can have at most {MAX_PIXELS} pixels; this one has {}", w * h)));
     }
     let label = port_label(label)?;
-    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span, panel: None })
+    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span, panel: None, speaker: None })
 }
 
 fn ex(kind: ExprKind, span: Span) -> Expr {

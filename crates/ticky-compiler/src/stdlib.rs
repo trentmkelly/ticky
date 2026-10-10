@@ -17,6 +17,7 @@ use crate::lower::{self, Names};
 /// Every library, with its functions (`(name, help)`); port types are listed separately.
 pub const LIBRARIES: &[(&str, &[&str])] = &[
     ("display", &[]),
+    ("speaker", &[]),
     ("items", &["stack_size", "rocket_capacity"]),
     ("quality", &["set", "merge", "of"]),
     ("random", &["choice", "key", "randint"]),
