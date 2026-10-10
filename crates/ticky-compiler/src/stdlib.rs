@@ -90,6 +90,8 @@ pub struct Control {
     pub switch: bool,
     /// The switch's position (0/1) or the setting's value when built.
     pub initial: i32,
+    /// A fixed place (`at=(x, y)`), else beside its port.
+    pub at: Option<(i64, i64)>,
 }
 
 /// `input go: controls.Switch("Start", on=False)` and `input n: controls.Setting("Target",
@@ -130,19 +132,26 @@ pub fn controls(m: &mut Module, imported: &HashSet<String>) -> Result<Vec<Contro
             errs.push(Diag::error(span, "a control is an `input`"));
             continue;
         }
-        let usage = if switch { "expected `controls.Switch(\"label\", on=False)`" } else { "expected `controls.Setting(\"label\", value)`" };
+        let usage = if switch { "expected `controls.Switch(\"label\", on=False, at=(x, y))`" } else { "expected `controls.Setting(\"label\", value, at=(x, y))`" };
         let Some(Expr { kind: ExprKind::Str(text), span: lsp }) = args.first() else {
             errs.push(Diag::error(span, usage));
             continue;
         };
         let (text, lsp) = (text.clone(), *lsp);
         let num = |e: &Expr| crate::program::eval_const(e, &consts, &[]).ok().and_then(|v| v.int());
+        let at = match crate::display::at_of(kwargs, &consts) {
+            Ok(a) => a,
+            Err(d) => {
+                errs.push(d);
+                continue;
+            }
+        };
         let initial = if switch {
-            if args.len() != 1 || kwargs.iter().any(|(k, _)| k != "on") {
+            if args.len() != 1 || kwargs.iter().any(|(k, _)| k != "on" && k != "at") {
                 errs.push(Diag::error(span, usage));
                 continue;
             }
-            match kwargs.first() {
+            match kwargs.iter().find(|(k, _)| k == "on") {
                 None => 0,
                 Some((_, e)) => match num(e) {
                     Some(v) => (v != 0) as i32,
@@ -153,7 +162,7 @@ pub fn controls(m: &mut Module, imported: &HashSet<String>) -> Result<Vec<Contro
                 },
             }
         } else {
-            if args.len() != 2 || !kwargs.is_empty() {
+            if args.len() != 2 || kwargs.iter().any(|(k, _)| k != "at") {
                 errs.push(Diag::error(span, usage));
                 continue;
             }
@@ -169,7 +178,7 @@ pub fn controls(m: &mut Module, imported: &HashSet<String>) -> Result<Vec<Contro
             errs.push(Diag::error(span, "a control is labelled by its first argument, not `= port(…)`"));
             continue;
         }
-        out.push(Control { name: name.clone(), switch, initial });
+        out.push(Control { name: name.clone(), switch, initial, at });
         *ty = Expr { kind: ExprKind::Name(if switch { "bool" } else { "int" }.into()), span };
         let port = Expr { kind: ExprKind::Name("port".into()), span: lsp };
         *label = Some(Expr { kind: ExprKind::Call { func: Box::new(port), args: vec![Expr { kind: ExprKind::Str(text), span: lsp }], kwargs: vec![] }, span: lsp });

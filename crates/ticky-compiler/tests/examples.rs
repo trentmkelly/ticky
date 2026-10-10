@@ -272,7 +272,7 @@ fn screens() {
     assert!(error_of("output s: controls.Switch(\"x\")\n").contains("needs `import controls`"));
     assert!(error_of("import controls\noutput s: controls.Switch(\"x\")\n").contains("is an `input`"));
     assert!(error_of("import controls\ninput s: controls.Knob(\"x\")\n").contains("has no `Knob`"));
-    assert!(error_of("import controls\ninput s: controls.Setting(\"x\")\n").contains("controls.Setting(\"label\", value)"));
+    assert!(error_of("import controls\ninput s: controls.Setting(\"x\")\n").contains("controls.Setting(\"label\", value"));
     assert!(error_of("import controls\ninput s: controls.Switch(\"x\") = port(\"y\")\n").contains("labelled by its first argument"));
     // Readouts.
     assert!(error_of("import display\ninput d: display.Digits(3)\n").contains("is an `output`"));
@@ -419,4 +419,33 @@ fn screen_drawing() {
             assert_eq!(h_.pixel(0, k), *want, "pixel ({}, {}) with x={x} y={y} n={n} d={d}", k % w, k / w);
         }
     }
+}
+
+/// Peripherals at fixed places (`at=`, `Options::at`): where they end up, logic placed around
+/// them, overlaps reported.
+#[test]
+fn fixed_placement() {
+    let src = |at: &str| format!("import display\nimport controls\ninput c: int @ C\ninput k: controls.Setting(\"K\", 5{at})\noutput s: display.Screen(8, 3) = port(\"S\"{at})\nevery tick:\n    for i in range(24):\n        s[i] = c * i + k\n");
+    for anneal in [None, Some(ticky_compiler::place::AnnealOpts { effort: 0.2, ..Default::default() })] {
+        for (x, y) in [(0, 0), (2, 3), (-30, -12), (50, 40)] {
+            let o = Options { anneal, at: vec![("s".into(), (x, y)), ("k".into(), (x - 2, y + 6))], ..opts() };
+            let c = compile(&src(""), &o).unwrap_or_else(|d| panic!("({x}, {y}): {}", d[0].message));
+            assert!(c.cg.netlist.validate(true).is_empty());
+            // Pixel 0's lamp is the screen's top-left tile; the control is where it was put.
+            let p0 = c.cg.netlist.entities[c.cg.screen_lamps[0][0]].pos;
+            assert_eq!(p0, (x as f64 + 0.5, y as f64 + 0.5));
+            let k = c.cg.controls[0].1;
+            assert_eq!(c.cg.netlist.entities[k].pos, ((x - 2) as f64 + 0.5, (y + 6) as f64 + 0.5));
+        }
+    }
+    // `at=` in the program.
+    let c = compile(&src(", at=(4, 7)"), &opts());
+    assert!(c.is_err_and(|d| d[0].message.contains("overlaps")), "the control and the screen share a tile");
+    let c = compile(&src("").replace("port(\"S\")", "port(\"S\", at=(4, 7))"), &opts()).unwrap();
+    assert_eq!(c.cg.netlist.entities[c.cg.screen_lamps[0][0]].pos, (4.5, 7.5));
+    // Overlapping the ports west of the grid.
+    let o = Options { at: vec![("s".into(), (-6, 0))], ..opts() };
+    assert!(compile(&src(""), &o).is_err_and(|d| d[0].message.contains("overlaps the program's ports")));
+    let o = Options { at: vec![("nope".into(), (0, 0))], ..opts() };
+    assert!(compile(&src(""), &o).is_err_and(|d| d[0].message.contains("no peripheral `nope`")));
 }

@@ -65,6 +65,7 @@ pub struct LayoutInfo {
 /// A return line: gate, output port, and the poles in between.
 type Line = (EntId, EntId, Vec<(f64, f64)>);
 
+#[derive(Clone)]
 pub struct LayoutOpts {
     /// Medium poles for power.
     pub poles: bool,
@@ -77,8 +78,33 @@ pub struct LayoutOpts {
     pub ports_ew: bool,
     /// Experimental placement by simulated annealing instead of the grid.
     pub anneal: Option<crate::place::AnnealOpts>,
-    /// Each screen's size (`width`, `height`) and which side of the blueprint it goes on.
-    pub screens: Vec<(usize, usize, Side)>,
+    /// Each screen's size (`width`, `height`) and which side of the blueprint it goes on, or
+    /// its fixed top-left tile (from the top-left corner of the combinator grid).
+    pub screens: Vec<(usize, usize, Side, Option<(i64, i64)>)>,
+    /// Controls placed at fixed tiles (else beside their ports).
+    pub controls_at: Vec<(EntId, (i64, i64))>,
+}
+
+/// The tiles fixed peripherals take (a screen with the pole rows above and below it, and the
+/// pole column of a tall one), which placement leaves free; and each one's tiles, for errors.
+pub fn reserved_tiles(opts: &LayoutOpts) -> std::collections::HashSet<(i64, i64)> {
+    let mut r = std::collections::HashSet::new();
+    for &(sw, sh, _, at) in &opts.screens {
+        if let Some((ax, ay)) = at {
+            for y in ay - 1..=ay + sh as i64 {
+                for x in ax..ax + sw as i64 {
+                    r.insert((x, y));
+                }
+                if sh > 6 {
+                    r.insert((ax - 1, y));
+                }
+            }
+        }
+    }
+    for &(_, at) in &opts.controls_at {
+        r.insert(at);
+    }
+    r
 }
 
 /// A side of the blueprint.
@@ -171,13 +197,33 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             }
         }
     }
-    // Controls beside their input ports: west of them (in a row: north).
+    // Controls beside their input ports: west of them (in a row: north); or where asked.
     for i in 0..net.entities.len() {
         if let Role::Control { port } = net.entities[i].role {
             let (x, y) = net.entities[port].pos;
-            net.entities[i].pos = if ew { (x, y - 1.5) } else { (x - 1.5, y) };
+            net.entities[i].pos = match opts.controls_at.iter().find(|c| c.0 == i) {
+                Some(&(_, (ax, ay))) => (ax as f64 + 0.5, ay as f64 + 0.5),
+                None if ew => (x, y - 1.5),
+                None => (x - 1.5, y),
+            };
         }
     }
+    let reserved = reserved_tiles(opts);
+    // A 1×2 slot at tile column `x`, slot row `r`, is blocked by a reserved tile, or (with
+    // poles) when no tile of its segment's pole column (`7·seg + 3`) within reach of it is
+    // free, so no pole could power it.
+    let blocked = |x: usize, r: usize| {
+        let (x, r) = (x as i64, r as i64);
+        if reserved.contains(&(x, 2 * r)) || reserved.contains(&(x, 2 * r + 1)) {
+            return true;
+        }
+        if !opts.poles || reserved.is_empty() {
+            return false;
+        }
+        // Centre 2r + 1; a pole at y + 0.5 reaches it when |2r + 1 − y − 0.5| < 4.5.
+        let px = (x / 7) * 7 + 3;
+        (2 * r - 3..=2 * r + 4).all(|y| reserved.contains(&(px, y)))
+    };
     let north_w = 1 + inputs.len() + if north_outs { n_out } else { 0 };
 
     let n = core.len().max(1);
@@ -189,17 +235,26 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             // stay adjacent.
             let segs = ((n as f64 / 21.0).sqrt().ceil() as usize).max(1);
             let per_row = SEG * segs;
-            let rows = n.div_ceil(per_row);
-            for (k, &id) in core.iter().enumerate() {
-                let (r, j) = (k / per_row, k % per_row);
-                let j = if r % 2 == 1 { per_row - 1 - j } else { j };
-                let (seg, off) = (j / SEG, j % SEG);
-                let col = seg * 7 + if off < 3 { off } else { off + 1 };
+            // Slots in serpentine order, skipping those fixed peripherals take.
+            let mut rows = 0;
+            let mut slot = 0;
+            for &id in &core {
+                let (r, col) = loop {
+                    let (r, j) = (slot / per_row, slot % per_row);
+                    slot += 1;
+                    let j = if r % 2 == 1 { per_row - 1 - j } else { j };
+                    let (seg, off) = (j / SEG, j % SEG);
+                    let col = seg * 7 + if off < 3 { off } else { off + 1 };
+                    if !blocked(col, r) {
+                        break (r, col);
+                    }
+                };
+                rows = rows.max(r + 1);
                 // Two-tile combinators fill the slot; one-tile entities sit in its top half.
                 let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
                 net.entities[id].pos = (col as f64 + 0.5, 2.0 * r as f64 + dy);
             }
-            (segs, rows, 7 * segs)
+            (segs, rows.max(1), 7 * segs)
         }
         Some(a) => {
             // Wire networks as member lists, counting only entities with a position yet.
@@ -238,7 +293,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             };
             let mut best: Option<(usize, Placed)> = None;
             for c in candidates {
-                let (slots, placed) = crate::place::anneal(net, &members, &core, opts.poles, a, frame, c);
+                let (slots, placed) = crate::place::anneal(net, &members, &core, opts.poles, a, frame, c, &blocked);
                 let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
                 let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
                 let w = if opts.poles { 7 * cols.div_ceil(SEG) } else { slots.tile_x(cols - 1) + 1 };
@@ -265,6 +320,29 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     for &r in &pole_rows {
         for seg in 0..segs {
             poles.push(((seg * 7 + 3) as f64 + 0.5, 2.0 * r as f64 + 0.5));
+        }
+    }
+    // A pole on a fixed peripheral's tiles moves up or down its column to the nearest free tile.
+    if !reserved.is_empty() {
+        let taken: std::collections::HashSet<(i64, i64)> = core
+            .iter()
+            .flat_map(|&id| {
+                let (cx, cy) = net.entities[id].pos;
+                let h = net.footprint(id).1 as i64;
+                (0..h).map(move |d| (cx.floor() as i64, (cy - h as f64 / 2.0).round() as i64 + d))
+            })
+            .collect();
+        let mut at: std::collections::HashSet<(i64, i64)> = poles.iter().map(|p| (p.0.floor() as i64, p.1.floor() as i64)).collect();
+        for p in poles.iter_mut() {
+            let (x, y) = (p.0.floor() as i64, p.1.floor() as i64);
+            if reserved.contains(&(x, y)) {
+                let free = |ny: &i64| !reserved.contains(&(x, *ny)) && !taken.contains(&(x, *ny)) && !at.contains(&(x, *ny));
+                if let Some(ny) = (1..12).flat_map(|d| [y - d, y + d]).find(free) {
+                    at.remove(&(x, y));
+                    at.insert((x, ny));
+                    p.1 = ny as f64 + 0.5;
+                }
+            }
         }
     }
     let w = w as f64;
@@ -316,6 +394,77 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     let screens_at = place_screens(net, opts, &mut poles, if opts.outputs_west && !ew && !gates_move { n_out } else { 0 }, w + 3.0);
     if !opts.poles {
         poles.clear();
+    }
+    // Combinators a moved pole no longer reaches (fixed peripherals in the grid): a pole on
+    // a free tile next to each.
+    if opts.poles && !reserved.is_empty() {
+        let mut taken: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        for i in 0..net.entities.len() {
+            let (w, h) = net.footprint(i);
+            let (cx, cy) = net.entities[i].pos;
+            let (x0, y0) = ((cx - w as f64 / 2.0).round() as i64, (cy - h as f64 / 2.0).round() as i64);
+            for dx in 0..w as i64 {
+                for dy in 0..h as i64 {
+                    taken.insert((x0 + dx, y0 + dy));
+                }
+            }
+        }
+        for p in poles.iter() {
+            taken.insert((p.0.floor() as i64, p.1.floor() as i64));
+        }
+        let supply = ticky_factorio::netlist::POLE_SUPPLY;
+        for i in 0..net.entities.len() {
+            if !net.entities[i].kind.is_combinator() {
+                continue;
+            }
+            let (w, h) = net.footprint(i);
+            let (cx, cy) = net.entities[i].pos;
+            let covers = |p: &(f64, f64)| (cx - p.0).abs() < supply + w as f64 / 2.0 && (cy - p.1).abs() < supply + h as f64 / 2.0;
+            if poles.iter().any(covers) {
+                continue;
+            }
+            let (tx, ty) = (cx.floor() as i64, cy.floor() as i64);
+            let spot = (1..4i64)
+                .flat_map(|d| (-d..=d).flat_map(move |dx| (-d..=d).map(move |dy| (tx + dx, ty + dy))))
+                .find(|t| !taken.contains(t) && !reserved.contains(t) && covers(&(t.0 as f64 + 0.5, t.1 as f64 + 0.5)));
+            if let Some(t) = spot {
+                taken.insert(t);
+                poles.push((t.0 as f64 + 0.5, t.1 as f64 + 0.5));
+            }
+        }
+    }
+    // Far-away peripherals: a chain of poles across the gap (on free tiles near the line).
+    if opts.poles {
+        let mut taken: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        for i in 0..net.entities.len() {
+            let (w, h) = net.footprint(i);
+            let (cx, cy) = net.entities[i].pos;
+            let (x0, y0) = ((cx - w as f64 / 2.0).round() as i64, (cy - h as f64 / 2.0).round() as i64);
+            for dx in 0..w as i64 {
+                for dy in 0..h as i64 {
+                    taken.insert((x0 + dx, y0 + dy));
+                }
+            }
+        }
+        for p in &poles {
+            taken.insert((p.0.floor() as i64, p.1.floor() as i64));
+        }
+        for _ in 0..64 {
+            let Some((a, b)) = mst(&poles).into_iter().find(|&(a, b)| dist(poles[a], poles[b]) > 9.0) else { break };
+            let (pa, pb) = (poles[a], poles[b]);
+            let steps = (dist(pa, pb) / 8.0).ceil() as usize;
+            for k in 1..steps {
+                let f = k as f64 / steps as f64;
+                let (x, y) = ((pa.0 + (pb.0 - pa.0) * f).floor() as i64, (pa.1 + (pb.1 - pa.1) * f).floor() as i64);
+                let free = (0..3i64)
+                    .flat_map(|d| (-d..=d).flat_map(move |dx| (-d..=d).map(move |dy| (x + dx, y + dy))))
+                    .find(|t| !taken.contains(t) && !reserved.contains(t));
+                if let Some(t) = free {
+                    taken.insert(t);
+                    poles.push((t.0 as f64 + 0.5, t.1 as f64 + 0.5));
+                }
+            }
+        }
     }
     let first_pole = net.entities.len();
     for &p in &poles {
@@ -414,7 +563,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     };
 
-    let (width, height) = if ew || gates_move || screens_at {
+    let (width, height) = if ew || gates_move || screens_at || !opts.controls_at.is_empty() {
         // The bounding box of everything placed.
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for i in 0..net.entities.len() {
@@ -447,40 +596,9 @@ fn place_screens(net: &mut Netlist, opts: &LayoutOpts, poles: &mut Vec<(f64, f64
     if pixels.iter().all(|p| p.is_empty()) {
         return false;
     }
-    // The bounding box of everything so far (tile edges).
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    let mut grow = |x: f64, y: f64, w: f64, h: f64| {
-        (x0, x1, y0, y1) = (x0.min(x - w / 2.0), x1.max(x + w / 2.0), y0.min(y - h / 2.0), y1.max(y + h / 2.0));
-    };
-    for i in 0..net.entities.len() {
-        if !matches!(net.entities[i].role, Role::Pixel { .. }) {
-            let (fw, fh) = net.footprint(i);
-            grow(net.entities[i].pos.0, net.entities[i].pos.1, fw as f64, fh as f64);
-        }
-    }
-    for p in poles.iter() {
-        grow(p.0, p.1, 1.0, 1.0);
-    }
-    if lines > 0 {
-        grow(lines_x - 0.5, -(lines as f64) + 0.5, 1.0, 1.0);
-    }
-    let mut along: std::collections::HashMap<Side, f64> = std::collections::HashMap::new();
-    for (k, px) in pixels.iter_mut().enumerate() {
-        px.sort();
-        let (sw, sh, side) = opts.screens[k];
+    // Fixed screens first, then the rest around everything so far.
+    let place = |net: &mut Netlist, poles: &mut Vec<(f64, f64)>, px: &[(usize, EntId)], sw: usize, sh: usize, ox: f64, oy: f64, side: Side| {
         let (swf, shf) = (sw as f64, sh as f64);
-        let cur = along.entry(side).or_insert(0.0);
-        // The screen's top-left tile corner; a pole row takes the tile row above and below.
-        let (ox, oy) = match side {
-            Side::North => (x0 + *cur, y0 - shf - 1.0),
-            Side::South => (x0 + *cur, y1 + 1.0),
-            Side::West => (x0 - swf - 1.0, y0 + 1.0 + *cur),
-            Side::East => (x1 + 1.0, y0 + 1.0 + *cur),
-        };
-        *cur += match side {
-            Side::North | Side::South => swf + 1.0,
-            Side::East | Side::West => shf + 3.0,
-        };
         for &(i, id) in px.iter() {
             net.entities[id].pos = (ox + (i % sw) as f64 + 0.5, oy + (i / sw) as f64 + 0.5);
         }
@@ -498,6 +616,53 @@ fn place_screens(net: &mut Netlist, opts: &LayoutOpts, poles: &mut Vec<(f64, f64
                 poles.push((cx, (oy - 0.5 + 7.0 * j as f64).min(oy + shf + 0.5)));
             }
         }
+    };
+    for (k, px) in pixels.iter_mut().enumerate() {
+        let (sw, sh, _, at) = opts.screens[k];
+        if let Some((ax, ay)) = at {
+            px.sort();
+            place(net, poles, px, sw, sh, ax as f64, ay as f64, Side::East);
+        }
+    }
+    let fixed: Vec<bool> = opts.screens.iter().map(|s| s.3.is_some()).collect();
+    // The bounding box of everything so far (tile edges).
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut grow = |x: f64, y: f64, w: f64, h: f64| {
+        (x0, x1, y0, y1) = (x0.min(x - w / 2.0), x1.max(x + w / 2.0), y0.min(y - h / 2.0), y1.max(y + h / 2.0));
+    };
+    for i in 0..net.entities.len() {
+        if !matches!(net.entities[i].role, Role::Pixel { screen, .. } if !fixed[screen]) {
+            let (fw, fh) = net.footprint(i);
+            grow(net.entities[i].pos.0, net.entities[i].pos.1, fw as f64, fh as f64);
+        }
+    }
+    for p in poles.iter() {
+        grow(p.0, p.1, 1.0, 1.0);
+    }
+    if lines > 0 {
+        grow(lines_x - 0.5, -(lines as f64) + 0.5, 1.0, 1.0);
+    }
+    let mut along: std::collections::HashMap<Side, f64> = std::collections::HashMap::new();
+    for (k, px) in pixels.iter_mut().enumerate() {
+        px.sort();
+        let (sw, sh, side, at) = opts.screens[k];
+        if at.is_some() {
+            continue;
+        }
+        let (swf, shf) = (sw as f64, sh as f64);
+        let cur = along.entry(side).or_insert(0.0);
+        // The screen's top-left tile corner; a pole row takes the tile row above and below.
+        let (ox, oy) = match side {
+            Side::North => (x0 + *cur, y0 - shf - 1.0),
+            Side::South => (x0 + *cur, y1 + 1.0),
+            Side::West => (x0 - swf - 1.0, y0 + 1.0 + *cur),
+            Side::East => (x1 + 1.0, y0 + 1.0 + *cur),
+        };
+        *cur += match side {
+            Side::North | Side::South => swf + 1.0,
+            Side::East | Side::West => shf + 3.0,
+        };
+        place(net, poles, px, sw, sh, ox, oy, side);
     }
     true
 }

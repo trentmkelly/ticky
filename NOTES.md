@@ -640,3 +640,24 @@ and "quality select" modes aren't in 2.0.77). The quality modes need the Quality
   `Harness::set` on a control switches/edits its combinator instead of injecting a value;
   the difftest job lists `control`/`switch` per port and the Lua harness does the same.
 - In-game: scratch program and the example MATCH.
+
+## 2026-10-10 — Fixed placement: `at=` / `--at` (SPEC §8.4 item 9)
+- Origin: the combinator grid's (0, 0), which every layout uses; so a fixed peripheral's
+  tiles are known before placement. `Screen.at` (from `port(…, at=)`), `Control.at`,
+  `Options.at` (CLI `--at NAME=X,Y`, wins); `LayoutOpts.screens` carries `at`,
+  `LayoutOpts.controls_at` the controls'. A control's wire to its port is now a `NetSpec`
+  (relayed when far) rather than a direct wire.
+- `layout::reserved_tiles`: a screen with its pole rows (and tall screens' pole column).
+  Grid and annealer (`place::anneal(…, blocked)`, grid grown to keep enough free slots)
+  skip blocked slots: reserved, or (with poles) no free tile of the segment's pole column
+  within reach (|Δy| < 4.5) — without that, a pole moved off a screen left combinators dark.
+  Core poles on reserved tiles move along their column (not onto other poles: an early
+  version stacked two); a repair pass adds a pole beside any unpowered combinator; MST
+  gaps over 9 tiles get chains of poles on free tiles near the line (far peripherals).
+- Fixed screens are placed first; automatic ones go around everything placed so far
+  (fixed ones included). Errors: two fixed peripherals overlapping (names both), a fixed
+  peripheral on the ports/RUN/poles (from `validate`'s overlap, translated); internal
+  layout errors now name the entities' kinds and roles.
+- Sweeps: dashboard 220 positions × grid/anneal, readouts 72 with three peripherals: no
+  failures beyond the expected overlap errors. In-game MATCH: screen inside the grid
+  (5, 9), 60 tiles away, annealed (3, 4), readouts+panel mixed, controls far away.

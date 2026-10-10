@@ -538,8 +538,8 @@ c = screen[3, 1]
 ### 8.4 Standard library peripherals
 
 A fixed list of modules, each `import`ed like `display`. A peripheral is either hardware the
-compiler builds into the blueprint (placed like screens, with a `--NAME=SIDE`-style option
-where it has a position) or a function over bundles that maps to one combinator mode. None of
+compiler builds into the blueprint (placed automatically or at a fixed place, item 9) or a
+function over bundles that maps to one combinator mode. None of
 them adds new semantics to the core language: each lowers to existing IR plus at most one new
 entity kind or combinator mode.
 
@@ -648,21 +648,27 @@ one) that difftest-matches the game, and a line in the README.
   depend on random picks (through variables, function results and conditions) and the
   difftest compares those as `*` (checked in-game: dice rolls 1–6 held for 60 ticks, coin
   flips about even, picks over every queued signal).
-- [ ] **9. Placement for every placed peripheral** (screens, digits, panels, speakers,
-  controls). Either automatic, as screens are now (beside the logic on a chosen side), or a
-  fixed offset the programmer picks: `output screen: display.Screen(16, 6) = port("Meter",
-  at=(0, 10))`, `output temp: display.Digits(4) = port("Temp", at=(10, 20))`. The offset is in
-  tiles from the top-left corner of the logic block (the combinators and ports, not counting
-  peripherals; x east, y south; negative allowed) to the peripheral's own top-left corner.
-  The logic grows east and south from that corner, so a peripheral keeps its place relative
-  to it as the program changes.
-  The CLI can override it (`--at NAME=X,Y`, beside `--display NAME=SIDE`). Fixed peripherals
-  reserve their tiles (and their power poles), so placement, annealing and wire relays work
-  around them. A peripheral any distance away is wired with a line of relay poles, as
-  `--outputs=west` does (the build summary counts them); with `--place=anneal`, the
-  combinators driving it are pulled towards it, so the line stays short. Overlapping
-  peripherals are a compile error naming both. Peripherals without `at=` keep automatic
-  placement.
+- [x] **9. Placement for every placed peripheral** (screens, readouts, panels, speakers,
+  controls). Either automatic (screens, readouts, panels and speakers beside the logic on a
+  chosen side, `--display NAME=SIDE`; controls beside their input ports), or a fixed place
+  the programmer picks: `output screen: display.Screen(16, 6) = port("Meter", at=(0, 10))`,
+  `output temp: display.Digits(4) = port("Temp", at=(10, 20))`, `input go:
+  controls.Switch("Start", at=(-6, 3))`, or from the command line, `--at NAME=X,Y` (which
+  overrides the program). The place is the peripheral's top-left tile, counted in tiles from
+  the top-left corner of the combinator grid (x east, y south; negative allowed): the grid
+  always starts there and grows east and south, so a peripheral keeps its place as the
+  program changes; the input ports and RUN switch are the 4 columns just west of it.
+  - Fixed peripherals reserve their tiles and the pole rows above and below a screen; the grid
+    and the annealer place combinators around them (also leaving out slots no pole could
+    reach), core poles on reserved tiles move along their column, and a pole goes next to
+    any combinator that loses its power.
+  - Any distance works: a chain of poles carries power across the gap, and wires (a screen's
+    bank, a control's wire to its port) get relay poles as needed.
+  - Two fixed peripherals on the same tiles (with their pole rows) are an error naming both;
+    one on the ports, RUN switch or their poles is an error too ("move it further out").
+  Checked by sweeping positions in and around two examples (grid and annealed: no failures
+  beyond the expected overlap errors) and in-game (MATCH with a screen inside the grid, 60
+  tiles away, annealed, readouts and a panel mixed, and controls relayed from far away).
 
 ---
 

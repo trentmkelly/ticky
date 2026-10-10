@@ -148,6 +148,18 @@ struct Placement {
     /// `west` of the rest of the blueprint. Repeat for several screens.
     #[arg(long = "display", value_parser = parse_display)]
     displays: Vec<(String, Side)>,
+    /// Put a peripheral (screen, readout, panel, speaker or control) at a fixed place:
+    /// `NAME=X,Y`, its top-left tile counted from the top-left corner of the combinator grid
+    /// (the ports and RUN switch are just west of it). Overrides `at=` in the program.
+    #[arg(long = "at", value_parser = parse_at)]
+    at: Vec<(String, (i64, i64))>,
+}
+
+fn parse_at(s: &str) -> Result<(String, (i64, i64)), String> {
+    let usage = "expected NAME=X,Y, e.g. `screen=0,10`";
+    let (name, xy) = s.split_once('=').ok_or(usage)?;
+    let (x, y) = xy.split_once(',').ok_or(usage)?;
+    Ok((name.to_string(), (x.trim().parse().map_err(|_| usage)?, y.trim().parse().map_err(|_| usage)?)))
 }
 
 fn parse_display(s: &str) -> Result<(String, Side), String> {
@@ -247,7 +259,7 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
             (n.clone(), side)
         })
         .collect();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone() };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -461,7 +473,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new() }
 }
 
 fn main() -> ExitCode {

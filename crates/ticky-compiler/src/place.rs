@@ -294,6 +294,7 @@ pub fn anneal(
     opts: AnnealOpts,
     frame: Frame,
     cols: Option<usize>,
+    blocked: &dyn Fn(usize, usize) -> bool,
 ) -> (Slots, Vec<(usize, usize)>) {
     let n = movable.len().max(1);
     // Grid size: room to rearrange, within any limit.
@@ -329,7 +330,15 @@ pub fn anneal(
             (n.div_ceil(r) * 2 + 2, r)
         }
     };
+    // Slots fixed peripherals take (by tile column and slot row) are never used: grow the grid
+    // to make up for them.
+    let free = |rows: usize| (0..rows).map(|r| (0..cols).filter(|&c| !blocked(Slots { cols, rows, poles }.tile_x(c), r)).count()).sum::<usize>();
+    let mut rows = rows;
+    while free(rows) < n {
+        rows += 1;
+    }
     let slots = Slots { cols, rows, poles };
+    let is_blocked: Vec<bool> = (0..cols * rows).map(|s| blocked(slots.tile_x(s % cols), s / cols)).collect();
 
     let index: std::collections::HashMap<EntId, usize> = movable.iter().enumerate().map(|(i, e)| (*e, i)).collect();
     let mut nets = Vec::new();
@@ -359,10 +368,17 @@ pub fn anneal(
     let mut who = vec![None; cols * rows];
     let mut col_count = vec![0usize; cols];
     let mut row_count = vec![0usize; rows];
+    let mut k_slot = 0;
     for (k, a) in at.iter_mut().enumerate() {
-        let (r, j) = (k / cols, k % cols);
-        let c = if r % 2 == 1 { cols - 1 - j } else { j };
-        let s = r * cols + c;
+        let s = loop {
+            let (r, j) = (k_slot / cols, k_slot % cols);
+            k_slot += 1;
+            let c = if r % 2 == 1 { cols - 1 - j } else { j };
+            if !is_blocked[r * cols + c] {
+                break r * cols + c;
+            }
+        };
+        let (r, c) = (s / cols, s % cols);
         *a = s;
         who[s] = Some(k);
         col_count[c] += 1;
@@ -378,6 +394,9 @@ pub fn anneal(
     for _ in 0..200 {
         let m = rng.below(movable.len());
         let s = rng.below(cols * rows);
+        if is_blocked[s] {
+            continue;
+        }
         let before = st.shape() + st.nets_of[m].iter().map(|&j| st.net_cost[j]).sum::<f64>();
         let from = st.at[m];
         st.swap(m, s);
@@ -400,7 +419,7 @@ pub fn anneal(
         let dr = rng.below(2 * reach as usize + 1) as isize - reach;
         let (nc, nr) = ((c + dc).clamp(0, cols as isize - 1), (r + dr).clamp(0, rows as isize - 1));
         let s = nr as usize * cols + nc as usize;
-        if s != st.at[m] {
+        if s != st.at[m] && !is_blocked[s] {
             st.try_move(m, s, temp, &mut rng);
         }
     }

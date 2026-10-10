@@ -132,6 +132,10 @@ off and on.
 - **Sounds** (`import speaker`): `speaker.Alarm("Too hot", icon="signal-fire")` (a `bool`:
   a global alert and siren while true) and `speaker.Notes("piano")` (`tune.play(n)`);
   `examples/sounds.ticky`.
+- **Placing peripherals**: beside the logic automatically (`--display NAME=SIDE`), or at a
+  fixed place, `port("Meter", at=(0, 10))` or `--at NAME=X,Y`, tiles from the combinator
+  grid's top-left corner; the logic is placed around it, and power and wires reach it from
+  any distance.
 - **Controls** (`import controls`): `controls.Switch("Start")` and `controls.Setting("Target",
   100)`, constant combinators in the blueprint the player flips or edits;
   `examples/controls.ticky`.

@@ -31,6 +31,9 @@ pub struct Screen {
     pub panel: Option<PanelSpec>,
     /// A speaker's settings (`sig` unused: chosen by codegen).
     pub speaker: Option<ticky_factorio::netlist::Speaker>,
+    /// A fixed place (`port(…, at=(x, y))`): its top-left tile, from the top-left corner of
+    /// the combinator grid. Otherwise beside the rest.
+    pub at: Option<(i64, i64)>,
 }
 
 /// `display.Panel({key: (icon, text), …})`: the value `k + 1` shows message `k`.
@@ -256,8 +259,9 @@ fn digits(
             None => return Err(Diag::error(e.span, "a readout's colour must be a constant")),
         },
     };
+    let at = port_at(label, consts)?;
     let label = port_label(label)?;
-    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span, panel: None, speaker: None };
+    let sc = Screen { name: name.to_string(), var: format!("_digits_{name}"), kind: ScreenKind::Digits, w: 4 * n - 1, h: 5, label, span, panel: None, speaker: None, at };
     Ok((sc, colour))
 }
 
@@ -321,9 +325,10 @@ fn panel(
     if messages.is_empty() {
         return Err(Diag::error(ty.span, "a panel needs at least one message"));
     }
+    let at = port_at(label, consts)?;
     let label = port_label(label)?;
     let spec = PanelSpec { messages, always_show, show_in_chart };
-    Ok(Screen { name: name.to_string(), var: format!("_panel_{name}"), kind: ScreenKind::Panel, w: 1, h: 1, label, span, panel: Some(spec), speaker: None })
+    Ok(Screen { name: name.to_string(), var: format!("_panel_{name}"), kind: ScreenKind::Panel, w: 1, h: 1, label, span, panel: Some(spec), speaker: None, at })
 }
 
 /// `panel = e` → `panel = [e]` and `panel op= e` → `panel = [panel op e]` (whole-array
@@ -492,8 +497,9 @@ fn speaker(
         };
         ticky_factorio::netlist::Speaker { sig: crate::ir::Graph::slot(0), alert: None, instrument, note: 0, pitch: true, global, volume }
     };
+    let at = port_at(label, consts)?;
     let label = port_label(label)?;
-    Ok(Screen { name: name.to_string(), var: format!("_speaker_{name}"), kind: ScreenKind::Speaker, w: 1, h: 1, label, span, panel: None, speaker: Some(sp) })
+    Ok(Screen { name: name.to_string(), var: format!("_speaker_{name}"), kind: ScreenKind::Speaker, w: 1, h: 1, label, span, panel: None, speaker: Some(sp), at })
 }
 
 /// Replaces a panel's keys (strings) by their values in assignments to it and comparisons
@@ -602,13 +608,38 @@ fn panel_keys_nested(s: &mut Stmt, panels: &HashMap<String, PanelSpec>, errs: &m
 fn port_label(label: Option<&Expr>) -> Result<Option<String>, Diag> {
     match label {
         None => Ok(None),
-        Some(Expr { kind: ExprKind::Call { func, args, .. }, .. })
+        Some(Expr { kind: ExprKind::Call { func, args, kwargs }, .. })
             if matches!(&func.kind, ExprKind::Name(n) if n == "port") && matches!(args.first().map(|a| &a.kind), Some(ExprKind::Str(_))) =>
         {
+            if let Some((k, e)) = kwargs.iter().find(|(k, _)| k != "at") {
+                return Err(Diag::error(e.span, format!("a peripheral's `port` takes a label and `at=(x, y)`, not `{k}`")));
+            }
             let ExprKind::Str(text) = &args[0].kind else { unreachable!() };
             Ok(Some(text.clone()))
         }
-        Some(e) => Err(Diag::error(e.span, "expected `port(\"label\")`")),
+        Some(e) => Err(Diag::error(e.span, "expected `port(\"label\")` or `port(\"label\", at=(x, y))`")),
+    }
+}
+
+/// `at=(x, y)` among a call's keyword arguments: a fixed place, in tiles from the top-left
+/// corner of the combinator grid (constants, negative allowed).
+pub fn at_of(kwargs: &[(String, Expr)], consts: &HashMap<String, Cv>) -> Result<Option<(i64, i64)>, Diag> {
+    let Some((_, e)) = kwargs.iter().find(|(k, _)| k == "at") else { return Ok(None) };
+    let num = |x: &Expr| crate::program::eval_const(x, consts, &[]).ok().and_then(|v| v.int()).map(|v| v as i64);
+    match &e.kind {
+        ExprKind::Tuple(xy) if xy.len() == 2 => match (num(&xy[0]), num(&xy[1])) {
+            (Some(x), Some(y)) => Ok(Some((x, y))),
+            _ => Err(Diag::error(e.span, "`at=(x, y)` needs constant numbers of tiles")),
+        },
+        _ => Err(Diag::error(e.span, "expected `at=(x, y)`")),
+    }
+}
+
+/// `at=` in a peripheral's `port(…)`.
+fn port_at(label: Option<&Expr>, consts: &HashMap<String, Cv>) -> Result<Option<(i64, i64)>, Diag> {
+    match label {
+        Some(Expr { kind: ExprKind::Call { kwargs, .. }, .. }) => at_of(kwargs, consts),
+        _ => Ok(None),
     }
 }
 
@@ -642,8 +673,9 @@ fn screen(
     if w * h > MAX_PIXELS {
         return Err(Diag::error(ty.span, format!("a screen can have at most {MAX_PIXELS} pixels; this one has {}", w * h)));
     }
+    let at = port_at(label, consts)?;
     let label = port_label(label)?;
-    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span, panel: None, speaker: None })
+    Ok(Screen { name: name.to_string(), var: name.to_string(), kind: ScreenKind::Screen, w, h, label, span, panel: None, speaker: None, at })
 }
 
 fn ex(kind: ExprKind, span: Span) -> Expr {

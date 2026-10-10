@@ -19,7 +19,7 @@ pub mod testrun;
 use serde_json::Value;
 use ticky_factorio::{blueprint, Role, Sig, SignalTable};
 use ticky_syntax::ast::PortDir;
-use ticky_syntax::Diag;
+use ticky_syntax::{Diag, Span};
 
 pub use codegen::Codegen;
 
@@ -79,11 +79,13 @@ pub struct Options {
     pub screen_sides: Vec<(String, layout::Side)>,
     /// Item data (`items.stack_size`, …) follows Space Age rather than the base game.
     pub space_age: bool,
+    /// Fixed places for peripherals by name (`--at NAME=X,Y`), overriding `at=` in the source.
+    pub at: Vec<(String, (i64, i64))>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new() }
     }
 }
 
@@ -127,6 +129,12 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
             return Err(vec![Diag::error(Default::default(), format!("there is no screen `{name}` to place"))]);
         }
     }
+    for (name, _) in &opts.at {
+        if !program.screens.iter().any(|s| &s.name == name) && !program.controls.iter().any(|c| &c.name == name) {
+            return Err(vec![Diag::error(Default::default(), format!("there is no peripheral `{name}` to place"))]);
+        }
+    }
+    let at_of = |name: &str, src: Option<(i64, i64)>| opts.at.iter().find(|(n, _)| n == name).map(|x| x.1).or(src);
     let screens = program
         .screens
         .iter()
@@ -138,15 +146,76 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
                     format!("screen `{}` is {} rows tall: the poles above and below it power 3 rows each, so place substations to power the rest", s.name, s.h),
                 ));
             }
-            (s.w, s.h, side)
+            (s.w, s.h, side, at_of(&s.name, s.at))
         })
         .collect();
-    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal, screens };
+    let controls_at: Vec<(usize, (i64, i64))> = cg
+        .controls
+        .iter()
+        .filter_map(|&(pi, k)| {
+            let c = program.controls.iter().find(|c| c.name == program.ports[pi].name)?;
+            Some((k, at_of(&c.name, c.at)?))
+        })
+        .collect();
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal, screens, controls_at };
+    // Fixed peripherals mustn't overlap each other.
+    let mut fixed: Vec<(String, Span, std::collections::HashSet<(i64, i64)>)> = Vec::new();
+    for (k, s) in program.screens.iter().enumerate() {
+        if lo.screens[k].3.is_some() {
+            let one = layout::LayoutOpts { screens: vec![lo.screens[k]], controls_at: vec![], ..lo.clone() };
+            fixed.push((s.name.clone(), s.span, layout::reserved_tiles(&one)));
+        }
+    }
+    for &(k, at) in &lo.controls_at {
+        let name = cg.controls.iter().find(|c| c.1 == k).map(|c| program.ports[c.0].name.clone()).unwrap_or_default();
+        let span = program.ports.iter().find(|p| p.name == name).map(|p| p.span).unwrap_or_default();
+        fixed.push((name, span, [at].into_iter().collect()));
+    }
+    for i in 0..fixed.len() {
+        for j in i + 1..fixed.len() {
+            if let Some(t) = fixed[i].2.intersection(&fixed[j].2).next() {
+                return Err(vec![Diag::error(fixed[j].1, format!("`{}` overlaps `{}` at ({}, {}) (with their pole rows)", fixed[j].0, fixed[i].0, t.0, t.1))
+                    .with_help("move one of them with `at=(x, y)` or `--at NAME=X,Y`")]);
+            }
+        }
+    }
     let layout = layout::layout(&mut cg.netlist, &cg.nets, &lo)
         .map_err(|e| vec![Diag::error(Default::default(), format!("internal layout error: {e}"))])?;
     let problems = cg.netlist.validate(opts.poles);
+    // A fixed peripheral on the program's own ports or poles.
+    if let Some(&(name, (x, y))) = problems
+        .iter()
+        .filter_map(|m| {
+            let rest = m.strip_prefix("entities ")?;
+            let (ids, at) = rest.split_once(" overlap at (")?;
+            let (a, b) = ids.split_once(" and ")?;
+            let (x, y) = at.trim_end_matches(')').split_once(", ")?;
+            Some(((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?), (x.parse::<i64>().ok()?, y.parse::<i64>().ok()?)))
+        })
+        .find_map(|((a, b), xy)| {
+            let fixed_name = |e: usize| fixed.iter().find(|f| f.2.contains(&xy) && matches!(cg.netlist.entities[e].role, Role::Pixel { .. } | Role::Control { .. } | Role::Power)).map(|f| f.0.as_str());
+            Some((fixed_name(a).or(fixed_name(b))?, xy))
+        })
+        .as_ref()
+    {
+        return Err(vec![Diag::error(Default::default(), format!("`{name}` (placed with `at=`) overlaps the program's ports or poles at ({x}, {y})"))
+            .with_help("the combinator grid starts at (0, 0); the ports and RUN switch are just west of it: move it further out")]);
+    }
     if !problems.is_empty() {
-        return Err(vec![Diag::error(Default::default(), format!("internal layout error: {}", problems.join("; ")))]);
+        // Name the entities involved.
+        let named: Vec<String> = problems
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                for (i, e) in cg.netlist.entities.iter().enumerate().rev() {
+                    m = m.replace(&format!("entity {i} "), &format!("entity {i} ({} {:?}) ", e.kind.proto_name(), e.role));
+                    m = m.replace(&format!("entities {i} "), &format!("entities {i} ({} {:?}) ", e.kind.proto_name(), e.role));
+                    m = m.replace(&format!("and {i} "), &format!("and {i} ({} {:?}) ", e.kind.proto_name(), e.role));
+                }
+                m
+            })
+            .collect();
+        return Err(vec![Diag::error(Default::default(), format!("internal layout error: {}", named.join("; ")))]);
     }
     let t = SignalTable::base();
     cg.netlist.label = opts.label.clone();

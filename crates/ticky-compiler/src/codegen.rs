@@ -1196,7 +1196,8 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
             } else {
                 format!("Ticky control `{}`{label}: set the value of {} here.", port.name, t.name(port.sig))
             });
-            cg.net.wire((k, Conn::Red), (id, Conn::InRed));
+            // A network rather than a wire: relays carry it if the control is placed far away.
+            cg.nets.push(NetSpec { red: true, members: vec![(k, Conn::Red), (id, Conn::InRed)] });
             controls.push((pi, k));
         }
     }
