@@ -181,7 +181,13 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                 let next = expr(g, names, item);
                 g.path.pop();
                 let next = next?;
-                same_kind(g, acc, next, item.span)?;
+                // Operands of different kinds (`sig and n > 0`) can't share a value, so the
+                // result is their truth: what a condition needs, and all such a mix is used for.
+                if same_kind(g, acc, next, item.span).is_err() {
+                    let (a, b) = (g.truth(acc), g.truth(next));
+                    acc = g.ar(if *op == BoolOp::And { ArOp::And } else { ArOp::Or }, a, b);
+                    continue;
+                }
                 acc = if g.is_bool(acc) && g.is_bool(next) {
                     g.ar(if *op == BoolOp::And { ArOp::And } else { ArOp::Or }, acc, next)
                 } else if *op == BoolOp::And {

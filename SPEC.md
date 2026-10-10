@@ -438,12 +438,14 @@ def gcd(a, b):
     return a
 ```
 
-- Parameters are passed by value. Arrays and bundles are copied on write (`xs[i] = …` inside a
-  function only modifies the caller's array if it is declared `global`). **This differs from
-  Python**, where lists are shared references: return the changed array instead.
+- Parameters are passed by value. Arrays and bundles are copied on write (`xs[i] = …` on a
+  parameter doesn't change the caller's array). **This differs from Python**, where lists are
+  shared references: return the changed array instead.
 - Positional and keyword arguments; defaults must be constant. Multiple return values via
   tuples (`return a, b`; `x, y = f()`). Early `return`s anywhere, including inside loops.
-- A function assigns module variables only if it declares them `global` (as in Python).
+- A function assigns module variables only if it declares them `global` (as in Python):
+  without it, `x = …` makes a local `x`. Element writes to a module variable (`xs[i] = …`,
+  `b[sig] = …`, including ports) need no `global`, also as in Python.
 - Calls inside `and`, `or` and `x if c else y` only run when Python would run them.
 - **How calls are compiled** (implemented):
   - Functions without loops or waits are **inlined** at each call. They usually become a few

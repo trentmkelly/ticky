@@ -589,10 +589,9 @@ impl Graph {
     /// Python truthiness as a 0/1 value (a bundle is true when it has any signal; a runtime
     /// signal when it is one, i.e. not "no signal").
     pub fn truth(&mut self, v: V) -> V {
-        if self.is_sigval(v) {
-            let b = self.unsig(v);
-            return self.truth(b);
-        }
+        // A signal is true unless it's "no signal": the one-hot bundle is non-empty. (Signal
+        // state and ports are already that bundle, so `unsig` leaves them as they are.)
+        let v = if self.is_sigval(v) { self.unsig(v) } else { v };
         if self.is_bundle(v) {
             let n = self.bcount(v);
             let z = self.konst(0);
@@ -679,7 +678,8 @@ impl Graph {
         let sig = |g: &Self, v: V| g.is_sigval(v) || g.as_sig(v).is_some();
         if sig(self, a) && sig(self, b) {
             let (x, y) = (self.unsig(a), self.unsig(b));
-            let m = self.mux(t, x, y);
+            let f = self.not(t);
+            let m = self.bmux_tf(t, f, x, y);
             return self.sigval(m);
         }
         if self.is_bundle(a) {

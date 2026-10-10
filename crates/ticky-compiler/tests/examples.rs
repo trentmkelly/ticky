@@ -449,3 +449,49 @@ fn fixed_placement() {
     let o = Options { at: vec![("nope".into(), (0, 0))], ..opts() };
     assert!(compile(&src(""), &o).is_err_and(|d| d[0].message.contains("no peripheral `nope`")));
 }
+
+#[test]
+fn signal_conditions_and_inlined_returns() {
+    // `if s` / `x if s else y` on Signal state (an `Op::Src`) used to loop forever, and so did
+    // choosing between two Signal states; `sig and cond` mixes kinds and is a condition.
+    let src = r#"
+input  w: Bundle
+input  c: int @ C
+output t1: Signal
+output t2: Signal
+output o: Signal
+output n: int @ N
+output m: int @ M
+every 4 ticks:
+    o = t1 if c > 0 else t2
+    n = 1 if t1 else 0
+    m = 1 if t1 and c > 5 else 0
+    t1 = w.argmax()
+    t2 = w.argmin()
+
+test "signals":
+    set w = {"coal": 5, "stone": 2}
+    set c = 9
+    run 30 ticks
+    assert o == S("coal") and n == 1 and m == 1
+    set c = 0
+    run 30 ticks
+    assert o == S("stone") and m == 0
+    set w = {}
+    run 30 ticks
+    assert n == 0 and not o
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    // A function's `return` inside `x if c else y` ends inside it: the code after the `if`
+    // isn't copied into both arms, so many such calls in a row stay small.
+    let mut src = String::from("input a: int @ A\noutput o: int @ O\ndef f(x):\n    return x + 1\nevery 64 ticks:\n    v = a\n");
+    for _ in 0..24 {
+        src.push_str("    v = f(v) if v > 3 else v - 1\n");
+    }
+    src.push_str("    o = v\n");
+    let c = compile(&src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    assert!(c.cg.netlist.entities.len() < 400, "{} entities", c.cg.netlist.entities.len());
+}

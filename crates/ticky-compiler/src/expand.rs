@@ -2196,13 +2196,25 @@ pub fn display(n: &str) -> String {
 
 // ---------------------------------------------------------------- flattening
 
+/// Whether `stmts` can exit to a block outside them. (Exits to blocks inside, such as the
+/// `return` of a function inlined there, end within `stmts` and don't count: treating them as
+/// leaving would copy the following code into both arms of every `if` around such a call.)
 fn contains_exit(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match &s.kind {
-        StmtKind::Exit(_) => true,
-        StmtKind::If { body, orelse, .. } => contains_exit(body) || contains_exit(orelse),
-        StmtKind::Block { body, .. } | StmtKind::While { body, .. } | StmtKind::For { body, .. } => contains_exit(body),
-        _ => false,
-    })
+    fn walk(stmts: &[Stmt], inner: &mut Vec<usize>) -> bool {
+        stmts.iter().any(|s| match &s.kind {
+            StmtKind::Exit(l) => !inner.contains(l),
+            StmtKind::If { body, orelse, .. } => walk(body, inner) || walk(orelse, inner),
+            StmtKind::Block { label, body } => {
+                inner.push(*label);
+                let out = walk(body, inner);
+                inner.pop();
+                out
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } => walk(body, inner),
+            _ => false,
+        })
+    }
+    walk(stmts, &mut Vec::new())
 }
 
 /// Removes `Block`/`Exit` from straight-line code by moving the code that follows an `if`

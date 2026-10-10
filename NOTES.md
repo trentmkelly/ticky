@@ -671,3 +671,31 @@ its localised_name as JSON, and for recipes the category, ingredients, products 
 works for any mod, with no name-prefix filter (the old `names` scenario only did `nt-`). Used
 to write the user's `cubium-names.txt` / `cubium-recipes.txt` (Cubium 1.0.28: 13 items,
 10 fluids, 82 recipes). Those files are the user's reference, untracked; don't commit them.
+
+## 2026-10-10: Cubium generator, and three compiler fixes it found
+
+`examples/cubium-generator.ticky` (written at the user's request; their own attempt is the
+untracked `cubium-copper.ticky`): four crafter rows, each set to one of four Cubium recipes.
+In-game difftest MATCH with Cubium loaded
+(`TICKY_SPACE_AGE=1 TICKY_EXTRA_MODS="cubium=../cubium"`, `--space-age`), 1499 ticks.
+- First draft (rows as `Signal` state, bundle scores + `argmax`, rows deciding in sequence):
+  ~880 combinators. Recipes as small ints, one row decided per turn (`rows[turn]`), signals
+  only at the outputs: 221. One decision per pass rather than four chained ones is the big win.
+- **Fix: `Graph::truth` looped forever** on Signal state/ports (`Op::Src` with `src_sig`):
+  `is_sigval` is true but `unsig` returns them unchanged, and truth recursed on the same value.
+  `mux` between two such signals recursed the same way; it now builds the `bmux` directly.
+  Hit by `x if s else y` with `s` a Signal variable.
+- **Fix: `a and b` with different kinds** (`sig and n > 0`) was a "number vs signal" error;
+  it's now the `and`/`or` of their truths (a bool), which is what conditions need.
+- **Fix: `contains_exit` counted exits to blocks inside the statements.** An inlined
+  function's `return` inside `x if c else y` made `flatten` copy all following code into both
+  arms; four rows × four such calls hit the 200k branching budget ("too much branching").
+  Now only exits leaving the statements count. Bench unchanged for every other example;
+  the generator's first draft went 604 → 221 with the final design.
+- `NO_SIGNAL = Bundle().argmax()` at top level isn't constant-folded, so it turns the
+  prologue into running `main` code (and every later top-level variable becomes main's,
+  giving single-writer errors). Wrote `Bundle().argmax()` inline instead. Could fold.
+- Seen once, not reproduced after the netlist changed: "internal layout error: no room for a
+  wire relay" with the default grid placement on the ~880-combinator draft (anneal was fine).
+- SPEC §7 corrected: element writes to module variables need no `global` (as in Python);
+  only rebinding does. The old text said the opposite.
