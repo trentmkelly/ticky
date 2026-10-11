@@ -1224,3 +1224,15 @@ bestof 31 → 29, arrays 51 → 50, stats 47 → 46; no example grew.
   conditions and running maxima, in `every tick`/`every 30 ticks`/main shapes, vs Python.
 - Verification: `FUZZ_N=100 tools/verify.sh` clean; fuzz_bundles, fuzz_signals, fuzz_lookups
   2×300 each clean. Test `lookup_rewrites_apply` (58 → 47 combinators).
+
+## 2026-10-11: fix — two selects passing values under one array element's signal
+
+A select whose value is only written into a bundle (`arr[0] = u if x else v`) takes the
+element's signal as its name, and with select stages its passed values carry that name on
+the cluster's private wire. An unrolled loop writing `arr[0]` in each iteration put two
+such passes on one wire, where they added up (arr[0] = 3 instead of 1 for x = y = -20 in
+`passed_values_of_one_array_element`). Later selects with a taken name now use a bus signal
+(their bundle copies it). Introduced with select stages (94c33d1), not by the pipeline merge:
+the bisect that blamed the merge used `git archive` trees built into one shared
+CARGO_TARGET_DIR, where path packages share artifact names and old source mtimes leave stale
+binaries — build each tree with its own target dir. Bench unchanged.

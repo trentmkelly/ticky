@@ -128,7 +128,7 @@ impl Cg {
         };
         // A value computed only to be one signal of a bundle (`{s: x, …}`) is written onto
         // the bundle's wire as that signal by the combinators computing it (no copy).
-        let bundle_writes: HashMap<V, (V, Sig)> = producers
+        let mut bundle_writes: HashMap<V, (V, Sig)> = producers
             .iter()
             .copied()
             .filter_map(|x| {
@@ -334,6 +334,19 @@ impl Cg {
             local_sig.insert(v, x);
             own_wire.insert(v, n);
         }
+        // Two selects of one cluster writing the same bundle signal (the same array element
+        // in successive iterations of an unrolled loop) can't both name their passed values
+        // after it on the cluster's wire, where they'd add up: later ones take a bus signal
+        // and their bundle copies it.
+        let mut named: std::collections::HashSet<(usize, Sig)> = Default::default();
+        for &m in &producers {
+            if let Some(&(_, s)) = bundle_writes.get(&m).filter(|_| plan.has_pass(m)) {
+                if !named.insert((cluster[&m], s)) {
+                    bundle_writes.remove(&m);
+                }
+            }
+        }
+        let bundle_writes = bundle_writes;
         for &m in &producers {
             if !plan.has_pass(m) {
                 continue;

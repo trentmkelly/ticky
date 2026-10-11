@@ -1305,3 +1305,71 @@ test "behaviour":
     let combinators = ents.iter().filter(|e| e.kind.is_combinator()).count();
     assert!(combinators <= 47, "{combinators} combinators (47 when written, 58 before these rewrites)");
 }
+
+#[test]
+fn passed_values_of_one_array_element() {
+    // An unrolled loop writes `arr[0]` through a select in each iteration. Each select passes
+    // its arms' values on a private wire under its own name, which was the array element's
+    // signal (written straight onto the array's wire), so two iterations' passes added up on
+    // one cluster wire (arr[0] came out 3 instead of 1 for x = y = -20). Found by fuzz_level2.
+    let src = r#"input x: int @ X
+input y: int @ Y
+output o0: int @ A
+output o1: int @ B
+output o2: int @ C
+output o3: int @ E
+output o4: int @ F
+output o5: int @ G
+output o6: int @ H
+output done: bool @ D
+every 1000 ticks:
+    arr = [3, -1, 4, 1]
+    a = 0
+    b = 1
+    c = 2
+    for i4 in range(3):
+        arr[x % 4] = a
+        a = y
+        u1 = (arr[3] if x else arr[0])
+        u3 = max(arr) & c
+        arr[0] = u1
+        arr[i4 + 1] = 0
+        arr[1] = u3
+    o0 = a
+    o1 = b
+    o2 = c
+    o3 = arr[0]
+    o4 = arr[1]
+    o5 = arr[2]
+    o6 = arr[3]
+    done = True
+
+test "x=-20, y=-20":
+    set x = -20
+    set y = -20
+    run 1100 ticks
+    assert o0 == -20 and o3 == 1 and o4 == 0 and o5 == 0 and o6 == 0
+
+test "x=5, y=3":
+    set x = 5
+    set y = 3
+    run 1100 ticks
+    assert o0 == 3 and o3 == 1 and o4 == 2 and o5 == 0 and o6 == 0
+
+test "x=0, y=7":
+    set x = 0
+    set y = 7
+    run 1100 ticks
+    assert o0 == 7 and o3 == 7 and o4 == 2 and o5 == 0 and o6 == 0
+
+test "x=2, y=-9":
+    set x = 2
+    set y = -9
+    run 1100 ticks
+    assert o0 == -9 and o3 == 1 and o4 == 2 and o5 == -9 and o6 == 0
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+    }
+}
