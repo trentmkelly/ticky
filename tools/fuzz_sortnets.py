@@ -79,16 +79,21 @@ class Gen:  # pylint: disable=too-many-instance-attributes
     # ---------------------------------------------------------------- shapes
 
     def bubble(self):
-        """A bubble sort function, unrolled by the compiler; strict or non-strict swap."""
+        """A bubble sort function, unrolled by the compiler; strict or non-strict swap, by a
+        temporary, a tuple assignment or `min`/`max`."""
         op = self.r.choice([">", ">", ">="])
+        a, b = "xs[j]", "xs[j + 1]"
+        swap = self.r.choice([
+            [f"            if {a} {op} {b}:", f"                t = {a}",
+             f"                {a} = {b}", f"                {b} = t"],
+            [f"            if {a} {op} {b}:", f"                {a}, {b} = {b}, {a}"],
+            [f"            {a}, {b} = min({a}, {b}), max({a}, {b})"],
+        ])
         self.funcs += [
             "def sort(xs):",
             f"    for i in range({self.n} - 1):",
             f"        for j in range({self.n} - 1 - i):",
-            f"            if xs[j] {op} xs[j + 1]:",
-            "                t = xs[j]",
-            "                xs[j] = xs[j + 1]",
-            "                xs[j + 1] = t",
+            *swap,
             "    return xs",
         ]
         self.body.append("    ys = sort(vs)")
@@ -209,8 +214,8 @@ def main():  # pylint: disable=too-many-locals
             path = f.name
         out = subprocess.run([TICKY, "test", path], capture_output=True, text=True, check=False)
         text = out.stdout + out.stderr
-        if "ran out of signals" in text:
-            skipped += 1  # too big for the compiler's signal allocation (not a miscompile)
+        if "ran out of signals" in text or "ticks per iteration, but asks for" in text:
+            skipped += 1  # too big for the signal allocation or too deep for the period
             os.unlink(path)
             continue
         programs += 1
@@ -219,7 +224,7 @@ def main():  # pylint: disable=too-many-locals
             print(f"FAILED (seed {seed}, program {p}): {path}\n{text[-800:]}")
         else:
             os.unlink(path)
-    print(f"{programs} programs, {failed} failed ({skipped} too large to compile)")
+    print(f"{programs} programs, {failed} failed ({skipped} too large or deep to compile)")
     sys.exit(1 if failed else 0)
 
 
