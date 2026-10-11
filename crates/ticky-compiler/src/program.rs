@@ -1087,8 +1087,28 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mut procs = Vec::new();
     let all = std::iter::once((MAIN, "main".to_string(), main_cfg))
         .chain(proc_cfgs.into_iter().enumerate().map(|(k, c)| (proc_owner(k), procs_src[k].0.clone(), c)));
+    // Names each process's code mentions (its own body and subroutines), for register
+    // sharing: a variable mentioned by any other code is never shared.
+    let mut code: Vec<(Option<usize>, BTreeSet<String>)> = Vec::new();
+    {
+        let mut m = BTreeSet::new();
+        crate::liveness::mentioned(&main_stmts, &mut m);
+        subs_of(None).iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
+        code.push((Some(MAIN), m));
+        for (k, (name, body)) in procs_src.iter().enumerate() {
+            let mut m = BTreeSet::new();
+            crate::liveness::mentioned(body, &mut m);
+            subs_of(Some(name)).iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
+            code.push((Some(proc_owner(k)), m));
+        }
+        let mut m = BTreeSet::new();
+        every.iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
+        code.push((None, m));
+    }
     for (owner, name, c) in all {
-        let Some(c) = c else { continue };
+        let Some(mut c) = c else { continue };
+        let elsewhere: BTreeSet<&String> = code.iter().filter(|(o, _)| *o != Some(owner)).flat_map(|(_, m)| m).collect();
+        share_registers(&mut c, owner, &states, &elsewhere);
         let ctx = Ctx { owner, ports: &ports, states: &states, consts: &consts };
         match lower_main(&ctx, &c) {
             Ok(mut m) => {
@@ -1593,6 +1613,41 @@ fn definite_assignment(c: &cfg::Cfg) -> Vec<BTreeSet<String>> {
         }
         if !changed {
             return ins;
+        }
+    }
+}
+
+/// Register sharing (SPEC §11.2): the process's own scalar variables that are never live at
+/// the same time are renamed to one of them, so they share a register. The others are left
+/// as states nobody reads (codegen gives those no register). Variables any other process or
+/// `every` block mentions, ports and bundles keep their own. `TICKY_NO_REGSHARE` turns it off.
+fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: &BTreeSet<&String>) {
+    use crate::liveness::Cand;
+    if std::env::var_os("TICKY_NO_REGSHARE").is_some() {
+        return;
+    }
+    let cands: BTreeMap<String, Cand> = states
+        .iter()
+        .filter(|s| s.owner == Some(owner) && s.port.is_none() && !elsewhere.contains(&s.name))
+        .filter_map(|s| match s.ty {
+            Ty::Int => Some((s.name.clone(), Cand { class: 0, init: s.has_init })),
+            Ty::Bool => Some((s.name.clone(), Cand { class: 1, init: s.has_init })),
+            _ => None,
+        })
+        .collect();
+    let map = crate::liveness::coalesce(c, &cands, &definite_assignment(c));
+    if map.is_empty() {
+        return;
+    }
+    if std::env::var_os("TICKY_DUMP_REGSHARE").is_some() {
+        eprintln!("register sharing: {map:?}");
+    }
+    let f = |n: &str| map.get(n).cloned();
+    for d in &mut c.steps {
+        rename_stmts(&mut d.stmts, &f);
+        match &mut d.term {
+            Term::Branch(e, ..) | Term::WaitUntil(e, _) | Term::WaitTicks(e, _) => rename_expr(e, &f),
+            _ => {}
         }
     }
 }

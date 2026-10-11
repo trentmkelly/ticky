@@ -886,6 +886,9 @@ where operands must stay in step):
   as with `>`) and a table, instead of a comparison and selects per candidate.
 - **Reads and writes of bundle signals** go straight from and to the bundle's wire when the
   value is only copied.
+- **Shared registers.** Variables of one process that are never live at the same time (two
+  loops' counters, results of separate phases) share one register. Anything another process
+  or `every` block mentions, outputs and bundles keep their own.
 
 ### 11.3 Cost report
 

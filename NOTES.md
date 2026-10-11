@@ -778,3 +778,27 @@ penalty, scoring maths). Changes, in order, each verified with all example tests
   first seven changes and 37/37 (incl. bestof ties and the generator with Cubium loaded) on
   the final build; a deep fuzz run (105,800 expressions, 1,100 programs) was clean; test
   `optimizations_apply` pins the small probe at ≤ 41 entities.
+
+## 2026-10-11: register sharing (liveness)
+
+- `liveness.rs`: per-process liveness over the steps (`cfg::Cfg`, with `successors`, so a
+  return flows to every caller's continuation), statement by statement inside a step. Two
+  variables interfere when one is assigned while the other is live after the assignment (or
+  in the same tuple assignment), or both are live on entry (one start pulse loads both). A
+  copy `x = y` doesn't make `x` interfere with `y` (loop variable `k = k#k0` shares the
+  counter's register). Greedy colouring per class (int, bool); program.rs `share_registers`
+  renames the members to a representative in the cfg before `lower_main`; the others become
+  states nobody reads, which codegen already gives no register.
+- Candidates: the process's own Int/Bool states, not ports, not mentioned by any other
+  process's or `every` block's code. Prologue variables qualify too (when no one else reads
+  them): the member live on entry is the representative, so the register starts with its
+  value. Left out: variables never read across a step (no register, merging would only add
+  loads: sorting went +14 before this rule), names in a call's function position, and any
+  variable without an initial value read where it might not be assigned (live on entry or
+  outside `definite_assignment`), so a merge can't hide that error (test
+  `registers_are_shared`).
+- Bench: calculator 112 → 102, primes 49 → 47, ranking 107 → 104, functions 79 → 77;
+  nothing else changes. `TICKY_NO_REGSHARE=1` turns it off, `TICKY_DUMP_REGSHARE=1` prints
+  the merges. About half the programs of fuzz_programs/fuzz_procs/fuzz_level2 share
+  registers; fuzzers clean (level2 compile failures: the same layout/signals/branching ones as
+  before). In-game difftest MATCH: calculator, primes, ranking, functions.

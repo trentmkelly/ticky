@@ -9,6 +9,7 @@ pub mod expand;
 pub mod fuse;
 pub mod ir;
 pub mod layout;
+pub mod liveness;
 pub mod lower;
 pub mod pipeline;
 pub mod place;
