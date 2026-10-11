@@ -778,3 +778,38 @@ penalty, scoring maths). Changes, in order, each verified with all example tests
   first seven changes and 37/37 (incl. bestof ties and the generator with Cubium loaded) on
   the final build; a deep fuzz run (105,800 expressions, 1,100 programs) was clean; test
   `optimizations_apply` pins the small probe at ≤ 41 entities.
+
+## 2026-10-11: front-end optimisations (expand.rs, cfg.rs)
+
+Part of the optimisation campaign (branch `opt/frontend`). Bench: calculator 112 → 109,
+fib 33 → 32, functions 79 → 74, primes 49 → 47, ranking 107 → 105, signals 99 → 98, others
+unchanged (2254 → 2240, −14).
+- **Single-call subroutines are inlined.** `Expander::sub_sites` counts call sites per
+  `sub_key` (so per process) in each expansion round; the next round inlines those with one
+  (`inline_once`). Round 0 always runs and compiles every one as a subroutine, and the count
+  doesn't depend on that choice. The inlined body is the ordinary inlining path (frames,
+  exit label for `return`, waits and loops inside work as in `main`).
+- **Private loop variables.** `count_reads` counts reads of every name in the module (ports,
+  `global`, tests count); a range loop's variable whose reads are all inside the body (for a
+  function local: within that function) and which the body doesn't assign becomes `#i{id}.k`
+  (displays as `k`), aliased in the body. `cfg::for_range` uses such a `#…` target (also the
+  `for x in xs` / bundle-loop index temps) as the counter itself: no `k#k` register, no copy.
+  A name read nowhere (`_`) may be assigned by an inner loop; it's private without the alias.
+- **Countdown.** A private variable the body doesn't use, `range(n)` (start constant 0,
+  step 1, end not constant): the counter starts at `n` and counts down to 0, so `n#end` goes.
+  Only start 0: with another start `n - start` can overflow where the original can't.
+- **`--opt=size` step copies.** `cfg::fuse` copied small steps (≤ 6 statements) into some of
+  their plain-jump predecessors; that saves those paths 2 ticks but adds code. Under size it
+  copies only when every predecessor is a plain jump (the step goes). `crate::opt_size()`
+  (thread-local like `checks_on`). Under speed it would save calculator/primes 2 each, at
+  +7%/+11% ticks in their tests, so speed keeps the old rule.
+- Tried, no gain: `Goto` instead of the pre-loop test for statically non-empty ranges (+1 in
+  sorting, sounds: `fuse` then copies the body); breaking out of `while` via the loop test
+  (hand-written on primes: same count, slower).
+- Fuzz (TICKY = frozen release), final build: procs 400, programs 500, level2 300, blocks,
+  bundles, signals 300 each, exprs 300 rounds; plus about as many on earlier builds of this
+  branch: no new failures. Pre-existing, same on the base
+  binary: level2 "too much branching" / "ran out of signals" / "no room for a wire relay"
+  compile failures on big programs, and one fuzz_programs false positive (`c *= …` overflow
+  that its Python model doesn't flag). Test `single_call_inlining_and_loop_counters`.
+
