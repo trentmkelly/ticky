@@ -1153,17 +1153,11 @@ impl<'a> Expander<'a> {
                     conds: cs,
                 })
             }
-            ExprKind::Tuple(items) => {
-                let mut v = Vec::new();
-                for i in items {
-                    v.push(self.expr(i, out)?);
-                }
-                Val::Tuple(v)
-            }
+            ExprKind::Tuple(items) => Val::Tuple(self.exprs_in_order(items, out)?),
             ExprKind::List(items) => {
                 let mut v = Vec::new();
-                for i in items {
-                    v.push(self.expr_scalar(i, out)?);
+                for (x, i) in self.exprs_in_order(items, out)?.into_iter().zip(items) {
+                    v.push(self.scalar(x, i.span)?);
                 }
                 if v.len() > MAX_MEM {
                     return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
@@ -1749,7 +1743,9 @@ impl<'a> Expander<'a> {
                     let mut held = Vec::new();
                     for p in parts {
                         held.push(match p {
-                            Val::Scalar(e) => Val::Scalar(self.bind(e, out)),
+                            // Copied even when it's a name (`xs[j + 1]` with `j` a constant is
+                            // element `xs.1`): an earlier target may be that variable.
+                            p @ Val::Scalar(_) => self.freeze(p, out),
                             Val::Mem(banks, n) => {
                                 let mut held = Vec::new();
                                 for b in banks {
