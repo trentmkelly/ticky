@@ -94,6 +94,10 @@ pub enum BTerm {
     /// One-hot: the signals of the constant bundle `table` (red) whose value equals the index
     /// signal on bundle `ix` (green), each set to the constant.
     Hot(V, V, i32),
+    /// One-hot by a scalar: the signals of the constant bundle `table` (red, values never 0)
+    /// whose value equals `x` (green: the bus, or the bundle `x` is read from), each set to
+    /// the constant. [`BTerm::Hot`] without the index wire.
+    HotEq(V, V, i32),
     /// `each(b) op k`, summed onto one signal.
     Fold(V, ArOp, i32, Sig),
     /// Scalar arithmetic `a op b` written straight onto signal `s` of the bundle (instead of
@@ -208,6 +212,7 @@ impl BTerm {
             BTerm::Ar(_, a, b, _) => vec![*a, *b],
             BTerm::Dec(arms) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
             BTerm::Hot(t, ix, _) => vec![*t, *ix],
+            BTerm::HotEq(t, x, _) => vec![*t, *x],
             BTerm::Fold(b, ..) => vec![*b],
         }
     }
@@ -1022,6 +1027,10 @@ impl Graph {
                 let i = bval(ix, SignalTable::base().index_signal());
                 normalize(t.iter().filter(|(_, v)| *v == i).map(|(s, _)| (*s, *c)))
             }
+            BTerm::HotEq(t, x, c) => {
+                let (t, i) = (b(*t)?, k(*x)?);
+                normalize(t.iter().filter(|(_, v)| *v == i && i != 0).map(|(s, _)| (*s, *c)))
+            }
             BTerm::Fold(x, op, c, s) => {
                 let x = b(*x)?;
                 normalize([(*s, x.iter().fold(0i32, |acc, (_, v)| acc.wrapping_add(op.apply(*v, *c))))])
@@ -1042,7 +1051,7 @@ impl Graph {
         let konst = normalize(konst);
         // A filter that never passes contributes nothing.
         rest.retain(|t| !matches!(t, BTerm::Filter(_, d, _) | BTerm::DFilter(_, _, d, _) if d.is_empty()));
-        rest.retain(|t| !matches!(t, BTerm::Hot(_, _, 0) | BTerm::DFilter(_, _, _, FOut::Const(0)) | BTerm::Filter(_, _, FOut::Const(0))));
+        rest.retain(|t| !matches!(t, BTerm::Hot(_, _, 0) | BTerm::HotEq(_, _, 0) | BTerm::DFilter(_, _, _, FOut::Const(0)) | BTerm::Filter(_, _, FOut::Const(0))));
         if rest.is_empty() {
             return self.bconst(konst);
         }

@@ -5,7 +5,7 @@
 use ticky_factorio::*;
 
 use super::*;
-use crate::ir::{BOp, BTerm, FOut, Graph, Op, V};
+use crate::ir::{BDnf, BOp, BTerm, FOut, Graph, Op, V};
 
 /// The wires of one bundle value. Consumers read it on red (or green, for the second
 /// bundle of an element-wise operation); the wire of each colour is made when first needed.
@@ -127,57 +127,15 @@ impl Cg {
                             None => (arith(r(x).op(), ArOp::Add, Operand::Const(0), sig), vec![], true, "one signal"),
                         },
                         BTerm::Filter(b, d, fout) => {
-                            let mut conds = Vec::new();
-                            for (i, term) in d.iter().enumerate() {
-                                let mut lits: Vec<Cond> = Vec::new();
-                                for l in term {
-                                    let (first, first_nets) = match l.a {
-                                        BOp::Each => (each, Nets::RED),
-                                        BOp::Val(x) => (r(x).sig(), Nets::GREEN),
-                                    };
-                                    let (second, second_nets) = match l.b {
-                                        BOp::Each => (Operand::Sig(each), Nets::RED),
-                                        BOp::Val(x) => scal(x),
-                                    };
-                                    lits.push(Cond { first, first_nets, second, second_nets, cmp: l.op, and: true });
-                                }
-                                // Outputting `each` needs `each` in every term's conditions.
-                                if !term.iter().any(|l| l.a == BOp::Each || l.b == BOp::Each) {
-                                    lits.push(Cond { first: each, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: true });
-                                }
-                                lits[0].and = i == 0;
-                                conds.extend(lits);
-                            }
+                            let (conds, bus) = self.filter_conds(&d, r);
                             let o = match fout {
                                 FOut::Copy => DOut { sig: each, copy: true, constant: 1, nets: Nets::RED },
                                 FOut::Const(k) => out_const(each, k),
                             };
-                            let bus = conds.iter().any(|c| c.first_nets == Nets::GREEN || c.second_nets == Nets::GREEN);
                             (dec(conds, vec![o]), vec![(b, false)], bus, "filter")
                         }
                         BTerm::DFilter(dom, b, d, fout) => {
-                            // `each` iterates over the domain (green) and `b` (red): signals
-                            // missing from `b` are tested as 0.
-                            let mut conds = Vec::new();
-                            for (i, term) in d.iter().enumerate() {
-                                let mut lits = vec![Cond {
-                                    first: each,
-                                    first_nets: Nets::GREEN,
-                                    second: Operand::Const(0),
-                                    second_nets: Nets::BOTH,
-                                    cmp: CmpOp::Ne,
-                                    and: i == 0,
-                                }];
-                                for l in term {
-                                    let second = match l.b {
-                                        BOp::Val(x) => r(x).op(),
-                                        BOp::Each => unreachable!("each on both sides"),
-                                    };
-                                    assert!(matches!(second, Operand::Const(_)), "domain filters compare with constants");
-                                    lits.push(Cond { first: each, first_nets: Nets::RED, second, second_nets: Nets::BOTH, cmp: l.op, and: true });
-                                }
-                                conds.extend(lits);
-                            }
+                            let conds = self.dfilter_conds(&d, r);
                             let o = match fout {
                                 FOut::Copy => DOut { sig: each, copy: true, constant: 1, nets: Nets::GREEN },
                                 FOut::Const(k) => out_const(each, k),
@@ -223,7 +181,26 @@ impl Cg {
                                 cmp: CmpOp::Eq,
                                 and: true,
                             };
-                            (dec(vec![cond], vec![out_const(each, c)]), vec![(t, false), (ix, true)], false, "one-hot")
+                            // An index bundle shared with an array read also has the positions:
+                            // `each(red) != 0` keeps them out, whatever the game iterates.
+                            let mut conds = vec![cond];
+                            if !matches!(g.op(ix), Op::Bun(ts) if matches!(ts.as_slice(), [BTerm::Shift(..)])) {
+                                conds.insert(0, Cond { first: each, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: true });
+                            }
+                            (dec(conds, vec![out_const(each, c)]), vec![(t, false), (ix, true)], false, "one-hot")
+                        }
+                        BTerm::HotEq(t, x, c) => {
+                            // `each` should iterate the table (red) only, but `each(red) != 0`
+                            // also keeps out anything on the green side, whatever the game
+                            // iterates (a missing `x` reads 0).
+                            let (s, reads) = match direct(x) {
+                                Some((b, s)) => (s, vec![(t, false), (b, true)]),
+                                None => (r(x).sig(), vec![(t, false)]),
+                            };
+                            let nz = Cond { first: each, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: true };
+                            let eq = Cond { first: each, first_nets: Nets::RED, second: Operand::Sig(s), second_nets: Nets::GREEN, cmp: CmpOp::Eq, and: true };
+                            let bus = reads.len() == 1;
+                            (dec(vec![nz, eq], vec![out_const(each, c)]), reads, bus, "one-hot")
                         }
                         BTerm::Fold(b, op, c, sig) => {
                             let a = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Const(c), second_nets: Nets::BOTH, op, out: sig };
@@ -368,6 +345,133 @@ impl Cg {
         let id = self.loose(kind, format!("{what}: {label}"));
         let rb = r(b).bun();
         self.bread(rb, id, false);
+        match out_net {
+            Some(n) => self.nets[n].members.push((id, Conn::OutRed)),
+            None => self.nets[0].members.push((id, Conn::OutGreen)),
+        }
+    }
+
+    /// A filter's conditions (`each` reads the bundle on red, numbers come from the bus on
+    /// green), and whether it reads the bus.
+    fn filter_conds(&self, d: &BDnf, r: &dyn Fn(V) -> Ref) -> (Vec<Cond>, bool) {
+        let each = self.each;
+        let scal = |u: V| -> (Operand, Nets) {
+            match r(u).op() {
+                Operand::Const(k) => (Operand::Const(k), Nets::BOTH),
+                o => (o, Nets::GREEN),
+            }
+        };
+        let mut conds = Vec::new();
+        for (i, term) in d.iter().enumerate() {
+            let mut lits: Vec<Cond> = Vec::new();
+            for l in term {
+                let (first, first_nets) = match l.a {
+                    BOp::Each => (each, Nets::RED),
+                    BOp::Val(x) => (r(x).sig(), Nets::GREEN),
+                };
+                let (second, second_nets) = match l.b {
+                    BOp::Each => (Operand::Sig(each), Nets::RED),
+                    BOp::Val(x) => scal(x),
+                };
+                lits.push(Cond { first, first_nets, second, second_nets, cmp: l.op, and: true });
+            }
+            // Outputting `each` needs `each` in every term's conditions.
+            if !term.iter().any(|l| l.a == BOp::Each || l.b == BOp::Each) {
+                lits.push(Cond { first: each, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: true });
+            }
+            lits[0].and = i == 0;
+            conds.extend(lits);
+        }
+        let bus = conds.iter().any(|c| c.first_nets == Nets::GREEN || c.second_nets == Nets::GREEN);
+        (conds, bus)
+    }
+
+    /// A domain filter's conditions: `each` iterates over the domain (green) and the bundle
+    /// (red), so signals missing from the bundle are tested as 0.
+    fn dfilter_conds(&self, d: &BDnf, r: &dyn Fn(V) -> Ref) -> Vec<Cond> {
+        let each = self.each;
+        let mut conds = Vec::new();
+        for (i, term) in d.iter().enumerate() {
+            let mut lits = vec![Cond { first: each, first_nets: Nets::GREEN, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Ne, and: i == 0 }];
+            for l in term {
+                let second = match l.b {
+                    BOp::Val(x) => r(x).op(),
+                    BOp::Each => unreachable!("each on both sides"),
+                };
+                assert!(matches!(second, Operand::Const(_)), "domain filters compare with constants");
+                lits.push(Cond { first: each, first_nets: Nets::RED, second, second_nets: Nets::BOTH, cmp: l.op, and: true });
+            }
+            conds.extend(lits);
+        }
+        conds
+    }
+
+    /// For a total (or count) `v` of a one-filter bundle, times `scale`: that bundle, when
+    /// the filter's decider can write the result itself (one output signal on an `each`
+    /// decider sums over the passing signals: their values, or its constant). Copied values
+    /// can't be scaled, except a domain's that are all equal (counting).
+    pub(super) fn filter_total(g: &Graph, v: V, scale: i32) -> Option<V> {
+        let (b, count) = match *g.op(v) {
+            Op::BTotal(b) => (b, false),
+            Op::BCount(b) => (b, true),
+            _ => return None,
+        };
+        let Op::Bun(terms) = g.op(b) else { return None };
+        let [t @ (BTerm::Filter(..) | BTerm::DFilter(..))] = terms.as_slice() else { return None };
+        let k = match t {
+            _ if count => Some(1),
+            BTerm::Filter(_, _, FOut::Const(k)) | BTerm::DFilter(_, _, _, FOut::Const(k)) => Some(*k),
+            BTerm::Filter(_, _, FOut::Copy) => None,
+            BTerm::DFilter(dom, _, _, FOut::Copy) => match g.as_bconst(*dom)?.as_slice() {
+                [(_, d), rest @ ..] if rest.iter().all(|(_, e)| e == d) => Some(*d),
+                _ => None,
+            },
+            _ => return None,
+        };
+        let ok = match k {
+            Some(k) => (k as i64 * scale as i64).abs() <= i32::MAX as i64,
+            None => scale == 1,
+        };
+        ok.then_some(b)
+    }
+
+    /// [`filter_total`](Self::filter_total) as one decider: the filter's conditions, with the
+    /// sum (or count) of what passes on `out` (on `out_net`, else the bus).
+    pub(super) fn emit_filter_total(&mut self, g: &Graph, v: V, out: Sig, scale: i32, out_net: Option<usize>, r: &dyn Fn(V) -> Ref, what: &str) {
+        let count = matches!(g.op(v), Op::BCount(_));
+        let (Op::BTotal(b) | Op::BCount(b)) = *g.op(v) else { unreachable!("not a total") };
+        let Op::Bun(terms) = g.op(b) else { unreachable!("not a filter") };
+        let (conds, reads, bus, o) = match terms[0].clone() {
+            BTerm::Filter(x, d, fout) => {
+                let (conds, bus) = self.filter_conds(&d, r);
+                let o = match fout {
+                    FOut::Const(k) if !count => out_const(out, k.wrapping_mul(scale)),
+                    FOut::Copy if !count => DOut { sig: out, copy: true, constant: 1, nets: Nets::RED },
+                    _ => out_const(out, scale),
+                };
+                (conds, vec![(x, false)], bus, o)
+            }
+            BTerm::DFilter(dom, x, d, fout) => {
+                let conds = self.dfilter_conds(&d, r);
+                let o = match fout {
+                    _ if count => out_const(out, scale),
+                    FOut::Const(k) => out_const(out, k.wrapping_mul(scale)),
+                    FOut::Copy if scale == 1 => DOut { sig: out, copy: true, constant: 1, nets: Nets::GREEN },
+                    FOut::Copy => out_const(out, g.as_bconst(dom).unwrap()[0].1.wrapping_mul(scale)),
+                };
+                (conds, vec![(x, false), (dom, true)], false, o)
+            }
+            _ => unreachable!("not a filter"),
+        };
+        let label = if count { "count" } else { "total" };
+        let id = self.loose(dec(conds, vec![o]), format!("{what}: filter and {label}"));
+        for (x, on_green) in reads {
+            let rx = r(x).bun();
+            self.bread(rx, id, on_green);
+        }
+        if bus {
+            self.on_bus_in(id);
+        }
         match out_net {
             Some(n) => self.nets[n].members.push((id, Conn::OutRed)),
             None => self.nets[0].members.push((id, Conn::OutGreen)),

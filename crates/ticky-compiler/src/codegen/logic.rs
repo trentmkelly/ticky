@@ -235,7 +235,7 @@ impl Cg {
                 }
                 let Op::Bun(terms) = g.op(*bun) else { return None };
                 let only_copies = terms.iter().all(|t| match t {
-                    BTerm::One(..) | BTerm::Shift(..) => true,
+                    BTerm::One(..) | BTerm::Shift(..) | BTerm::HotEq(..) => true,
                     t => !t.operands().contains(&x),
                 });
                 only_copies.then_some((x, (b, s)))
@@ -271,6 +271,56 @@ impl Cg {
         for (i, f) in floors.iter().enumerate() {
             for v in [Some(f.m), f.div.map(|d| d.1), f.div.map(|d| d.2), f.rem.map(|r| r.0), f.rem.map(|r| r.1)].into_iter().flatten() {
                 floor_at.insert(v, i);
+            }
+        }
+        // A total (or count) of a filter that nothing else reads: the filter's decider writes
+        // it (bundles.rs `filter_total`). Filter bundle → the read.
+        let filter_totals: HashMap<V, V> = producers
+            .iter()
+            .copied()
+            .filter(|&v| is_read(v))
+            .filter_map(|v| {
+                let m = fold.get(&v).map_or(1, |x| x.1);
+                let b = Cg::filter_total(g, v, i32::try_from(m).ok()?)?;
+                (consumers.get(&b).is_some_and(|cs| cs.as_slice() == [v]) && !is_root.contains(&b)).then_some((b, v))
+            })
+            .collect();
+        let fused_total: std::collections::HashSet<V> = filter_totals.values().copied().collect();
+        // A comparison or condition reading signals of one bundle that nothing else reads
+        // (`ys[k] == zs[k] and …`) takes that bundle on its red input and the bus on green: no
+        // read combinators. Not with cluster-local operands (they need the red input); not for
+        // select stages or floor groups (their own emitters).
+        let mut cond_reads: HashMap<V, V> = HashMap::new(); // decider → bundle
+        let mut cond_read: HashMap<V, Sig> = HashMap::new(); // read → its signal
+        for &v in &producers {
+            if !matches!(g.op(v), Op::Cmp(..) | Op::Dec(_)) || transparent.contains(&v) || plan.stages.contains_key(&v) || floor_at.contains_key(&v) {
+                continue;
+            }
+            let ops = eff_operands(v);
+            if ops.iter().any(|o| local(*o)) {
+                continue;
+            }
+            let reads: Vec<(V, V, Sig)> = ops
+                .iter()
+                .filter_map(|&o| match *g.op(o) {
+                    Op::BGet(b, s)
+                        if !is_root.contains(&o)
+                            && !fold.contains_key(&o)
+                            && !direct_reads.contains_key(&o)
+                            && consumers.get(&o).is_some_and(|cs| cs.iter().all(|c| *c == v)) =>
+                    {
+                        Some((o, b, s))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The bundle with the most such reads.
+            let Some(b) = reads.iter().map(|r| r.1).max_by_key(|b| reads.iter().filter(|r| r.1 == *b).count()) else { continue };
+            cond_reads.insert(v, b);
+            for (o, rb, s) in reads {
+                if rb == b {
+                    cond_read.insert(o, s);
+                }
             }
         }
         let mut node_ref: HashMap<V, Ref> = HashMap::new();
@@ -339,7 +389,7 @@ impl Cg {
             }
         }
         for &v in &producers {
-            if fold.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || direct_reads.contains_key(&v) {
+            if fold.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || direct_reads.contains_key(&v) || filter_totals.contains_key(&v) || cond_read.contains_key(&v) {
                 continue;
             }
             if floor_at.get(&v).is_some_and(|&i| floor_sig[i].is_some() && floors[i].rem.map(|r| r.0) != Some(v)) {
@@ -373,6 +423,9 @@ impl Cg {
         let mut floor_done: std::collections::HashSet<usize> = Default::default();
 
         for v in producers {
+            if filter_totals.contains_key(&v) {
+                continue;
+            }
             if let Some(&i) = floor_at.get(&v) {
                 if let Some(a) = floor_sig[i] {
                     if floor_done.insert(i) {
@@ -386,7 +439,7 @@ impl Cg {
                 self.emit_bundle(g, v, out, &locate, &direct, &|x| bundle_writes.contains_key(&x), what);
                 continue;
             }
-            if direct_reads.contains_key(&v) {
+            if direct_reads.contains_key(&v) || cond_read.contains_key(&v) {
                 continue;
             }
             if is_read(v) {
@@ -401,7 +454,11 @@ impl Cg {
                     }
                     None => (node_ref[&t].sig(), None),
                 };
-                self.emit_from_bundle(g, v, out, m as i32, net, &locate, what);
+                if fused_total.contains(&v) {
+                    self.emit_filter_total(g, v, out, m as i32, net, &locate, what);
+                } else {
+                    self.emit_from_bundle(g, v, out, m as i32, net, &locate, what);
+                }
                 continue;
             }
             if transparent.contains(&v) {
@@ -490,13 +547,16 @@ impl Cg {
             }
             let ops = eff_operands(v);
             let reads_local = ops.iter().any(|o| local(*o));
-            // With a red input, every operand must say which wire it comes from.
+            // With a red input (cluster wire or a bundle's), every operand must say which wire
+            // it comes from.
+            let red_in = reads_local || cond_reads.contains_key(&v);
             let pick = |u: V| -> (Operand, Nets) {
                 match *g.op(u) {
                     Op::Const(k) => (Operand::Const(k), Nets::BOTH),
-                    Op::Src(s) => (src(s).op(), if reads_local { Nets::GREEN } else { Nets::BOTH }),
+                    Op::Src(s) => (src(s).op(), if red_in { Nets::GREEN } else { Nets::BOTH }),
                     _ if local(u) => (Operand::Sig(local_sig[&u]), Nets::RED),
-                    _ => (node_ref[&u].op(), if reads_local { Nets::GREEN } else { Nets::BOTH }),
+                    _ if cond_read.contains_key(&u) => (Operand::Sig(cond_read[&u]), Nets::RED),
+                    _ => (node_ref[&u].op(), if red_in { Nets::GREEN } else { Nets::BOTH }),
                 }
             };
             let sig = |u: V| match pick(u) {
@@ -546,6 +606,10 @@ impl Cg {
                 let id = self.net.add(kind, Role::Core);
                 self.net.entities[id].description = Some(format!("{what}: {label}"));
                 self.nets[0].members.push((id, Conn::InGreen));
+                if let Some(&b) = cond_reads.get(&v) {
+                    let rb = locate(b).bun();
+                    self.bread(rb, id, false);
+                }
                 if reads_local {
                     // Inputs from this node's cluster.
                     let ni = self.cluster_net(&mut cluster_net, cluster[&v]);

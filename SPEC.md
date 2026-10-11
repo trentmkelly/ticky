@@ -920,6 +920,14 @@ where operands must stay in step, with the restrictions noted):
   at its last value); when nothing reads `k` after the loop and the body doesn't assign it,
   `k` is the counter itself. `for _ in range(n)` with an unused variable counts down from `n`,
   so `n` needs no register of its own.
+- **Lookups by a runtime index into bundle reads.** `[b["coal"], b["stone"], …][i]` is a
+  table lookup of the signal and one multiplication with `b` (two combinators, whatever the
+  length), sharing the index wire of an array accessed by the same `i`. A table keyed by a
+  number compares the table with the number itself (no index arithmetic).
+- **Totals of filters.** A count or sum of what passes a filter (`(b[s1] == k) + …`, scaled
+  or not) is the filter's one decider: an `each` decider with one output signal sums.
+- **Conditions on bundle signals** read them straight from the bundle's wire
+  (`all([ys[k] == zs[k] for k …])` is one decider, not a read per element).
 - **Functions with loops called once** are inlined: no return address, call or return.
 - With `--opt=size`, a small step reached by plain jumps is copied into them only if that
   removes it (under `speed`, also into some of them, which saves those paths a step).

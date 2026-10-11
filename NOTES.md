@@ -1178,3 +1178,49 @@ fib, handshake, primes, sorting −1; nothing grew. (Before those merges 1957 �
   (opt/pipe; both of its commits and the other parent are fine alone): a loop of runtime-index
   writes to `arr` with `u1 = (arr[3] if x else arr[0])` gives arr[0] = 3 where Python gives
   1 (x = y = -20). Reported to the lead; fuzz_level2 seeds 2 and 3 hit it once each.
+
+## 2026-10-11: lookup, filter-total and bundle-condition rewrites (examples 1735 → 1696)
+
+All emit shapes are made of probed pieces; `harness/lookups-probe.ticky` exercises each one
+(incl. a bus-keyed lookup at key 0 and the guarded shared-index `Hot`): in-game MATCH, 259
+ticks. Per example (vs main at 7c79d0b): cubium-generator 138 → 121, sorting 128 → 110,
+bestof 31 → 29, arrays 51 → 50, stats 47 → 46; no example grew.
+- **One-hot by a scalar** (`BTerm::HotEq`, fuse/lookups.rs `table_lookups`): a table lookup
+  whose keys need no shift (no key is 0) compares the table (red) with `x` (green: the bus,
+  or the bundle `x` is a single-use read of; logic.rs `direct_reads` accepts it) instead of
+  building `x + 0` on the index signal. Decider `each(red) != 0 and each(red) == x(green)`:
+  the sim's `each` iterates the networks of its operands (red only), but the guard keeps
+  green-only signals out even if the game iterated both (with `x` = 0 they would match).
+  cubium's four `recipe(rows[k])`: −4. Non-zero offsets aren't folded into the table: only
+  `ahot` makes them (`i + 1` against positions), and slot 0 would become 0. The `+0` index in
+  `signals` feeds a `SelectAt` selector, which ranks both wires, so it stays.
+- **Filter totals** (codegen/bundles.rs `filter_total`/`emit_filter_total`, logic.rs
+  `filter_totals`): a total/count whose operand is a one-filter bundle nothing else reads is
+  that filter's decider with one output signal (copy → sum, constant → count × constant).
+  A wire-sum factor goes into the output constant (counts, and domain filters whose domain
+  values are all equal: count_sum's ones); copied values only at factor 1 (argmax's table).
+  cubium −6 (five share-penalty counts at ×300, the argmax table), bestof −2.
+- **Conditions reading a bundle on red** (logic.rs `cond_reads`): a Cmp/Dec (not a select
+  stage or floor group: their own emitters) whose operands include single-use `BGet`s of one
+  bundle takes that bundle on its red input; those operands read `(s, RED)`, the rest come
+  from the bus on green. Not with cluster-local operands. sorting's `agree` (−15 when
+  written; 16 reads, one also `slow_median`'s). Register loads with direct conditions (registers.rs) still read through separate reads.
+- **Picks among bundle reads** (fuse/lookups.rs `picked_read`, from `rebuild` of a `Sel`):
+  ≥3 arms `x == c_i → b[s_i]` (distinct keys and signals, one bundle) → `BDot(b, Hot(table,
+  ix))`. The index is an existing index bundle for `x + k` when one keeps the table off 0
+  (`index_wire`: an array read's `Bun[Shift, K(positions)]` first), else `HotEq`, else a new
+  shift. cubium's `working = [cs["signal-A"], …][turn]`: 4 reads + 4 select deciders → a
+  one-hot and a dot (plus the table constant).
+- **Shared index wires** (`shared_hot_index`): `ahot`'s `Bun[Shift(x + 1)]` for an array
+  write uses the array read's `Bun[Shift(x + 1), K(positions)]` when the block has one (cubium
+  `rows[turn]`/`since[turn]` writes: −1; sorting, arrays, stats −1 each). With positions on
+  the index wire, `Hot` gets the `each(red) != 0` guard too.
+- Tried and dropped: sharing equal constant combinators between bundles (cubium's positions
+  table and the array read's positions; split again where colours collide). Constants don't
+  count as combinators in the bench, and wiring one constant to distant bundles made two
+  fuzz_level2 programs fail layout ("no room for a wire relay").
+- `tools/fuzz_lookups.py`: picks (also next to an array indexed the same way), signal tables
+  keyed by numbers or bundle reads (with and without 0 keys), scaled counts, bundle
+  conditions and running maxima, in `every tick`/`every 30 ticks`/main shapes, vs Python.
+- Verification: `FUZZ_N=100 tools/verify.sh` clean; fuzz_bundles, fuzz_signals, fuzz_lookups
+  2×300 each clean. Test `lookup_rewrites_apply` (58 → 47 combinators).

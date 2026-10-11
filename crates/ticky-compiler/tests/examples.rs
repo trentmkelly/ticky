@@ -1256,3 +1256,52 @@ test "misc":
         }
     }
 }
+
+#[test]
+fn lookup_rewrites_apply() {
+    // A pick among bundle reads by a runtime index (one-hot lookup + one `b · onehot`,
+    // sharing the array write's index wire), a signal table keyed by a number (no index
+    // arithmetic), a scaled count (one decider), and a condition reading a bundle's signals
+    // straight off its wire.
+    let src = r#"input  a: Bundle
+input  b: Bundle
+input  i: int @ I
+input  y: int @ Y
+output p: int @ P
+output r: Signal
+output n: int @ N
+output c: int @ C
+xs = [0, 0, 0, 0]
+
+every 10 ticks:
+    xs[i % 4] = 5
+    p = [a["coal"], a["stone"], a["wood"], a["iron-plate"]][i % 4] * 100 + xs[i % 4]
+    r = S("coal") if y == 1 else S("stone") if y == 2 else S("wood") if y == 3 else Bundle().argmax()
+    n = 300 * ((1 if b["coal"] == 2 else 0) + (1 if b["stone"] == 2 else 0) + (1 if b["wood"] == 2 else 0)) - y
+    c = (7 if b["iron-plate"] == y and b["copper-plate"] < 3 else -1) * i
+
+test "behaviour":
+    set a = {"coal": 1, "stone": 2, "wood": 3, "iron-plate": 4}
+    set b = {"coal": 2, "wood": 2, "iron-plate": 3}
+    set i = 2
+    set y = 3
+    run 40 ticks
+    assert p == 305 and r == S("wood") and n == 597 and c == 14
+    set i = 7
+    set y = 0
+    run 40 ticks
+    assert p == 405 and r == Bundle().argmax() and n == 600 and c == -7
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let ents = &c.cg.netlist.entities;
+    let made = |what: &str| ents.iter().filter(|e| e.description.as_deref().is_some_and(|d| d.ends_with(what))).count();
+    assert_eq!(made("read a signal's value"), 1, "the pick is one dot product");
+    assert_eq!(made("filter and total"), 1, "the count is one decider");
+    assert_eq!(made("block 1: index"), 1, "one index wire, shared by the pick and the array");
+    assert_eq!(made("read one signal"), 0, "no separate reads");
+    let combinators = ents.iter().filter(|e| e.kind.is_combinator()).count();
+    assert!(combinators <= 47, "{combinators} combinators (47 when written, 58 before these rewrites)");
+}
