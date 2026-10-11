@@ -41,27 +41,30 @@ pub(super) fn pipelined_block(
     let mut best: Option<(usize, Cg, Built)> = None;
     let mut err = None;
     for (ti, tau) in pipe.taus.iter().enumerate() {
-        for stages in 0.. {
-            let mut trial = cg.clone();
-            let used = match build(&mut trial, p, bi, b, pipe, tau, stages, shared, live, comb) {
-                Ok((r, used)) => {
-                    let n = trial.combinators_since(first);
-                    if std::env::var_os("TICKY_DUMP_PIPE").is_some() {
-                        eprintln!("block {}: schedule {ti}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
+        for inline in [false, true] {
+            for stages in 0.. {
+                let mut trial = cg.clone();
+                let shape = Shape { tau, stages, inline };
+                let used = match build(&mut trial, p, bi, b, pipe, &shape, shared, live, comb) {
+                    Ok((r, used)) => {
+                        let n = trial.combinators_since(first);
+                        if std::env::var_os("TICKY_DUMP_PIPE").is_some() {
+                            eprintln!("block {}: schedule {ti}, inline {inline}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
+                        }
+                        if best.as_ref().is_none_or(|(m, _, _)| n < *m) {
+                            best = Some((n, trial, r));
+                        }
+                        used
                     }
-                    if best.as_ref().is_none_or(|(m, _, _)| n < *m) {
-                        best = Some((n, trial, r));
+                    Err(e) => {
+                        err.get_or_insert(e);
+                        0
                     }
-                    used
+                };
+                // More carry wires than the last build used would build the same again.
+                if used < stages || stages > pipe.latency as usize + 1 {
+                    break;
                 }
-                Err(e) => {
-                    err.get_or_insert(e);
-                    0
-                }
-            };
-            // More carry wires than the last build used would build the same again.
-            if used < stages || stages > pipe.latency as usize + 1 {
-                break;
             }
         }
     }
@@ -74,8 +77,18 @@ pub(super) fn pipelined_block(
 /// ticks they come after the pipeline's offset 0.
 type Built = (HashMap<usize, Ref>, HashMap<usize, usize>, u32);
 
-/// Builds the block with schedule `tau` and at most `stages` carry wires. Also returns how
-/// many carry wires it built.
+/// One way to build a block.
+struct Shape<'a> {
+    /// The schedule (one of [`crate::pipeline::Pipe::taus`]).
+    tau: &'a [Option<i32>],
+    /// How many carry wires may be built.
+    stages: usize,
+    /// Whether conditions used only to choose constants are tested by the select's deciders
+    /// themselves (reading their operands a tick later) rather than built.
+    inline: bool,
+}
+
+/// Builds the block. Also returns how many carry wires it built.
 #[allow(clippy::too_many_arguments)]
 fn build(
     cg: &mut Cg,
@@ -83,14 +96,14 @@ fn build(
     bi: usize,
     b: &crate::program::Block,
     pipe: &crate::pipeline::Pipe,
-    tau: &[Option<i32>],
-    stages: usize,
+    shape: &Shape,
     shared: &Shared,
     live: &[bool],
     comb: &std::collections::HashSet<usize>,
 ) -> Result<(Built, usize), Diag> {
     let what = format!("block {}", bi + 1);
     let g = &b.graph;
+    let (tau, stages) = (shape.tau, shape.stages);
     let owned: Vec<usize> = (0..p.states.len()).filter(|&si| p.states[si].owner == Some(bi) && live[si]).collect();
     let registers = owned.iter().any(|si| !comb.contains(si));
     // Commit only once the pipeline holds values computed from inputs read after the start.
@@ -114,8 +127,13 @@ fn build(
         roots.extend(acc_conds(a));
     }
     let nodes = g.reachable(&roots);
+    let inline = if shape.inline { inline_conds(g, &nodes, &roots) } else { HashSet::new() };
     let mut node_ref: HashMap<V, Ref> = HashMap::new();
     for &v in &nodes {
+        // Inlined conditions aren't built; parts of a sum write the sum's signal.
+        if inline.contains(&v) || pipe.fold.get(&v).is_some_and(|&(sum, _)| sum != v) {
+            continue;
+        }
         match g.op(v) {
             Op::Ar(..) | Op::Cmp(..) | Op::Mux { .. } | Op::Dec(_) | Op::Sel(_) | Op::BGet(..) | Op::BTotal(_) | Op::BCount(_) | Op::AGet(..) | Op::BDot(..) => {
                 node_ref.insert(v, Ref::Op(Operand::Sig(cg.alloc()?)));
@@ -145,7 +163,16 @@ fn build(
     // A condition `x op y` on operands read by `Delays::read`.
     let cond = |x: (Operand, Nets), op: CmpOp, y: (Operand, Nets)| Cond { first: as_sig(x.0), first_nets: x.1, second: y.0, second_nets: y.1, cmp: op, and: true };
     for &v in &nodes {
-        let Some(&out_ref) = node_ref.get(&v) else { continue };
+        // A sum on the wire is its parts' outputs: nothing to build. Each part writes its
+        // value times `m` onto the sum's signal.
+        if pipe.transparent.contains(&v) {
+            continue;
+        }
+        let (out_ref, m) = match (pipe.fold.get(&v), node_ref.get(&v)) {
+            (Some(&(sum, m)), _) => (node_ref[&sum], m),
+            (None, Some(&r)) => (r, 1),
+            (None, None) => continue,
+        };
         if matches!(g.op(v), Op::BConst(_)) {
             cg.emit_bundle(g, v, out_ref.bun(), &|_| unreachable!(), &|_| None, &|_| false, &what);
             continue;
@@ -162,21 +189,30 @@ fn build(
             let look = |u: V| ops[&u];
             match out_ref {
                 Ref::Bun(o) => cg.emit_bundle(g, v, o, &look, &|_| None, &|_| false, &what),
-                r => cg.emit_from_bundle(g, v, r.sig(), 1, None, &look, &what),
+                r => cg.emit_from_bundle(g, v, r.sig(), m, None, &look, &what),
             }
             continue;
         }
         let out = out_ref.sig();
         match g.op(v).clone() {
             Op::Ar(op, a, bb) => {
-                let (r, red) = dl.read(cg, &[(a, t), (bb, t)])?;
+                let (mut r, red) = dl.read(cg, &[(a, t), (bb, t)])?;
+                // Times `m` (see `pipeline::wire_sums`): `-(x - y)` is `y - x`, `-(x / k)` is
+                // `x / -k`, constant factors multiply.
+                match (op, r[0].0, r[1].0) {
+                    _ if m == 1 => {}
+                    (ArOp::Sub, ..) if m == -1 => r.swap(0, 1),
+                    (ArOp::Mul, _, Operand::Const(k)) | (ArOp::Div, _, Operand::Const(k)) => r[1].0 = Operand::Const(k * m),
+                    (ArOp::Mul, Operand::Const(k), _) => r[0].0 = Operand::Const(k * m),
+                    _ => unreachable!("not a wire sum part"),
+                }
                 let k = Kind::Arith(Arith { first: r[0].0, first_nets: r[0].1, second: r[1].0, second_nets: r[1].1, op, out });
                 let id = cg.core(k, format!("{what}: arithmetic"));
                 dl.attach(cg, id, red);
             }
             Op::Cmp(op, a, bb) => {
                 let (r, red) = dl.read(cg, &[(a, t), (bb, t)])?;
-                let id = cg.core(dec_const(vec![cond(r[0], op, r[1])], out, 1), format!("{what}: comparison"));
+                let id = cg.core(dec_const(vec![cond(r[0], op, r[1])], out, m), format!("{what}: comparison"));
                 dl.attach(cg, id, red);
             }
             Op::Mux { .. } | Op::Sel(_) => {
@@ -190,12 +226,23 @@ fn build(
                     if g.as_const(val) == Some(0) {
                         continue;
                     }
+                    if inline.contains(&cv) {
+                        // The condition's own literals, as of the select's input tick.
+                        let Some(k) = g.as_const(val) else { unreachable!("inlined conditions choose constants") };
+                        let d = cond_dnf(g, cv);
+                        let ops: Vec<(V, i32)> = d.iter().flatten().flat_map(|l| [(l.a, t), (l.b, t)]).collect();
+                        let (r, red) = dl.read(cg, &ops)?;
+                        let terms = dl_terms(&d, &r, &cond);
+                        let id = cg.core(dec_const(distribute(&[], &terms), out, k * m), format!("{what}: select"));
+                        dl.attach(cg, id, red);
+                        continue;
+                    }
                     let (r, red) = dl.read(cg, &[(cv, t), (val, t)])?;
                     let id = match r[1].0 {
                         Operand::Const(0) => continue,
                         Operand::Const(k) => {
                             let ne = cond(r[0], CmpOp::Ne, (Operand::Const(0), Nets::BOTH));
-                            cg.core(dec_const(vec![ne], out, k), format!("{what}: select"))
+                            cg.core(dec_const(vec![ne], out, k * m), format!("{what}: select"))
                         }
                         Operand::Sig(_) => {
                             let k = Kind::Arith(Arith { first: r[1].0, first_nets: r[1].1, second: r[0].0, second_nets: r[0].1, op: ArOp::Mul, out });
@@ -210,7 +257,7 @@ fn build(
                     let ops: Vec<(V, i32)> = d.iter().flatten().flat_map(|l| [(l.a, t), (l.b, t)]).collect();
                     let (r, red) = dl.read(cg, &ops)?;
                     let terms = dl_terms(&d, &r, &cond);
-                    let id = cg.core(dec_const(distribute(&[], &terms), out, k), format!("{what}: condition"));
+                    let id = cg.core(dec_const(distribute(&[], &terms), out, k * m), format!("{what}: condition"));
                     dl.attach(cg, id, red);
                 }
             }
@@ -317,12 +364,68 @@ fn build(
     Ok(((direct, direct_red, if registers { 1 } else { o as u32 }), used))
 }
 
+/// Conditions (comparisons, or one-arm conditions worth 1) used only to choose nonzero
+/// constants in selects: each such arm's decider can test the condition itself.
+fn inline_conds(g: &Graph, nodes: &[V], roots: &[V]) -> HashSet<V> {
+    let arms = |m: V| -> Option<Vec<(V, V)>> {
+        match g.op(m) {
+            Op::Mux { t, f, a, b } => Some(vec![(*t, *a), (*f, *b)]),
+            Op::Sel(arms) => Some(arms.clone()),
+            _ => None,
+        }
+    };
+    let mut users: HashMap<V, Vec<V>> = HashMap::new();
+    for &v in nodes {
+        for u in g.operands(v) {
+            users.entry(u).or_default().push(v);
+        }
+    }
+    nodes
+        .iter()
+        .copied()
+        .filter(|&c| {
+            let boolean = match g.op(c) {
+                Op::Cmp(_, a, _) => g.as_const(*a).is_none(),
+                Op::Dec(arms) => arms.len() == 1 && arms[0].1 == 1,
+                _ => false,
+            };
+            boolean
+                && !roots.contains(&c)
+                && users.get(&c).is_some_and(|us| {
+                    us.iter().all(|&m| {
+                        arms(m).is_some_and(|arms| {
+                            arms.iter().all(|&(cv, x)| match g.as_const(x) {
+                                Some(0) => true,
+                                _ if x == c => false,
+                                Some(_) => true,
+                                None => cv != c,
+                            })
+                        })
+                    })
+                })
+        })
+        .collect()
+}
+
+/// An inlinable condition as a DNF of literals.
+fn cond_dnf(g: &Graph, c: V) -> crate::ir::Dnf {
+    match g.op(c) {
+        Op::Cmp(op, a, b) => vec![vec![Lit { a: *a, op: *op, b: *b }]],
+        Op::Dec(arms) => arms[0].0.clone(),
+        _ => unreachable!("not a condition"),
+    }
+}
+
 /// Decider conditions for `d`, whose literals' operands (`a`, `b` of each, in order) were
 /// read as `r`.
 fn dl_terms(d: &crate::ir::Dnf, r: &[(Operand, Nets)], cond: &dyn Fn((Operand, Nets), CmpOp, (Operand, Nets)) -> Cond) -> CDnf {
     let mut r = r.iter();
     d.iter().map(|term| term.iter().map(|l| cond(*r.next().unwrap(), l.op, *r.next().unwrap())).collect()).collect()
 }
+
+/// Operands as read by one combinator (each with the wires to read it on), and the carry
+/// wire to connect to its red input.
+type Reads = (Vec<(Operand, Nets)>, Option<usize>);
 
 /// Operands delayed to their consumer's iteration (see the module docs).
 struct Delays<'a> {
@@ -450,7 +553,7 @@ impl Delays<'_> {
     /// most of them share comes from a carry wire on red, if there's one that far; the rest
     /// come from the bus on green. Returns each operand with the wires to read it on, and
     /// the carry wire to connect to the combinator's red input ([`Delays::attach`]).
-    fn read(&mut self, cg: &mut Cg, ops: &[(V, i32)]) -> Result<(Vec<(Operand, Nets)>, Option<usize>), Diag> {
+    fn read(&mut self, cg: &mut Cg, ops: &[(V, i32)]) -> Result<Reads, Diag> {
         let mut by_delay: BTreeMap<i32, BTreeSet<V>> = BTreeMap::new();
         for &(u, at) in ops {
             if let Some((_, d)) = self.delayed(u, at) {

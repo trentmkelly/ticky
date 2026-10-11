@@ -738,3 +738,78 @@ test "shared registers":
     let e = error_of("input  a: int @ A\noutput o: int @ O\nwait 1\nx = a\no = x\nwait 1\no = y + 1\ny = a + 2\nwait 1\no = y\n");
     assert!(e.contains("`y` might be used before it's assigned"), "{e}");
 }
+
+#[test]
+fn pipelines_share_delays() {
+    // Values needed several ticks after they're computed come off shared carry wires (one
+    // combinator per tick for the whole block, not a delay chain per value), the sums are on
+    // the wire and the start-up delay is a counter. Before these: 50 combinators in the
+    // block, latency 11.
+    let src = r#"input  x: int @ X
+input  y: int @ Y
+output s: int @ S
+output last: int @ L
+output tot: int @ T
+last = 0
+tot = 0
+every tick:
+    p = x * y
+    q = (x - y) * (x + y)
+    s = (p > 10) + (q > 2) - (x > y) + p * 2 - q
+    if s > 50 and x > 0:
+        last = s + y
+    tot += s
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    let b = &c.cg.blocks[0];
+    assert!(b.combinators <= 25 && b.latency == Some(8), "{} combinators, latency {:?}", b.combinators, b.latency);
+    let desc = |e: &ticky_factorio::netlist::Entity| e.description.clone().unwrap_or_default();
+    assert!(c.cg.netlist.entities.iter().any(|e| desc(e).contains("carry 2")));
+    assert!(c.cg.netlist.entities.iter().any(|e| desc(e).contains("start-up counter")));
+    // Inputs that change every tick: every output is the value for the inputs `latency`
+    // ticks earlier, all from the same iteration, and a restart after RUN off is exactly
+    // like the first start.
+    use ticky_compiler::testrun::{Harness, PVal};
+    let port = |n: &str| c.program.port_index(n).unwrap();
+    let int = |v: PVal| match v {
+        PVal::Int(k) => k,
+        PVal::Bun(_) => unreachable!(),
+    };
+    let input = |t: i64| (((t * 7) % 13) as i32 - 4, ((t * 5) % 11) as i32 - 3);
+    let f = |(x, y): (i32, i32)| {
+        let (p, q) = (x * y, (x - y) * (x + y));
+        (p > 10) as i32 + (q > 2) as i32 - (x > y) as i32 + p * 2 - q
+    };
+    let mut h = Harness::new(&c);
+    let drive = |h: &mut Harness, ticks: i64| -> Vec<[i32; 3]> {
+        (0..ticks)
+            .map(|t| {
+                let (x, y) = input(t);
+                h.set(port("x"), PVal::Int(x));
+                h.set(port("y"), PVal::Int(y));
+                h.sim.step();
+                [int(h.get(port("s"))), int(h.get(port("last"))), int(h.get(port("tot")))]
+            })
+            .collect()
+    };
+    let first = drive(&mut h, 120);
+    let lat = (0..30).find(|&l| (40..120).all(|t| first[t as usize][0] == f(input(t - l)))).expect("s follows the inputs");
+    let (mut last, mut tot) = (0, 0);
+    let start = (0..120).find(|&t| first[t][2] != 0).unwrap();
+    for (t, row) in first.iter().enumerate().skip(start) {
+        let (x, y) = input(t as i64 - lat);
+        if row[0] > 50 && x > 0 {
+            last = row[0] + y;
+        }
+        tot += row[0];
+        assert_eq!((row[1], row[2]), (last, tot), "registers at tick {t}");
+    }
+    h.sim.set_constant_on(c.cg.run_switch, false);
+    h.set(port("x"), PVal::Int(0));
+    h.set(port("y"), PVal::Int(0));
+    for _ in 0..30 {
+        h.sim.step();
+    }
+    h.sim.set_constant_on(c.cg.run_switch, true);
+    assert_eq!(drive(&mut h, 120), first);
+}
