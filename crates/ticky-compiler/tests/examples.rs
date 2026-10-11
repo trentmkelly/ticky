@@ -732,7 +732,8 @@ test "shared registers":
     for r in run_tests(&c, src) {
         assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
     }
-    let holds: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).filter(|d| d.starts_with("variable") && d.ends_with("(hold)")).collect();
+    // (Registers held under the same conditions share a hold decider: count its parts.)
+    let holds: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).flat_map(|d| d.split("; ")).filter(|d| d.starts_with("variable") && d.ends_with("(hold)")).collect();
     // `t`, `s`, one loop counter and the three outputs (9 without sharing).
     assert_eq!(holds.len(), 6, "{holds:?}");
     let e = error_of("input  a: int @ A\noutput o: int @ O\nwait 1\nx = a\no = x\nwait 1\no = y + 1\ny = a + 2\nwait 1\no = y\n");
