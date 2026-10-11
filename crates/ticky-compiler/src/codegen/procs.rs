@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use ticky_factorio::*;
 use ticky_syntax::Diag;
 
-use super::registers::Writer;
+use super::registers::{increments, own_node, Writer};
 use super::*;
 use crate::fuse::{LoadVal, WriterPlan};
 use crate::ir::{Lit, V};
@@ -42,8 +42,19 @@ pub(super) fn main_proc(
     }
     let src = |s: u32| src_ref[s as usize];
     let mut steps = m.steps.clone();
+    // Per step and plan: which loads are increments (scalar variables only).
+    let mut incs: Vec<Vec<Vec<bool>>> = Vec::new();
     for s in &mut steps {
         s.plans.retain(|(si, _)| live[*si]);
+        incs.push(
+            s.plans
+                .iter_mut()
+                .map(|(si, plan)| match shared.state(*si) {
+                    Ref::Op(_) => increments(g, own_node(g, &m.srcs, *si), plan),
+                    Ref::Bun(_) => vec![false; plan.loads.len()],
+                })
+                .collect(),
+        );
     }
     let roots: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
     let nodes = cg.logic(g, &roots, &src, &m.name)?;
@@ -181,18 +192,20 @@ pub(super) fn main_proc(
             continue;
         }
         let mut ws = Vec::new();
+        let mut my_incs = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let Some((cms, prefix)) = &cm[i] else { continue };
-            for (w, plan) in &step.plans {
+            for (j, (w, plan)) in step.plans.iter().enumerate() {
                 if *w == si {
                     ws.push(Writer { en: *cms, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit });
+                    my_incs.push(incs[i][j].clone());
                 }
             }
         }
         let name = format!("variable {}", s.display_name());
         match shared.state(si) {
             Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,
-            r => cg.register(r.sig(), s.init, &ws, &name)?,
+            r => cg.register_incs(r.sig(), s.init, &ws, &my_incs, &name)?,
         }
     }
     for (func, &r) in &ret_sig {

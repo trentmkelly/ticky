@@ -4,7 +4,7 @@
 use ticky_factorio::*;
 use ticky_syntax::Diag;
 
-use super::registers::Writer;
+use super::registers::{increments, own_node, Writer};
 use super::*;
 use crate::fuse::WriterPlan;
 use crate::ir::{Lit, V};
@@ -50,7 +50,15 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
         let (raw, name) = shared.raw(p, kind);
         src_ref.push(if let SrcKind::Own(_) = kind { raw } else { cg.sample_ref(raw, ei, &format!("{what}: {name}"))? });
     }
-    let plans: Vec<&(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).collect();
+    // Live states' plans, with increments split out (scalar states only).
+    let mut plans: Vec<(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).cloned().collect();
+    let incs: Vec<Vec<bool>> = plans
+        .iter_mut()
+        .map(|(si, plan)| match shared.state(*si) {
+            Ref::Op(_) => increments(&b.graph, own_node(&b.graph, &b.srcs, *si), plan),
+            Ref::Bun(_) => vec![false; plan.loads.len()],
+        })
+        .collect();
     let mut roots: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
     roots.extend(b.checks.iter().map(|ck| ck.fail));
     let src = |s: u32| src_ref[s as usize];
@@ -64,15 +72,14 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
         if s.owner != Some(bi) || !live[si] {
             continue;
         }
-        let ws: Vec<Writer> = plans
-            .iter()
-            .filter(|(w, _)| *w == si)
-            .map(|(_, plan)| Writer { en: es, prefix: es_prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit })
-            .collect();
+        let mine: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].0 == si).collect();
+        let ws: Vec<Writer> =
+            mine.iter().map(|&i| Writer { en: es, prefix: es_prefix.clone(), plan: &plans[i].1, val: &loc, lit: &lit, lit_eg: &lit }).collect();
+        let my_incs: Vec<Vec<bool>> = mine.iter().map(|&i| incs[i].clone()).collect();
         let name = format!("state {}", s.display_name());
         match shared.state(si) {
             Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,
-            r => cg.register(r.sig(), s.init, &ws, &name)?,
+            r => cg.register_incs(r.sig(), s.init, &ws, &my_incs, &name)?,
         }
     }
     cg.flush_shared(false);

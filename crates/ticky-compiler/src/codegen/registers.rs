@@ -10,7 +10,8 @@ use ticky_syntax::Diag;
 
 use super::*;
 use crate::fuse::{is_true, LoadVal, WriterPlan};
-use crate::ir::{Lit, V};
+use crate::ir::{Graph, Lit, Op, V};
+use crate::program::SrcKind;
 
 /// A decider waiting for others with the same conditions.
 pub(super) struct Pending {
@@ -65,14 +66,44 @@ impl Cg {
     /// (`prefix`, used to time enable pulses for guarded loads) and a plan. When no load
     /// fires, the register holds. ST loads `init`.
     pub(super) fn register(&mut self, x: Sig, init: i32, writers: &[Writer], name: &str) -> Result<(), Diag> {
+        self.register_incs(x, init, writers, &[], name)
+    }
+
+    /// [`Cg::register`], where `incs[w][l]` marks writer `w`'s load `l` as an increment (see
+    /// [`increments`]): it adds its value while the register keeps holding. Constant
+    /// increments check their guard on the commit tick (one decider each).
+    pub(super) fn register_incs(&mut self, x: Sig, init: i32, writers: &[Writer], incs: &[Vec<bool>], name: &str) -> Result<(), Diag> {
         let mut hold: CDnf = vec![vec![c(self.st, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)]];
-        for w in writers {
+        for (wi, w) in writers.iter().enumerate() {
+            let inc = |l: usize| incs.get(wi).is_some_and(|i| i[l]);
             let unconditional = w.plan.loads.len() == 1 && is_true(&w.plan.loads[0].guard);
             let mut factor: CDnf = vec![vec![]];
-            if unconditional {
+            if unconditional && !inc(0) {
                 factor = vec![vec![c(w.en, CmpOp::Eq, 0)]];
             }
-            for l in &w.plan.loads {
+            for (li, l) in w.plan.loads.iter().enumerate() {
+                if inc(li) {
+                    match l.val {
+                        LoadVal::Const(0) => {}
+                        LoadVal::Const(k) => {
+                            let guard = lits(&l.guard, w.lit);
+                            self.core(dec_const(distribute(&[c(w.en, CmpOp::Ne, 0)], &guard), x, k), format!("{name} (increment)"));
+                        }
+                        LoadVal::Node(v) => {
+                            let en = if is_true(&l.guard) {
+                                w.en
+                            } else {
+                                let eg = self.alloc()?;
+                                let early = lits(&l.guard, w.lit_eg);
+                                self.core(dec_const(distribute(&w.prefix, &early), eg, 1), format!("{name} (increment condition)"));
+                                eg
+                            };
+                            let s = (w.val)(v).sig();
+                            self.core(arith(Operand::Sig(s), ArOp::Mul, Operand::Sig(en), x), format!("{name} (increment)"));
+                        }
+                    }
+                    continue;
+                }
                 if unconditional {
                     match l.val {
                         LoadVal::Const(0) => {}
@@ -220,6 +251,48 @@ impl Cg {
             Ref::Op(Operand::Const(_)) => unreachable!("sampling a constant"),
         })
     }
+}
+
+/// Increments: a load of `own + a` (or `own ± k`) can add `a` to a register that keeps
+/// holding, instead of replacing its value: no adder, and the hold doesn't stop for it (when
+/// every load is one, it shares the program-wide `[ST=0 ∧ RUN≠0]` hold). Rewrites such loads
+/// of `plan` in place; the result says which loads are now increments. `own` is the
+/// register's own value in `g`.
+pub(super) fn increments(g: &Graph, own: Option<V>, plan: &mut WriterPlan) -> Vec<bool> {
+    let Some(own) = own else { return vec![false; plan.loads.len()] };
+    let mut out = Vec::new();
+    for l in &mut plan.loads {
+        let LoadVal::Node(v) = l.val else {
+            out.push(false);
+            continue;
+        };
+        let step = match *g.op(v) {
+            Op::Ar(ArOp::Add, a, b) if a == own => Some((b, 1)),
+            Op::Ar(ArOp::Add, a, b) if b == own => Some((a, 1)),
+            Op::Ar(ArOp::Sub, a, b) if a == own => Some((b, -1)),
+            _ => None,
+        };
+        let val = match step {
+            Some((a, sign)) => match g.as_const(a) {
+                Some(k) => k.checked_mul(sign).map(LoadVal::Const),
+                None if sign == 1 => Some(LoadVal::Node(a)),
+                None => None,
+            },
+            None => None,
+        };
+        out.push(val.is_some());
+        if let Some(val) = val {
+            l.val = val;
+            l.direct = false;
+        }
+    }
+    out
+}
+
+/// The node of state `si`'s own value in a graph whose sources are `srcs`.
+pub(super) fn own_node(g: &Graph, srcs: &[SrcKind], si: usize) -> Option<V> {
+    let s = srcs.iter().position(|k| *k == SrcKind::Own(si))?;
+    g.nodes.iter().position(|o| *o == Op::Src(s as u32)).map(|v| v as V)
 }
 
 /// One writer of a register, as seen by codegen.
