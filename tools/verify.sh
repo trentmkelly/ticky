@@ -17,6 +17,7 @@ echo "== cargo build --release"
 cargo build --release || { echo "verify: build failed"; exit 1; }
 cp target/release/ticky "$DIR/ticky"
 export TICKY="$DIR/ticky"
+export FUZZ_KEEP="${FUZZ_KEEP:-/tmp/ticky-verify-$$-programs}"  # failing fuzz_level2 programs
 
 echo "== cargo test --release"
 cargo test --release || fail+=("cargo test")

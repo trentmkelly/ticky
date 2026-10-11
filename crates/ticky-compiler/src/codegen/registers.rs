@@ -120,7 +120,7 @@ impl Cg {
     /// increments check their guard on the commit tick (one decider each), as do staged
     /// loads (`Writer::stage`).
     pub(super) fn register_incs(&mut self, x: Sig, init: i32, writers: &[Writer], incs: &[Vec<bool>], name: &str) -> Result<(), Diag> {
-        let mut hold: CDnf = vec![vec![c(self.st, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)]];
+        let mut factors: Vec<(Sig, CDnf)> = Vec::new();
         for (wi, w) in writers.iter().enumerate() {
             let inc = |l: usize| incs.get(wi).is_some_and(|i| i[l]);
             let unconditional = w.plan.loads.len() == 1 && is_true(&w.plan.loads[0].guard);
@@ -198,8 +198,9 @@ impl Cg {
                 either.extend(lits(keep, w.lit));
                 factor = cand(&factor, &either);
             }
-            hold = cand(&hold, &factor);
+            factors.push((w.en, factor));
         }
+        let hold = hold_of(vec![c(self.st, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)], factors);
         self.hold(distribute(&[], &hold), x, name);
         if init != 0 {
             self.shared(vec![c(self.st, CmpOp::Ne, 0)], out_const(x, init), format!("{name} (initial value {init})"));
@@ -311,6 +312,32 @@ impl Cg {
             Ref::Op(Operand::Const(_)) => unreachable!("sampling a constant"),
         })
     }
+}
+
+/// Most terms of a hold condition built as the product of its writers' factors.
+const MAX_HOLD_TERMS: usize = 16;
+
+/// A register's hold condition: `base` and every writer's factor (its commit pulse, then
+/// what holds while it isn't loading). Distributed, that's a product of the factors' terms,
+/// which grows exponentially with writers that have direct loads (each factor is `en = 0`
+/// or its `keep`). Past [`MAX_HOLD_TERMS`] it uses that a register's writers are steps of
+/// one process or one `every` block (the single-writer rule), so at most one commits on a
+/// tick, and a factor holds whenever its writer isn't committing: the hold is "no writer
+/// commits, or the one committing keeps" — one term per writer's term.
+fn hold_of(base: Vec<Cond>, factors: Vec<(Sig, CDnf)>) -> CDnf {
+    let factors: Vec<(Sig, CDnf)> = factors.into_iter().filter(|(_, f)| *f != vec![vec![]]).collect();
+    if factors.iter().try_fold(1usize, |n, (_, f)| n.checked_mul(f.len()).filter(|&n| n <= MAX_HOLD_TERMS)).is_some() {
+        return factors.iter().fold(vec![base], |h, (_, f)| cand(&h, f));
+    }
+    let mut idle = base.clone();
+    idle.extend(factors.iter().map(|(en, _)| c(*en, CmpOp::Eq, 0)));
+    let mut hold = vec![idle];
+    for (en, f) in &factors {
+        for t in f.iter().filter(|t| !t.contains(&c(*en, CmpOp::Eq, 0))) {
+            hold.push(base.iter().cloned().chain([c(*en, CmpOp::Ne, 0)]).chain(t.iter().cloned()).collect());
+        }
+    }
+    hold
 }
 
 /// One register's plan in one writer, for [`Cg::stage_loads`]. `key` names the plan, `writer`

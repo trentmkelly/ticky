@@ -1271,3 +1271,35 @@ such passes on one wire, where they added up (arr[0] = 3 instead of 1 for x = y 
 the bisect that blamed the merge used `git archive` trees built into one shared
 CARGO_TARGET_DIR, where path packages share artifact names and old source mtimes leave stale
 binaries — build each tree with its own target dir. Bench unchanged.
+## 2026-10-11: fix — staged select vs. bundle write sharing a name; unread flattened stages; exponential holds
+
+- **fuzz_level2 seed 61** (`staged_select_and_bundle_write_of_one_cluster`): a staged select
+  (`c = x if x else x % y`, computed under c's register signal onto a staging wire) and a
+  select written straight into a bundle (`arr[3] = a if x else 9`, named after the element's
+  signal) both name their passed values on the cluster's private wire after their own
+  signal. A register's signal can be the same as a bundle element's (they live on different
+  wires), so the two passes added up (arr[3] = a + c). The bundle-write dedupe from the fix
+  above now starts with the staged stages' names. Introduced by staged loads (0e13233);
+  the earlier dedupe didn't look at staged names.
+- **fuzz_level2 seed 65** (`stage_of_a_flattened_select_left_unread`): a panic
+  (`cluster[m]`) in `logic`. Selects under the same condition flatten into the outer one,
+  leaving an inner select unread, but its stage was still in `plan.stages` and its passes
+  in `pass_of`, which pointed at a select with no cluster. `pass_of` now only lists stages
+  still read. Introduced by the tuple-assignment fix (6c2a770) making that shape.
+- **Exponential hold conditions** (`hold_of_many_writers_with_direct_loads`; a fuzz_procs
+  seed-4 program whose `build`/`sim` ran for minutes and GBs): a register's hold is the
+  product over its writers of "not committing, or keeping" factors, and with direct loads
+  in many steps that distributed to millions of decider conditions (12,457,152 there; 2^20
+  for 20 steps of `if x > i: a = k`). Pre-existing (fd5c4f5 fails the test program too);
+  staged loads (0e13233) made far more loads direct, so many more programs hit it.
+  `registers::hold_of`: past 16 terms, uses the single-writer rule (a register's writers
+  are steps of one process or `every` block, so at most one commits per tick): "no writer
+  commits, or the committing one keeps", one term per factor term (102 conditions there).
+- fuzz_level2 keeps failing programs: `FUZZ_KEEP=DIR` copies them there as
+  `level2-sSEED-N.ticky` (verify.sh sets it); passing programs are deleted. reduce_level2.py
+  handles `every` programs, and its `_c(...)` checks accept parenthesised tuples (how
+  `ast.unparse` writes tuple assignments).
+- Sibling hunt: fuzz_level2 seeds 61–80 at 200 clean but for "ran out of signals" (75, 77);
+  the other fuzzers at 150–200 on seeds 2–5 clean but for the hold above; after the fixes
+  fuzz_procs seeds 4, 6–9 and fuzz_programs 2–4 (300) clean. Bench unchanged (1696).
+  `FUZZ_N=200 tools/verify.sh` all passed; in-game 36/36 examples and cubium MATCH.

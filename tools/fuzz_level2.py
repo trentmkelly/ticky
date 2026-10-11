@@ -9,15 +9,19 @@ one `every` block instead of the main program. Final values are compared with Py
 execution.
 
 usage: tools/fuzz_level2.py [COUNT] [SEED]
+With FUZZ_KEEP=DIR, failing programs are also copied there (as level2-sSEED-N.ticky, kept
+when temp files get cleaned up); passing programs are deleted.
 """
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 
 TICKY = os.environ.get("TICKY", "./target/debug/ticky")
+KEEP = os.environ.get("FUZZ_KEEP")
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
 
 
@@ -160,12 +164,23 @@ def checked_line(line):
 def run_python(src):
     """Final (a, b, c, arr) under Python semantics, or None on overflow/division by zero."""
     checked = "\n".join(checked_line(line) for line in src)
-    env = {"_c": check, "sum": lambda xs: check(sum(xs))}
+    # `_c(a, b)` comes from a parenthesised tuple (as ast.unparse writes them).
+    env = {"_c": lambda *v: check(v[0]) if len(v) == 1 else tuple(map(check, v)), "sum": lambda xs: check(sum(xs))}
     try:
         exec(checked, env)  # pylint: disable=exec-used
         return tuple(check(env[v]) for v in ["a", "b", "c"]) + tuple(check(v) for v in env["arr"])
     except (Overflow, ZeroDivisionError, RecursionError):
         return None
+
+
+def keep(path, seed, n):
+    """Where the failing program at `path` is kept (a copy in FUZZ_KEEP, if set)."""
+    if not KEEP:
+        return path
+    os.makedirs(KEEP, exist_ok=True)
+    dest = os.path.join(KEEP, f"level2-s{seed}-{n}.ticky")
+    shutil.copy(path, dest)
+    return dest
 
 
 def main():  # pylint: disable=too-many-locals
@@ -209,15 +224,18 @@ def main():  # pylint: disable=too-many-locals
         out = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if out.returncode != 0 and every and "too much branching" in out.stderr:
             tested -= 1  # an `every` block's limit on unrolled `break`s, not a bug
+            os.unlink(path)
             continue
         if out.returncode != 0:
             failed += 1
-            print(f"COMPILE FAILURE ({path}):\n{out.stderr[-1500:]}")
+            print(f"COMPILE FAILURE ({keep(path, seed, tested)}):\n{out.stderr[-1500:]}")
             continue
         last = [int(v) for v in out.stdout.strip().splitlines()[-1].split()[1:]]
         if tuple(last[:7]) != want or last[7] != 1:
             failed += 1
-            print(f"MISMATCH ({path}) x={x} y={y}: python {want}, ticky {tuple(last[:7])} done={last[7]}")
+            print(f"MISMATCH ({keep(path, seed, tested)}) x={x} y={y}: python {want}, ticky {tuple(last[:7])} done={last[7]}")
+        else:
+            os.unlink(path)
     print(f"{tested} programs, {failed} failures")
     sys.exit(1 if failed else 0)
 

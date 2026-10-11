@@ -1435,3 +1435,128 @@ test "x=2, y=-9":
         assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
     }
 }
+
+#[test]
+fn staged_select_and_bundle_write_of_one_cluster() {
+    // `c`'s select is staged (computed under its register's signal onto a staging wire) and
+    // `arr[3]`'s writes the array element's signal straight into the bundle: both name their
+    // passed values on the cluster's wire after those signals, which were the same one, so
+    // the passes added up (arr[3] came out a + c = -1 for x = -6, y = -17). Found by
+    // fuzz_level2 seed 61.
+    let src = r#"input x: int @ X
+input y: int @ Y
+output o0: int @ A
+output o1: int @ B
+output o2: int @ C
+output o3: int @ E
+output o4: int @ F
+output o5: int @ G
+output o6: int @ H
+output done: bool @ D
+if True:
+    arr = [0, 0, 0, 0]
+    a = 0
+    b = 5
+    c = 2
+    if y:
+        a = b
+        arr[y % 4] = a
+        c = x if x else x % y
+    arr[2], arr[3] = (1, a if x else 9)
+    o0 = a
+    o1 = b
+    o2 = c
+    o6 = arr[3]
+    done = True
+
+test "x=-6, y=-17":
+    set x = -6
+    set y = -17
+    run 20 ticks
+    assert o0 == 5 and o2 == -6 and o6 == 5
+
+test "x=3, y=2":
+    set x = 3
+    set y = 2
+    run 20 ticks
+    assert o0 == 5 and o2 == 3 and o6 == 5
+
+test "x=0, y=5":
+    set x = 0
+    set y = 5
+    run 20 ticks
+    assert o0 == 5 and o2 == 0 and o6 == 9
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+    }
+}
+
+#[test]
+fn stage_of_a_flattened_select_left_unread() {
+    // `f0`'s inlined selects under the same condition flatten into the outer one, which
+    // leaves an inner select (and the stage planned for it) unread. Its passes were still
+    // put on its cluster's wire, which it doesn't have: a panic. Found by fuzz_level2 seed 65.
+    let src = r#"input x: int @ X
+input y: int @ Y
+output o1: int @ B
+output o2: int @ C
+arr = [3, -1, 4, 1]
+b = 1
+def f0(p, q):
+    if arr[3]:
+        return p - arr[q % 4]
+    return sum(arr) * q
+b, arr[2], b = y, 0, b
+c = f0(f0(y, y) or b, x) if y else 3
+o1 = b
+o2 = c
+
+test "x=0, y=0":
+    run 30 ticks
+    assert o1 == 1 and o2 == 3
+
+test "x=3, y=-2":
+    set x = 3
+    set y = -2
+    run 30 ticks
+    assert o1 == 1 and o2 == -3
+
+test "x=-5, y=7":
+    set x = -5
+    set y = 7
+    run 30 ticks
+    assert o1 == 1 and o2 == 5
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+    }
+}
+
+#[test]
+fn hold_of_many_writers_with_direct_loads() {
+    // Each step loads `a` under a condition the load decider checks itself, so the hold has
+    // a factor "not committing, or the condition fails" per step. Distributed, that was 2^20
+    // terms: a decider of millions of conditions (found as a fuzz_procs program that
+    // wouldn't build or simulate). Past a few terms the hold is one term per writer's term.
+    let mut src = String::from("input x: int @ X\noutput o: int @ A\na = 0\n");
+    for i in 1..=20 {
+        src += &format!("if x > {i}:\n    a = {}\nwait 2\n", 3 * i);
+    }
+    src += "o = a\n";
+    for (x, o) in [(-3, 0), (1, 0), (2, 3), (7, 18), (20, 57), (50, 60)] {
+        src += &format!("\ntest \"x={x}\":\n    set x = {x}\n    run 200 ticks\n    assert o == {o}\n");
+    }
+    let c = compile(&src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    let most = c.cg.netlist.entities.iter().filter_map(|e| match &e.kind {
+        ticky_factorio::netlist::Kind::Decider(d) => Some(d.conds.len()),
+        _ => None,
+    });
+    let most = most.max().unwrap();
+    assert!(most <= 102, "a decider with {most} conditions (102: [ST=0, RUN≠0] and 20 commit pulses = 0, then 4 per step)");
+    for r in run_tests(&c, &src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", &src)));
+    }
+}

@@ -44,13 +44,6 @@ impl Cg {
         }
         let plan = selects::plan(g, &producers, &is_root, &pre);
         let inline_cond = &plan.inline_cond;
-        // Each stage's passes, by value: (select, wire index — 0 for the cluster's own).
-        let mut pass_of: HashMap<V, (V, usize)> = HashMap::new();
-        for (&m, st) in &plan.stages {
-            for (i, &x) in st.passes.iter().enumerate() {
-                pass_of.insert(x, (m, i));
-            }
-        }
         // Operands as wired: a stage's reads; an inlined condition's own operands instead of it.
         let eff_operands = |v: V| -> Vec<V> {
             if let Some(st) = plan.stages.get(&v) {
@@ -70,6 +63,15 @@ impl Cg {
             }
             producers.into_iter().filter(|v| needed.contains(v)).collect()
         };
+        // Each stage's passes, by value: (select, wire index — 0 for the cluster's own). Only
+        // stages still read: a select flattened into another can keep a stage of its own that
+        // passes the same values (or values nothing else reads).
+        let mut pass_of: HashMap<V, (V, usize)> = HashMap::new();
+        for &m in &producers {
+            for (i, &x) in plan.stages.get(&m).map_or(&[][..], |st| &st.passes[..]).iter().enumerate() {
+                pass_of.insert(x, (m, i));
+            }
+        }
         if std::env::var_os("TICKY_DUMP_IR").is_some() {
             for &v in &producers {
                 if let Some(st) = plan.stages.get(&v) {
@@ -337,8 +339,10 @@ impl Cg {
         // Two selects of one cluster writing the same bundle signal (the same array element
         // in successive iterations of an unrolled loop) can't both name their passed values
         // after it on the cluster's wire, where they'd add up: later ones take a bus signal
-        // and their bundle copies it.
-        let mut named: std::collections::HashSet<(usize, Sig)> = Default::default();
+        // and their bundle copies it. Nor can one share a staged stage's name (a register's
+        // signal, which may be a bundle signal too).
+        let mut named: std::collections::HashSet<(usize, Sig)> =
+            producers.iter().filter(|m| plan.has_pass(**m)).filter_map(|m| staged.get(m).map(|&(x, _)| (cluster[m], x))).collect();
         for &m in &producers {
             if let Some(&(_, s)) = bundle_writes.get(&m).filter(|_| plan.has_pass(m)) {
                 if !named.insert((cluster[&m], s)) {
