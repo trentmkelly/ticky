@@ -907,3 +907,57 @@ every tick:
     h.sim.set_constant_on(c.cg.run_switch, true);
     assert_eq!(drive(&mut h, 120), first);
 }
+
+#[test]
+fn registers_share_and_increment() {
+    // Increments (`c += 1` under a condition, `t += a`, a reset), holds shared between
+    // registers and samples, staged inputs (`a`, `b`: only main samples them, one load) and
+    // two blocks of the same period on one clock.
+    let src = r#"input  a: int @ A
+input  b: int @ B
+output total: int @ T
+output count: int @ C
+output ticks1: int @ X
+output ticks2: int @ Y
+x1 = 0
+x2 = 5
+
+every 10 ticks:
+    x1 += 1
+    ticks1 = x1
+
+every 10 ticks:
+    x2 = x2 - 1
+    ticks2 = x2
+
+t = 0
+c = 0
+while True:
+    t += a
+    if b > 0:
+        c += 1
+    if t > 100:
+        t = 0
+    total = t
+    count = c
+
+test "behaviour":
+    set a = 7
+    set b = 1
+    run 60 ticks
+    assert ticks1 >= 5 and ticks2 == 5 - ticks1 and total > 0 and count > 0
+    set b = 0
+    run 200 ticks
+    assert total <= 100 and ticks1 + ticks2 == 5
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure);
+    }
+    let descs: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).collect();
+    let has = |s: &str| descs.iter().filter(|d| d.contains(s)).count();
+    assert_eq!(has("clock, period 10"), 1, "one shared clock");
+    assert!(has("(increment)") >= 3, "increments: {descs:?}");
+    assert_eq!(has("samples of main: inputs (load)"), 1, "staged inputs");
+    assert!(descs.iter().any(|d| d.contains("(hold); ") && d.contains("sample of")), "shared holds: {descs:?}");
+}
