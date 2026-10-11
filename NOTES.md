@@ -1028,3 +1028,46 @@ Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to 
 - Test `registers_share_and_increment`. Verification: no example grew; `FUZZ_N=100
   tools/verify.sh` passed; in-game difftest 36/36 MATCH plus difftest-cubium MATCH (frozen
   release copy, re-run after rebasing onto register sharing, select stages and pipe).
+
+## 2026-10-11: vectorised range comprehensions (expand/vectorize.rs)
+
+Branch `opt/vectorize`. sorting 210 → 129 (−81), nothing else changes (1957 → 1876, on main
+after the register changes; 231 → 134 before them).
+- `[f(k, x…) for k in range(…)]` (no filter; any start/step; `f` arithmetic, comparisons,
+  selects, `min`/`max`/`abs`, `//`/`%` by constants, no array reads or user calls on `k`)
+  is still unrolled into its elements, and also recorded (keyed by the elements' `Debug`
+  text: equal elements mean equal values at the same point) as banks `#vec({s: f(c + step·v)
+  for s, v in #aidx(nb).items()}, #arr(elements))`. `banks_of` uses those when the elements
+  would become a signal array's banks; registers, element reads etc. still take the elements.
+- The position table holds `k + 1` (never 0), so every slot is in the comprehension's domain
+  and `bundle::Conv` handles intermediate zeros as usual (scalars spread over the domain by
+  constant filters that fold). Inside a comprehension `//` and `%` truncate, so the floor
+  versions by a constant `c` (|c| < 2^30) are rewritten: `tmod(tmod(a, c) + c, c)` and
+  `tdiv(a, c) - (1 if tmod(a, c) < 0 else 0)` (`> 0` for c < 0), exact with wrapping.
+  A non-constant divisor anywhere (even loop-invariant) keeps the unrolled form.
+- `#vec(a, b)` (lower.rs `vec_or_unrolled`) lowers both and keeps the one adding fewer
+  operations (`added_ops`: non-constant nodes, bundle terms other than constants and `One`);
+  ties and lowering errors keep the unrolled one; the loser's runtime checks are dropped.
+  Comparisons/`min` on `k` usually lose (each is a filter over the bundle).
+- The element must be checked syntactically before expanding it with `k` non-constant
+  (`elementwise`): `zs[k]` would otherwise look like a runtime index and make `zs` a signal
+  array as a side effect (that's how I found the next point).
+- Signal-array choices (expand.rs `assign_to`): an array assigned from a recorded
+  comprehension with ≥ 2 arithmetic steps on `k` (and no comparisons/selects) is a signal
+  array; and an array first assigned a signal array's value (`zs = sorted(xs)`) whose name
+  is never written element by element anywhere (`element_writes`, by bare name) is kept as a
+  signal array instead of copied into registers (a read + register per element). In sorting
+  the comprehension took −69, `zs` −28. Without the element-write rule stats' `sort(xs)`
+  (bubble sort on a parameter in an `every` block) became a signal array and too deep.
+- `TICKY_NO_VECTORISE=1` turns off the comprehension part (not the `sorted` rule).
+- New `tools/fuzz_comps.py` (in verify.sh via the glob): range comprehensions with random
+  ranges and elements (30% sorting-shaped), constant/runtime reads, `sum`, `sorted`, element
+  writes, main program or `every 60 ticks`; about a quarter take the bundle form. About
+  1,300 programs over the builds, clean; fuzz_level2/bundles/programs/procs 300 each (seed 7) clean;
+  `FUZZ_N=100 tools/verify.sh` clean. 140 random comprehension programs: none larger
+  with vectorisation on, 9 smaller. Test `vectorised_range_comprehensions` (216 → 72 in the
+  report).
+- In-game: all 36 examples MATCH (sorting 3199 ticks); a probe (floor `%` and `//` by a
+  negative constant over a stepped range, `min`/`abs` elements, runtime reads, `sum`,
+  `sorted`; INT_MIN/INT_MAX inputs) MATCH 399 ticks (117 combinators, 415 unrolled). Both
+  re-run after rebasing onto main (frozen release copy).

@@ -926,6 +926,14 @@ where operands must stay in step, with the restrictions noted):
   adder, and a constant step is one decider. Registers and samples held under the same
   conditions share one hold decider, all initial values are one decider, and blocks of the
   same period share a clock.
+- **Vectorised range comprehensions.** `[(k * seed) % 41 - 20 for k in range(N)]` is built
+  as bundle operations on the position table (`k` on element `k`'s signal) when that takes
+  fewer operations than one copy per element: about one combinator per operation, whatever
+  `N`. The element may use arithmetic, comparisons, `x if c else y`, `min`/`max`/`abs`,
+  and `//`/`%` by constants (with Python's floor semantics); any range. An array assigned
+  from such a comprehension (two or more arithmetic steps per element) is a signal array, as
+  is one first assigned another signal array's value (like `sorted(xs)`) and never written
+  element by element.
 
 ### 11.3 Cost report
 

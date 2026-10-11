@@ -962,3 +962,45 @@ test "behaviour":
     assert_eq!(has("samples of main: inputs (load)"), 1, "staged inputs");
     assert!(descs.iter().any(|d| d.contains("(hold); ") && d.contains("sample of")), "shared holds: {descs:?}");
 }
+
+/// Range comprehensions of arithmetic in the range variable are bundle operations on the
+/// position table (expand/vectorize.rs), with Python's floor `%` and `//` (negative divisor
+/// too) and ranges with a start and step; an array assigned from one is a signal array.
+/// The report counts 216 combinators unrolled, 72 vectorised.
+#[test]
+fn vectorised_range_comprehensions() {
+    let src = r#"input  s: int @ S
+input  i: int @ I
+output a: int @ A
+output b: int @ B
+output c: int @ C
+output d: int @ D
+every 30 ticks:
+    xs = [(k * s) % 41 - 20 for k in range(16)]
+    ys = [(k * s + 7) // -6 for k in range(-9, 30, 3)]
+    a = xs[i % 16]
+    b = sum(xs)
+    c = ys[i % len(ys)]
+    d = sorted(ys)[2]
+
+test "behaviour":
+    set s = 7
+    set i = 5
+    run 100 ticks
+    assert a == 15 and b == -54 and c == -9 and d == -26
+    set s = -123456
+    set i = 11
+    run 100 ticks
+    assert a == 7 and b == -18 and c == 493822 and d == -61730
+    set s = 2000000
+    set i = 3
+    run 100 ticks
+    assert a == -1 and b == 71 and c == -2 and d == -7000002
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 82, "{combinators} combinators (82 when written, ports included)");
+}

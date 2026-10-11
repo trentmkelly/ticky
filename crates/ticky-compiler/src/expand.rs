@@ -23,6 +23,8 @@ use ticky_syntax::{Diag, Span};
 
 use crate::program::eval_const;
 
+mod vectorize;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shape {
     Scalar,
@@ -129,6 +131,11 @@ pub struct Expander<'a> {
     found_mem: HashSet<String>,
     /// Inside a `process`: its name (it gets its own copies of subroutines).
     proc: Option<String>,
+    /// Names of arrays written element by element anywhere (see [`element_writes`]).
+    elem_written: HashSet<String>,
+    /// Range comprehensions' elements (by their `Debug` text) with their bundle version
+    /// (see [`vectorize`]).
+    vectorised: Vec<vectorize::Vectorised>,
 }
 
 /// Elements per bank of a signal array: one signal table.
@@ -349,6 +356,39 @@ fn count_reads(body: &[Stmt], out: &mut HashMap<String, usize>) {
     }
 }
 
+/// Names (unresolved, in any scope) assigned element by element: `xs[i] = …`, `xs[i] += …`.
+fn element_writes(body: &[Stmt], out: &mut HashSet<String>) {
+    fn target(e: &Expr, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Index(base, _) => {
+                if let ExprKind::Name(n) = &base.kind {
+                    out.insert(n.clone());
+                }
+                target(base, out);
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().for_each(|i| target(i, out)),
+            _ => {}
+        }
+    }
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { targets, .. } => targets.iter().for_each(|t| target(t, out)),
+            StmtKind::AnnAssign { target: t, .. } | StmtKind::AugAssign { target: t, .. } | StmtKind::For { target: t, .. } => target(t, out),
+            _ => {}
+        }
+        match &s.kind {
+            StmtKind::If { body, orelse, .. } => {
+                element_writes(body, out);
+                element_writes(orelse, out);
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Every { body, .. } => element_writes(body, out),
+            StmtKind::Def { body, .. } | StmtKind::Process { body, .. } | StmtKind::Test { body, .. } => element_writes(body, out),
+            StmtKind::Block { body, .. } | StmtKind::Sub { body, .. } => element_writes(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn globals_of(body: &[Stmt], out: &mut HashSet<String>) {
     for s in body {
         match &s.kind {
@@ -453,6 +493,8 @@ impl<'a> Expander<'a> {
             found_mem: HashSet::new(),
             impure: HashSet::new(),
             proc: None,
+            vectorised: Vec::new(),
+            elem_written: HashSet::new(),
         }
     }
 
@@ -530,6 +572,9 @@ impl<'a> Expander<'a> {
                 let n = items.len();
                 if n > MAX_MEM {
                     return Err(Diag::error(span, format!("arrays are limited to {MAX_MEM} elements")));
+                }
+                if let Some(banks) = self.vectorised_banks(&items) {
+                    return Ok((banks, n));
                 }
                 let banks = bank_ranges(n).into_iter().map(|(off, nb)| call("#arr", items[off..off + nb].to_vec(), span)).collect();
                 Ok((banks, n))
@@ -1129,7 +1174,8 @@ impl<'a> Expander<'a> {
                 let ExprKind::Name(t) = &target.kind else {
                     return Err(Diag::error(target.span, "the comprehension variable must be a single name"));
                 };
-                let values = if is_range(iter) {
+                let range = is_range(iter);
+                let values = if range {
                     self.iteration_values(iter, out)?
                 } else {
                     match self.expr(iter, out)? {
@@ -1141,7 +1187,7 @@ impl<'a> Expander<'a> {
                     }
                 };
                 let mut items = Vec::new();
-                for v in values {
+                for v in values.iter().cloned() {
                     self.aliases.push(HashMap::from([(t.clone(), v)]));
                     let mut keep = true;
                     for c in conds {
@@ -1162,6 +1208,9 @@ impl<'a> Expander<'a> {
                     } else {
                         self.aliases.pop();
                     }
+                }
+                if range && conds.is_empty() {
+                    self.vectorise_range(t, elt, &values, &items);
                 }
                 Val::Array(items)
             }
@@ -1610,6 +1659,7 @@ impl<'a> Expander<'a> {
                     return Err(Diag::error(target.span, format!("can't assign to `{n}` here")));
                 }
                 let r = self.resolve(n);
+                let elem_written = self.elem_written.contains(n);
                 match v {
                     Val::Scalar(e) => {
                         self.set_shape(&r, Shape::Scalar, target.span)?;
@@ -1622,6 +1672,10 @@ impl<'a> Expander<'a> {
                             Some(Shape::Array(_)) => false,
                             _ => self.decide_mem(&r, n),
                         };
+                        // A computed range comprehension is cheaper as a signal array (next round).
+                        if !mem && self.vectorised(&items).is_some_and(|v| v.signal_array) {
+                            self.want_mem(&r);
+                        }
                         if mem {
                             self.set_shape(&r, Shape::Mem(n), target.span)?;
                             let (banks, _) = self.banks_of(Val::Array(items), span)?;
@@ -1641,6 +1695,12 @@ impl<'a> Expander<'a> {
                             Some(_) => false,
                             None => self.decide_mem(&r, n),
                         };
+                        // An array first given a signal array's value and never written element by
+                        // element is cheaper as one too (next round): a bundle register and one read
+                        // per constant index, instead of a read and a register per element.
+                        if !mem && self.shapes.get(&r).is_none() && !elem_written {
+                            self.want_mem(&r);
+                        }
                         if !mem {
                             // Only arrays indexed at runtime are signal arrays (constant
                             // indexes are cheaper on registers): copy element by element.
@@ -2450,11 +2510,14 @@ pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallI
     let mut inline_once = HashSet::new();
     let mut reads = HashMap::new();
     count_reads(&m.body, &mut reads);
+    let mut elem_written = HashSet::new();
+    element_writes(&m.body, &mut elem_written);
     for round in 0..ROUNDS {
         let mut ex = Expander::new(&fns, &consts, shapes.clone());
         ex.subs = sequential_fns(&fns);
         ex.inline_once = std::mem::take(&mut inline_once);
         ex.reads = reads.clone();
+        ex.elem_written = elem_written.clone();
         ex.impure = impure_fns(&fns);
         ex.mem_keys = mem_keys.clone();
         let mut body = Vec::new();

@@ -288,6 +288,9 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     }
                     return Ok(g.bun(terms));
                 }
+                // Internal: `#vec(bundle version, unrolled)`, two forms of a bank of a range
+                // comprehension (expand/vectorize.rs): whichever adds fewer operations.
+                "#vec" => return vec_or_unrolled(g, names, &args[0], &args[1]),
                 "#aget" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#amax" | "#amin" | "#aidx" => {
                     let n = match args.last().map(|a| &a.kind) {
                         Some(ExprKind::Int(n)) => *n as usize,
@@ -463,6 +466,40 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
             return Err(Diag::error(e.span, "tuples and lists can only be used in assignments like `a, b = b, a`"))
         }
     })
+}
+
+/// The cheaper of two forms of the same bundle: `vector` (a bundle comprehension) unless it
+/// fails to lower or adds more operations than `unrolled` (see [`added_ops`]). Both are
+/// lowered; the loser's nodes stay unused, and its runtime checks are dropped.
+fn vec_or_unrolled(g: &mut Graph, names: &mut dyn Names, vector: &Expr, unrolled: &Expr) -> Result<V, Diag> {
+    let (n0, c0) = (g.nodes.len(), g.checks.len());
+    let a = expr(g, names, vector);
+    let (n1, c1) = (g.nodes.len(), g.checks.len());
+    let b = expr(g, names, unrolled)?;
+    match a {
+        Ok(a) if added_ops(g, n0, n1) < added_ops(g, n1, g.nodes.len()) => {
+            g.checks.truncate(c1);
+            Ok(a)
+        }
+        _ => {
+            g.checks.drain(c0..c1);
+            Ok(b)
+        }
+    }
+}
+
+/// Roughly the combinators needed by graph nodes `from..to`: every operation, and every term
+/// of a bundle except constants and single values copied onto a signal (usually computed
+/// there directly).
+fn added_ops(g: &Graph, from: usize, to: usize) -> usize {
+    g.nodes[from..to]
+        .iter()
+        .map(|op| match op {
+            Op::Const(_) | Op::BConst(_) | Op::Each | Op::Src(_) => 0,
+            Op::Bun(terms) => terms.iter().filter(|t| !matches!(t, BTerm::K(_) | BTerm::One(..))).count(),
+            _ => 1,
+        })
+        .sum()
 }
 
 /// With `--checks`: division (or remainder) by `y` fails when `y` is 0.
