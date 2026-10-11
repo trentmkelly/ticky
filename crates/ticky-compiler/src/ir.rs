@@ -377,6 +377,23 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
     }
 }
 
+/// `x op y` for every pair of values in the intervals, if it's the same for all of them.
+fn decide(op: CmpOp, x: Iv, y: Iv) -> Option<bool> {
+    match op {
+        CmpOp::Lt if x.hi < y.lo => Some(true),
+        CmpOp::Lt if x.lo >= y.hi => Some(false),
+        CmpOp::Le if x.hi <= y.lo => Some(true),
+        CmpOp::Le if x.lo > y.hi => Some(false),
+        CmpOp::Gt if x.lo > y.hi => Some(true),
+        CmpOp::Gt if x.hi <= y.lo => Some(false),
+        CmpOp::Ge if x.lo >= y.hi => Some(true),
+        CmpOp::Ge if x.hi < y.lo => Some(false),
+        CmpOp::Eq | CmpOp::Ne if x.hi < y.lo || y.hi < x.lo => Some(op == CmpOp::Ne),
+        CmpOp::Eq | CmpOp::Ne if x.lo == x.hi && y.lo == y.hi && x.lo == y.lo => Some(op == CmpOp::Eq),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct Graph {
     pub nodes: Vec<Op>,
@@ -541,6 +558,29 @@ impl Graph {
         self.intern(Op::SigK(s))
     }
 
+    /// The interval of `op`'s value.
+    fn op_iv(&self, op: &Op) -> Iv {
+        let mut iv = interval(op, |v| self.ivs[v as usize], |v| self.as_const(v), &self.src_iv);
+        // A select's arms are only taken when their conditions hold: `x if x > 0 else 1`
+        // is at least 1.
+        let guarded: Vec<(V, V)> = match op {
+            Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
+            Op::Sel(arms) => arms.clone(),
+            _ => Vec::new(),
+        };
+        if !guarded.is_empty() {
+            let mut r = if matches!(op, Op::Sel(_)) { Iv::k(0) } else { Iv { lo: MAX, hi: MIN } };
+            for (c, x) in guarded {
+                let mut facts = Vec::new();
+                self.facts(c, &mut facts);
+                let xi = self.iv_under(x, &facts);
+                r = Iv { lo: r.lo.min(xi.lo), hi: r.hi.max(xi.hi) };
+            }
+            iv = Iv { lo: iv.lo.max(r.lo), hi: iv.hi.min(r.hi) };
+        }
+        iv
+    }
+
     /// Interns `op` as it is (for rebuilding nodes without simplification).
     pub fn intern_op(&mut self, op: Op) -> V {
         self.intern(op)
@@ -556,24 +596,7 @@ impl Graph {
         if let Some(&v) = self.memo.get(&op) {
             return v;
         }
-        let mut iv = interval(&op, |v| self.ivs[v as usize], |v| self.as_const(v), &self.src_iv);
-        // A select's arms are only taken when their conditions hold: `x if x > 0 else 1`
-        // is at least 1.
-        let guarded: Vec<(V, V)> = match &op {
-            Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
-            Op::Sel(arms) => arms.clone(),
-            _ => Vec::new(),
-        };
-        if !guarded.is_empty() {
-            let mut r = if matches!(op, Op::Sel(_)) { Iv::k(0) } else { Iv { lo: MAX, hi: MIN } };
-            for (c, x) in guarded {
-                let mut facts = Vec::new();
-                self.facts(c, &mut facts);
-                let xi = self.iv_under(x, &facts);
-                r = Iv { lo: r.lo.min(xi.lo), hi: r.hi.max(xi.hi) };
-            }
-            iv = Iv { lo: iv.lo.max(r.lo), hi: iv.hi.min(r.hi) };
-        }
+        let iv = self.op_iv(&op);
         let iv = Iv { lo: iv.lo.max(hint.lo), hi: iv.hi.min(hint.hi) };
         // An interval that pins a single value is a constant.
         if iv.lo == iv.hi && !matches!(op, Op::Const(_)) {
@@ -628,6 +651,17 @@ impl Graph {
         if op == ArOp::And && kb == Some(1) && self.is_bool(a) {
             return a;
         }
+        // `(x >> j) >> k` is `x >> (j + k)` (both floor divisions by powers of two) while the
+        // total stays below 32: `x // 4 // 4`.
+        if let (ArOp::Shr, Some(k), Op::Ar(ArOp::Shr, x, jv)) = (op, kb, self.op(a).clone()) {
+            if let Some(j) = self.as_const(jv) {
+                let n = (j as u32 & 31) + (k as u32 & 31);
+                if n < 32 {
+                    let nv = self.konst(n as i32);
+                    return self.ar(ArOp::Shr, x, nv);
+                }
+            }
+        }
         self.intern(Op::Ar(op, a, b))
     }
 
@@ -639,25 +673,20 @@ impl Graph {
             return self.konst(matches!(op, CmpOp::Eq | CmpOp::Ge | CmpOp::Le) as i32);
         }
         // Decide from intervals where possible.
-        let (x, y) = (self.iv(a), self.iv(b));
-        let decided = match op {
-            CmpOp::Lt if x.hi < y.lo => Some(true),
-            CmpOp::Lt if x.lo >= y.hi => Some(false),
-            CmpOp::Le if x.hi <= y.lo => Some(true),
-            CmpOp::Le if x.lo > y.hi => Some(false),
-            CmpOp::Gt if x.lo > y.hi => Some(true),
-            CmpOp::Gt if x.hi <= y.lo => Some(false),
-            CmpOp::Ge if x.lo >= y.hi => Some(true),
-            CmpOp::Ge if x.hi < y.lo => Some(false),
-            CmpOp::Eq | CmpOp::Ne if x.hi < y.lo || y.hi < x.lo => Some(op == CmpOp::Ne),
-            _ => None,
-        };
-        if let Some(d) = decided {
+        if let Some(d) = decide(op, self.iv(a), self.iv(b)) {
             return self.konst(d as i32);
         }
         // A constant first operand is flipped to second (deciders need a signal first).
         if self.as_const(a).is_some() {
             return self.cmp(op.flip(), b, a);
+        }
+        if let Some(v) = self.cmp_select(op, a, b) {
+            return v;
+        }
+        if !matches!(self.op(a), Op::Mux { .. }) {
+            if let Some(v) = self.cmp_select(op.flip(), b, a) {
+                return v;
+            }
         }
         // `x + k <op> c` → `x <op> c - k`, when neither side can wrap: saves a combinator.
         if let (Op::Ar(aop @ (ArOp::Add | ArOp::Sub), x, kv), Some(c)) = (self.op(a).clone(), self.as_const(b)) {
@@ -677,6 +706,25 @@ impl Graph {
             return a;
         }
         self.intern(Op::Cmp(op, a, b))
+    }
+
+    /// `(p if t else q) op y` without the select, where intervals decide it for one arm and
+    /// the other arm's comparison agrees there: with `lo < hi`, `max(x, lo) > hi` is
+    /// `x > hi` (when `x < lo`, both are false), so `clamp` tests `x` itself. If both arms
+    /// are decided, it is a constant or the select's condition.
+    fn cmp_select(&mut self, op: CmpOp, a: V, y: V) -> Option<V> {
+        let Op::Mux { t, f, a: p, b: q } = *self.op(a) else { return None };
+        let (mut ft, mut ff) = (Vec::new(), Vec::new());
+        self.facts(t, &mut ft);
+        self.facts(f, &mut ff);
+        let under = |g: &Self, x: V, facts: &[Fact]| decide(op, g.iv_under(x, facts), g.iv_under(y, facts));
+        match (under(self, p, &ft), under(self, q, &ff)) {
+            (Some(dp), Some(dq)) if dp == dq => Some(self.konst(dp as i32)),
+            (Some(dp), Some(_)) => Some(if dp { t } else { f }),
+            (Some(dp), None) if under(self, q, &ft) == Some(dp) => Some(self.cmp(op, q, y)),
+            (None, Some(dq)) if under(self, p, &ff) == Some(dq) => Some(self.cmp(op, p, y)),
+            _ => None,
+        }
     }
 
     /// Records a runtime check that fails when `fail` is true (with `--checks` only).
@@ -744,7 +792,60 @@ impl Graph {
         if let Some(k) = self.as_const(f) {
             return if k != 0 { b } else { a };
         }
+        if let Some(v) = self.mux_factor(t, f, a, b) {
+            return v;
+        }
         self.intern(Op::Mux { t, f, a, b })
+    }
+
+    /// Arms that differ by an additive term: `x + d if c else x` is `x + (d if c else 0)`
+    /// (exact with wrapping arithmetic), so the sum is shared and the select is one decider
+    /// (Python's `%` is `r + b if r < 0 else r`). Also `x - d`, and a common operand of two
+    /// sums. The result keeps the select's interval, which its arms' conditions narrow.
+    fn mux_factor(&mut self, t: V, f: V, a: V, b: V) -> Option<V> {
+        // `v` as `x ± d` with the given `x`: (d, subtract).
+        let split = |g: &Self, v: V, x: V| -> Option<(V, bool)> {
+            match *g.op(v) {
+                Op::Ar(ArOp::Add, p, q) if p == x => Some((q, false)),
+                Op::Ar(ArOp::Add, p, q) if q == x => Some((p, false)),
+                Op::Ar(ArOp::Sub, p, q) if p == x => Some((q, true)),
+                _ => None,
+            }
+        };
+        // Bundle comprehensions lower selects of per-signal values by their shape.
+        if self.uses_each(a) || self.uses_each(b) {
+            return None;
+        }
+        let z = self.konst(0);
+        // (shared x, the arms' terms, subtract)
+        let (x, da, db, neg) = if let Some((d, neg)) = split(self, a, b) {
+            (b, d, z, neg)
+        } else if let Some((d, neg)) = split(self, b, a) {
+            (a, z, d, neg)
+        } else {
+            match *self.op(a) {
+                Op::Ar(ArOp::Sub, p, q) => match split(self, b, p)? {
+                    (d, true) => (p, q, d, true),
+                    _ => return None,
+                },
+                Op::Ar(ArOp::Add, p, q) => match (split(self, b, p), split(self, b, q)) {
+                    (Some((d, false)), _) => (p, q, d, false),
+                    (_, Some((d, false))) => (q, p, d, false),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        let iv = self.op_iv(&Op::Mux { t, f, a, b });
+        if iv.lo == iv.hi {
+            return Some(self.konst(iv.lo as i32));
+        }
+        let d = self.mux_tf(t, f, da, db);
+        let v = self.ar(if neg { ArOp::Sub } else { ArOp::Add }, x, d);
+        // The same value as the select, so its bounds hold for the node wherever it's used.
+        let cur = self.ivs[v as usize];
+        self.ivs[v as usize] = Iv { lo: cur.lo.max(iv.lo), hi: cur.hi.min(iv.hi) };
+        Some(v)
     }
 
     /// A decider node; simplifies trivial cases. `hint` bounds its value.
@@ -807,7 +908,7 @@ impl Graph {
             _ => {}
         }
         let f = self.not(t);
-        self.intern(Op::Mux { t, f, a, b })
+        self.mux_tf(t, f, a, b)
     }
 
 
