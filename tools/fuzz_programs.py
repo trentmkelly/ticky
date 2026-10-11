@@ -130,10 +130,17 @@ class Gen:
 CHECKS = bool(os.environ.get("CHECKS"))
 
 
+def checked(line):
+    """`line` with every parenthesised value, and a compound assignment's result
+    (`v *= e` → `v = _c(v * (e))`), checked for 32 bits."""
+    line = re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line)
+    return re.sub(r"^(\s*)(\w+) ([-+*])= (.*)$", r"\1\2 = _c(\2 \3 (\4))", line)
+
+
 def run_python(body, x, y, zero_ok=False):
     """Final (a, b, c) under Python semantics, or None if the program leaves 32 bits (or
     divides by zero; with `zero_ok`, that gives "div0")."""
-    src = "\n".join(re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line) for line in body)
+    src = "\n".join(checked(line) for line in body)
     env = {"_c": check, "min": min, "max": max, "x": x, "y": y, "a": 0, "b": 1, "c": 2}
     try:
         exec(src, env)  # pylint: disable=exec-used

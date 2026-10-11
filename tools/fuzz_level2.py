@@ -150,10 +150,17 @@ class Gen:  # pylint: disable=too-many-instance-attributes
         return lines
 
 
+def checked_line(line):
+    """`line` with every parenthesised value, and a compound assignment's result
+    (`v += e` → `v = _c(v + (e))`), checked for 32 bits."""
+    line = re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line)
+    return re.sub(r"^(\s*)(\w+) ([-+*])= (.*)$", r"\1\2 = _c(\2 \3 (\4))", line)
+
+
 def run_python(src):
     """Final (a, b, c, arr) under Python semantics, or None on overflow/division by zero."""
-    checked = "\n".join(re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line) for line in src)
-    env = {"_c": check}
+    checked = "\n".join(checked_line(line) for line in src)
+    env = {"_c": check, "sum": lambda xs: check(sum(xs))}
     try:
         exec(checked, env)  # pylint: disable=exec-used
         return tuple(check(env[v]) for v in ["a", "b", "c"]) + tuple(check(v) for v in env["arr"])

@@ -60,6 +60,8 @@ pub struct LayoutInfo {
     pub relays: usize,
     /// Medium poles of the output return lines.
     pub carriers: usize,
+    /// Free tile columns between the grid's segments (more than 0 when relays needed room).
+    pub gap: usize,
 }
 
 /// A return line: gate, output port, and the poles in between.
@@ -120,7 +122,44 @@ pub enum Side {
 /// An annealed placement: the slot grid and each entity's slot.
 type Placed = (crate::place::Slots, Vec<(usize, usize)>);
 
+/// Why a layout attempt failed.
+enum Failure {
+    /// Some network found no free tiles for its relay poles (the grid is too crowded).
+    NoRelayRoom(String),
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(msg: String) -> Self {
+        Failure::Other(msg)
+    }
+}
+
+/// Most free tile columns the grid adds between segments when relays run out of room. (Past
+/// 2, pole rows no longer reach across a gap; the bridging poles for far-apart poles span it.)
+const MAX_GAP: usize = 8;
+
+/// Places everything and wires it up. The grid's only free tiles are its pole columns, and
+/// relays of many networks converging on one area (say, an array read from all over a big
+/// program) can fill them all; then the grid is laid out again with 1, 2, 4, then 8 free
+/// columns between segments, for more relay room.
 pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts) -> Result<LayoutInfo, String> {
+    let mut gap = 0;
+    loop {
+        let mut trial = net.clone();
+        match layout_with_gap(&mut trial, nets, opts, gap) {
+            Ok(info) => {
+                *net = trial;
+                return Ok(info);
+            }
+            Err(Failure::NoRelayRoom(_)) if opts.anneal.is_none() && gap < MAX_GAP => gap = (2 * gap).max(1),
+            Err(Failure::NoRelayRoom(msg) | Failure::Other(msg)) => return Err(msg),
+        }
+    }
+}
+
+/// [`layout`] with `gap` free tile columns between the grid's segments (grid placement only).
+fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &LayoutOpts, gap: usize) -> Result<LayoutInfo, Failure> {
     let ew = opts.ports_ew;
     // Ports in entity order, which is declaration order (codegen creates them in
     // `program.ports` order); the test `ports_keep_declaration_order` holds us to it.
@@ -209,9 +248,11 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         }
     }
     let reserved = reserved_tiles(opts);
+    // Tile columns per segment: 6 slots, the pole column, and the gap (grid only).
+    let stride = 7 + if opts.anneal.is_none() { gap } else { 0 };
     // A 1×2 slot at tile column `x`, slot row `r`, is blocked by a reserved tile, or (with
-    // poles) when no tile of its segment's pole column (`7·seg + 3`) within reach of it is
-    // free, so no pole could power it.
+    // poles) when no tile of its segment's pole column (`stride·seg + 3`) within reach of it
+    // is free, so no pole could power it.
     let blocked = |x: usize, r: usize| {
         let (x, r) = (x as i64, r as i64);
         if reserved.contains(&(x, 2 * r)) || reserved.contains(&(x, 2 * r + 1)) {
@@ -221,14 +262,14 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             return false;
         }
         // Centre 2r + 1; a pole at y + 0.5 reaches it when |2r + 1 − y − 0.5| < 4.5.
-        let px = (x / 7) * 7 + 3;
+        let px = (x / stride as i64) * stride as i64 + 3;
         (2 * r - 3..=2 * r + 4).all(|y| reserved.contains(&(px, y)))
     };
     let north_w = 1 + inputs.len() + if north_outs { n_out } else { 0 };
 
     let n = core.len().max(1);
-    // `segs` segments of 7 columns (6 slots and a pole column), `rows` rows 2 tiles tall,
-    // `w` tiles wide.
+    // `segs` segments of `stride` columns (6 slots, a pole column, the gap), `rows` rows 2
+    // tiles tall, `w` tiles wide.
     let (segs, rows, w) = match opts.anneal {
         None => {
             // Roughly square, serpentine so consecutive entities (which share private wires)
@@ -244,7 +285,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                     slot += 1;
                     let j = if r % 2 == 1 { per_row - 1 - j } else { j };
                     let (seg, off) = (j / SEG, j % SEG);
-                    let col = seg * 7 + if off < 3 { off } else { off + 1 };
+                    let col = seg * stride + if off < 3 { off } else { off + 1 };
                     if !blocked(col, r) {
                         break (r, col);
                     }
@@ -254,7 +295,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
                 let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
                 net.entities[id].pos = (col as f64 + 0.5, 2.0 * r as f64 + dy);
             }
-            (segs, rows.max(1), 7 * segs)
+            (segs, rows.max(1), stride * segs - gap)
         }
         Some(a) => {
             // Wire networks as member lists, counting only entities with a position yet.
@@ -319,7 +360,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     pole_rows.dedup();
     for &r in &pole_rows {
         for seg in 0..segs {
-            poles.push(((seg * 7 + 3) as f64 + 0.5, 2.0 * r as f64 + 0.5));
+            poles.push(((seg * stride + 3) as f64 + 0.5, 2.0 * r as f64 + 0.5));
         }
     }
     // A pole on a fixed peripheral's tiles moves up or down its column to the nearest free tile.
@@ -474,7 +515,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
     let pole_ids: Vec<EntId> = (first_pole..net.entities.len()).collect();
     for (a, b) in mst(&poles) {
         if dist(poles[a], poles[b]) > 9.0 {
-            return Err(format!("pole gap of {:.1} tiles", dist(poles[a], poles[b])));
+            return Err(format!("pole gap of {:.1} tiles", dist(poles[a], poles[b])).into());
         }
         net.wire((pole_ids[a], Conn::Copper), (pole_ids[b], Conn::Copper));
     }
@@ -554,7 +595,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
             Err((ni, msg)) => {
                 attempts += 1;
                 if attempts > 8 || order[0] == ni {
-                    return Err(msg);
+                    return Err(Failure::NoRelayRoom(msg));
                 }
                 *net = base.clone();
                 order.retain(|&x| x != ni);
@@ -581,7 +622,7 @@ pub fn layout(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &Layout
         let width = w as usize + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
         (width, height)
     };
-    Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers })
+    Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers, gap })
 }
 
 /// Places the screens' lamps (and their poles, added to `poles`) around what's placed so far.
@@ -852,4 +893,69 @@ fn route_within(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::NetSpec;
+
+    /// `n` arithmetic combinators (placed in this order) and a two-member red network from
+    /// each of `hubs` (in the middle of the grid) to a combinator far away: so many networks
+    /// converging on one area fill the free tiles near it with relays.
+    fn converging(n: usize, hubs: std::ops::Range<usize>) -> (Netlist, Vec<NetSpec>) {
+        let mut net = Netlist::default();
+        for _ in 0..n {
+            let a = Arith { first: Operand::Sig(Sig(1)), first_nets: Nets::RED, second: Operand::Const(1), second_nets: Nets::RED, op: ArOp::Add, out: Sig(1) };
+            net.add(Kind::Arith(a), Role::Core);
+        }
+        let k = hubs.len();
+        let nets = hubs
+            .enumerate()
+            .map(|(i, h)| {
+                // Spread the far ends over the whole program, away from the hubs.
+                let far = (h + n / 4 + i * (n / 2) / k) % n;
+                NetSpec { red: true, members: vec![(h, Conn::InRed), (far, Conn::OutRed)] }
+            })
+            .collect();
+        (net, nets)
+    }
+
+    /// Every network's members are joined by wires of its colour (through relay poles).
+    fn connected(net: &Netlist, spec: &NetSpec) -> bool {
+        let colour = |c: Conn| matches!(c, Conn::InRed | Conn::OutRed | Conn::Red);
+        let mut seen = vec![spec.members[0]];
+        let mut stack = vec![spec.members[0]];
+        while let Some(p) = stack.pop() {
+            for w in &net.wires {
+                for (a, b) in [(w.a, w.b), (w.b, w.a)] {
+                    if a == p && colour(b.1) == spec.red && !seen.contains(&b) {
+                        seen.push(b);
+                        stack.push(b);
+                    }
+                }
+            }
+        }
+        spec.members.iter().all(|m| seen.contains(m))
+    }
+
+    /// Relays that fill the grid's pole columns (fuzz_level2 seeds 3 and 11 did this with
+    /// arrays read all over big programs: "no room for a wire relay"): the grid is laid out
+    /// again with free columns between its segments.
+    #[test]
+    fn relays_get_room_in_a_crowded_grid() {
+        let opts = LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, screens: vec![], controls_at: vec![] };
+        let (n, hubs) = (600, 270..330);
+        let (base, nets) = converging(n, hubs);
+        // Without the gap there is no room.
+        let mut net = base.clone();
+        assert!(matches!(layout_with_gap(&mut net, &nets, &opts, 0), Err(Failure::NoRelayRoom(_))));
+        let mut net = base.clone();
+        let info = layout(&mut net, &nets, &opts).unwrap_or_else(|e| panic!("{e}"));
+        assert!(info.gap > 0 && info.relays > 0);
+        assert!(net.validate(true).is_empty(), "{:?}", net.validate(true));
+        for spec in &nets {
+            assert!(connected(&net, spec));
+        }
+    }
 }

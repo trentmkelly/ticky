@@ -80,17 +80,25 @@ pub struct State {
     /// Set for output ports.
     pub port: Option<usize>,
     pub span: Span,
+    /// The variables renamed to this one by register sharing (they share its register).
+    pub shared: Vec<String>,
 }
 
 impl State {
-    /// Hidden loop variables have names that can't be written in source.
+    /// For descriptions: the variable's name, or the names of all the variables sharing its
+    /// register (`` `a` / `b` / `steps` ``).
     pub fn display_name(&self) -> String {
-        if let Some((var, rest)) = self.name.split_once('#') {
+        std::iter::once(&self.name).chain(&self.shared).map(|n| Self::display_one(n)).collect::<Vec<_>>().join(" / ")
+    }
+
+    /// Hidden loop variables have names that can't be written in source.
+    fn display_one(name: &str) -> String {
+        if let Some((var, rest)) = name.split_once('#') {
             if rest.starts_with('k') || rest.starts_with("end") {
                 return format!("loop counter for {}", crate::expand::display(var));
             }
         }
-        match crate::expand::display(&self.name) {
+        match crate::expand::display(name) {
             d if d.starts_with('`') || d.starts_with("the ") || d.starts_with("a ") => d,
             d => format!("`{d}`"),
         }
@@ -1008,6 +1016,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
             owner: writers.first().map(|w| w.0),
             port,
             span,
+            shared: Vec::new(),
         });
     }
     if !errs.is_empty() {
@@ -1107,10 +1116,11 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         every.iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
         code.push((None, m));
     }
+    let mut merged = BTreeMap::new();
     for (owner, name, c) in all {
         let Some(mut c) = c else { continue };
         let elsewhere: BTreeSet<&String> = code.iter().filter(|(o, _)| *o != Some(owner)).flat_map(|(_, m)| m).collect();
-        share_registers(&mut c, owner, &states, &elsewhere);
+        merged.extend(share_registers(&mut c, owner, &states, &elsewhere));
         let ctx = Ctx { owner, ports: &ports, states: &states, consts: &consts };
         match lower_main(&ctx, &c) {
             Ok(mut m) => {
@@ -1123,6 +1133,12 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     }
     if !errs.is_empty() {
         return Err(errs);
+    }
+    // A shared register's descriptions name every variable in it.
+    for (member, rep) in merged {
+        if let Some(s) = states.iter_mut().find(|s| s.name == rep) {
+            s.shared.push(member);
+        }
     }
     // Error codes, in order: `every` blocks, then each process's steps.
     let mut sites = Vec::new();
@@ -1623,10 +1639,11 @@ fn definite_assignment(c: &cfg::Cfg) -> Vec<BTreeSet<String>> {
 /// the same time are renamed to one of them, so they share a register. The others are left
 /// as states nobody reads (codegen gives those no register). Variables any other process or
 /// `every` block mentions, ports and bundles keep their own. `TICKY_NO_REGSHARE` turns it off.
-fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: &BTreeSet<&String>) {
+/// Returns the renames (variable → the one whose register it shares).
+fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: &BTreeSet<&String>) -> BTreeMap<String, String> {
     use crate::liveness::Cand;
     if std::env::var_os("TICKY_NO_REGSHARE").is_some() {
-        return;
+        return BTreeMap::new();
     }
     let cands: BTreeMap<String, Cand> = states
         .iter()
@@ -1639,7 +1656,7 @@ fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: 
         .collect();
     let map = crate::liveness::coalesce(c, &cands, &definite_assignment(c));
     if map.is_empty() {
-        return;
+        return map;
     }
     if std::env::var_os("TICKY_DUMP_REGSHARE").is_some() {
         eprintln!("register sharing: {map:?}");
@@ -1652,6 +1669,7 @@ fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: 
             _ => {}
         }
     }
+    map
 }
 
 fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {

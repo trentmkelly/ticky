@@ -3,7 +3,9 @@
 expressions with a child or 0/1 while Ticky still disagrees with Python.
 
 usage: tools/reduce_level2.py PROGRAM.ticky X Y      (TICKY=./target/debug/ticky)
-Prints the reduced program; the last candidate is left in /tmp/reduce-cur.ticky.
+Prints the reduced program; the last candidate is left in /tmp/reduce-cur.ticky (or REDUCE_CUR).
+With REDUCE_ERROR=TEXT, shrinks a compile failure instead: keeps candidates (that Python
+still runs) whose compile error contains TEXT.
 """
 import ast
 import copy
@@ -36,9 +38,22 @@ def legal(src):
                 return False
     return True
 
+ERROR = os.environ.get("REDUCE_ERROR")
+CUR = os.environ.get("REDUCE_CUR", "/tmp/reduce-cur.ticky")
+
 def bad(src):
     if not legal(src):
         return False
+    if ERROR:
+        # Still a valid program: Python runs it.
+        try:
+            if run_python([f"x = {x}", f"y = {y}"] + src.splitlines()) is None:
+                return False
+        except Exception:
+            return False
+        open(CUR, 'w').write("\n".join(head + src.splitlines() + tail) + "\n")
+        out = subprocess.run([T, 'check', CUR], capture_output=True, text=True)
+        return ERROR in out.stderr
     b = src.splitlines()
     try:
         want = run_python([f"x = {x}", f"y = {y}"] + b)
@@ -46,8 +61,8 @@ def bad(src):
         return False
     if want is None:
         return False
-    open('/tmp/reduce-cur.ticky', 'w').write("\n".join(head + b + tail) + "\n")
-    out = subprocess.run([T, 'sim', '/tmp/reduce-cur.ticky', '--ticks', '30000', f'--set=x={x}', f'--set=y={y}'], capture_output=True, text=True)
+    open(CUR, 'w').write("\n".join(head + b + tail) + "\n")
+    out = subprocess.run([T, 'sim', CUR, '--ticks', '30000', f'--set=x={x}', f'--set=y={y}'], capture_output=True, text=True)
     if out.returncode != 0:
         return False
     last = [int(v) for v in out.stdout.strip().splitlines()[-1].split()[1:]]
@@ -90,4 +105,5 @@ while changed:
             break
 print(src)
 bad(src)
-print("python:", run_python([f"x = {x}", f"y = {y}"] + src.splitlines()))
+if not ERROR:
+    print("python:", run_python([f"x = {x}", f"y = {y}"] + src.splitlines()))

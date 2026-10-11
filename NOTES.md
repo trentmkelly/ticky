@@ -1224,3 +1224,39 @@ bestof 31 → 29, arrays 51 → 50, stats 47 → 46; no example grew.
   conditions and running maxima, in `every tick`/`every 30 ticks`/main shapes, vs Python.
 - Verification: `FUZZ_N=100 tools/verify.sh` clean; fuzz_bundles, fuzz_signals, fuzz_lookups
   2×300 each clean. Test `lookup_rewrites_apply` (58 → 47 combinators).
+
+## 2026-10-11: maintenance (layout relays, flattening budget, fuzzer overflow, shared-register labels)
+
+- **"no room for a wire relay"** (fuzz_level2 seeds 3, 11): the grid's only free tiles are
+  its pole columns, and many red networks converging on one area (an array read from all
+  over a big program: `main: read one signal` nets) fill every free tile within reach with
+  their relays; rip-up and reroute can't help. `layout` now retries the grid with 1, 2, 4,
+  then 8 free tile columns between segments (`gap`, `LayoutInfo::gap`; past 2 the existing
+  bridging poles join the pole rows). Only on failure, so no example changes. Not for
+  `--place=anneal`. Test `relays_get_room_in_a_crowded_grid` (layout.rs unit test: 600
+  combinators, 60 red networks from the middle of the grid to far away; no room with gap 0;
+  synthetic so the optimiser can't uncrowd it). The reduced fuzz program it replaced
+  (gap 1) MATCHed in game, 599 ticks.
+- **Exponential flattening** (cfg.rs `flat_in_step`): flattening an exit copies the code
+  after it into both arms, so a function calling k inlined functions with early `return`s
+  flattens to 2^k copies of its tail (8 calls: 4,382 combinators and 100 s; 20 calls: "too
+  much branching"). A simple `if`/block whose flattening exceeds 1,000 statements now
+  becomes steps instead of failing (examples need ≤ 6, bench unchanged). That 8-call program
+  is 217 combinators; l11 above went 3,677 → 1,279; the "too much branching" fuzz program
+  (seed 4) compiles. Test `early_returns_dont_multiply_code`. The 200k budget for `every`
+  blocks (no steps there) stays a hard limit.
+- **"ran out of signals"** (seeds 3, 5): legitimate. Those programs need ~1,870 signals for
+  ~5,900 combinators (the pool has ~1,430): huge from inlining many calls in nested
+  expressions, not from a bug in allocation.
+- **Fuzzer overflow model**: `v *= e` / `+=` / `-=` weren't checked for 32 bits (only
+  parenthesised values were), so an intermediate overflow that a later `%` hid was a false
+  mismatch. fuzz_programs `checked()` (also used by fuzz_blocks) and fuzz_level2
+  `checked_line()` rewrite them to `v = _c(v op (e))`; fuzz_level2's `sum(arr)` is checked too.
+- **reduce_level2.py**: `REDUCE_ERROR=TEXT` shrinks a compile failure (candidates Python
+  still runs whose error contains TEXT); `REDUCE_CUR` sets the scratch file.
+- **Shared-register labels**: `State::shared` lists the variables renamed into a state by
+  register sharing; `display_name` joins them, so descriptions read "variable `s` / `p`
+  (hold)" (checked in `registers_are_shared`).
+- Verified after rebasing on main: `FUZZ_N=150 tools/verify.sh` seeds 11, 9, 3 all clean
+  except fuzz_level2 "ran out of signals" once each on seeds 9 and 3 (the limit above); the
+  relay failures noted for seed 9 are gone. In-game: 36/36 examples MATCH.

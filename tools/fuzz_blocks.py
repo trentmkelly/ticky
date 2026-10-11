@@ -9,13 +9,12 @@ usage: tools/fuzz_blocks.py [COUNT] [SEED]
 """
 import os
 import random
-import re
 import subprocess
 import sys
 import tempfile
 import textwrap
 
-from fuzz_programs import Gen, check, Overflow, VARS
+from fuzz_programs import Gen, check, checked, Overflow, VARS
 
 TICKY = os.environ.get("TICKY", "./target/debug/ticky")
 
@@ -45,7 +44,7 @@ def straight(g, ind, depth, n):
 
 def replay(body, x, y, inits, n):
     """(a, b, c) after n iterations under Python semantics, or None on overflow."""
-    src = textwrap.dedent("\n".join(re.sub(r"(?<![A-Za-z_0-9])\(", "_c(", line) for line in body))
+    src = textwrap.dedent("\n".join(checked(line) for line in body))
     code = compile(src, "<block>", "exec")
     env = {"_c": check, "min": min, "max": max, "x": x, "y": y}
     env.update(inits)

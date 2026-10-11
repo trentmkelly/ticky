@@ -184,6 +184,21 @@ impl Builder<'_> {
         n
     }
 
+    /// Puts a simple `if` or block into the current step, its exits flattened away; false if
+    /// it isn't simple, or flattening would copy too much code, so it should become steps
+    /// instead. (Each early exit copies the code after it into both arms: a function calling
+    /// k inlined functions with early `return`s flattens to 2^k copies of its tail. The
+    /// examples need a budget of 6 at most.)
+    fn flat_in_step(&mut self, s: &Stmt) -> bool {
+        if !is_simple(std::slice::from_ref(s)) {
+            return false;
+        }
+        let mut budget = 1_000;
+        let Ok(flat) = crate::expand::flatten(vec![s.clone()], &mut budget) else { return false };
+        self.steps[self.cur].stmts.extend(flat);
+        true
+    }
+
     fn stmt(&mut self, s: &Stmt) -> Result<(), Diag> {
         match &s.kind {
             StmtKind::Assign { .. }
@@ -195,10 +210,7 @@ impl Builder<'_> {
                 self.steps[self.cur].stmts.push(s.clone());
             }
             StmtKind::Block { label, body } => {
-                if is_simple(std::slice::from_ref(s)) {
-                    let mut budget = 200_000;
-                    let flat = crate::expand::flatten(vec![s.clone()], &mut budget)?;
-                    self.steps[self.cur].stmts.extend(flat);
+                if self.flat_in_step(s) {
                     return Ok(());
                 }
                 let after = self.new_step(s.span);
@@ -227,10 +239,7 @@ impl Builder<'_> {
             }
             StmtKind::Sub { .. } => return Err(Diag::error(s.span, "internal error: nested subroutine")),
             StmtKind::If { cond, body, orelse } => {
-                if is_simple(std::slice::from_ref(s)) {
-                    let mut budget = 200_000;
-                    let flat = crate::expand::flatten(vec![s.clone()], &mut budget)?;
-                    self.steps[self.cur].stmts.extend(flat);
+                if self.flat_in_step(s) {
                     return Ok(());
                 }
                 let t = self.new_step(s.span);

@@ -736,6 +736,8 @@ test "shared registers":
     let holds: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).flat_map(|d| d.split("; ")).filter(|d| d.starts_with("variable") && d.ends_with("(hold)")).collect();
     // `t`, `s`, one loop counter and the three outputs (9 without sharing).
     assert_eq!(holds.len(), 6, "{holds:?}");
+    // A shared register's descriptions name all its variables.
+    assert!(holds.contains(&"variable `s` / `p` (hold)") && holds.contains(&"variable `i` / `j` (hold)"), "{holds:?}");
     let e = error_of("input  a: int @ A\noutput o: int @ O\nwait 1\nx = a\no = x\nwait 1\no = y + 1\ny = a + 2\nwait 1\no = y\n");
     assert!(e.contains("`y` might be used before it's assigned"), "{e}");
 }
@@ -1304,4 +1306,64 @@ test "behaviour":
     assert_eq!(made("read one signal"), 0, "no separate reads");
     let combinators = ents.iter().filter(|e| e.kind.is_combinator()).count();
     assert!(combinators <= 47, "{combinators} combinators (47 when written, 58 before these rewrites)");
+}
+
+/// A function calling 20 inlined functions with early `return`s: flattening it into one step
+/// would copy its tail 2^20 times ("too much branching" before; 8 calls already gave 4,382
+/// combinators). Past a budget it becomes steps instead.
+#[test]
+fn early_returns_dont_multiply_code() {
+    let src = r#"input x: int @ X
+input y: int @ Y
+output o: int @ O
+output done: bool @ D
+arr = [3, -1, 4, 1]
+def f(p, q):
+    arr[p % 4] = q
+    if p > 2:
+        return q + arr[1]
+    return q * 2 - arr[0]
+def g(p, q):
+    q = f(p + 0, q)
+    q = f(p + 1, q)
+    q = f(p + 2, q)
+    q = f(p + 3, q)
+    q = f(p + 4, q)
+    q = f(p + 5, q)
+    q = f(p + 6, q)
+    q = f(p + 7, q)
+    q = f(p + 8, q)
+    q = f(p + 9, q)
+    q = f(p + 10, q)
+    q = f(p + 11, q)
+    q = f(p + 12, q)
+    q = f(p + 13, q)
+    q = f(p + 14, q)
+    q = f(p + 15, q)
+    q = f(p + 16, q)
+    q = f(p + 17, q)
+    q = f(p + 18, q)
+    q = f(p + 19, q)
+    return q
+o = g(x, y) + g(y, x)
+done = True
+
+test "a":
+    set x = 1
+    set y = 2
+    run until done, max 5000 ticks
+    assert o == -933125
+
+test "b":
+    set x = -30
+    set y = 5
+    run until done, max 5000 ticks
+    assert o == -93739
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure.map(|d| d.render("t", src)));
+    }
+    let n = c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
+    assert!(n < 1000, "{n} combinators");
 }
