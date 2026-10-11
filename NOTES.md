@@ -1026,4 +1026,5 @@ Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to 
   wire; est. −24 (sorting −13). Bundle loads as deciders testing the clock phase (dropping
   EI/ES): few blocks qualify.
 - Test `registers_share_and_increment`. Verification: no example grew; `FUZZ_N=100
-  tools/verify.sh` passed; in-game difftest 36/36 MATCH (frozen release copy).
+  tools/verify.sh` passed; in-game difftest 36/36 MATCH plus difftest-cubium MATCH (frozen
+  release copy, after rebasing onto register sharing).
