@@ -942,3 +942,5 @@ elsewhere).
   cubium-generator −1, guess −1 (most other examples' divisions write bundles or are
   pipelined). Test `floor_division_by_constant`; in-game probe (both signs of k, `//` and `%`
   of one dividend, a floor result as a select's pass, INT_MIN/INT_MAX) MATCH 199 ticks.
+- Final build: `FUZZ_N=100 tools/verify.sh` clean; in-game 36/36 examples and
+  cubium-generator (Cubium loaded, 1599 ticks) MATCH.
