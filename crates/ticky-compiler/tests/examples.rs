@@ -600,3 +600,100 @@ test "behaviour":
     let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
     assert!(combinators <= 40, "{combinators} combinators (40 when written, ports and controls included)");
 }
+
+/// A function with a loop called from one place is inlined there (no subroutine), keeping
+/// early returns from inside the loop, waits, globals and its own `i`. A loop variable read
+/// only in its loop is the counter itself; an unused one counts down (no register for the
+/// end); one read after the loop keeps its last value (or the old one if the loop is empty).
+#[test]
+fn single_call_inlining_and_loop_counters() {
+    let src = r#"input  n: int @ N
+output o1: int @ A
+output o2: int @ B
+output o3: int @ C
+output o4: int @ D
+output o5: int @ E
+output o6: int @ F
+output o7: int @ G
+output done: bool @ Z
+
+total = 0
+
+def find(limit, x):
+    # early return from inside a loop, a wait, a shadowed name, a global write
+    global total
+    k = 100
+    for i in range(limit):
+        wait 1
+        total += i
+        if i * i >= x:
+            return i
+    return k
+
+def count(m):
+    c = 0
+    for _ in range(m):
+        c += 1
+        if c > 50:
+            break
+    return c
+
+i = 7
+o1 = find(n, 10)
+o2 = total
+o3 = count(n)
+# loop variable read after the loop keeps its last value (or the old one when empty)
+j = -5
+for j in range(n):
+    pass
+o4 = j
+s = 0
+for q in range(n, 0, -1):
+    if q % 2 == 0:
+        continue
+    s += q
+o5 = s
+t = 0
+for _ in range(n):
+    for _ in range(3):
+        t += 1
+o6 = t + i
+w = 0
+for v in range(2, n):
+    w = w * 3 + v
+o7 = w
+done = True
+
+test "n = 5":
+    set n = 5
+    run until done, max 3000 ticks
+    assert o1 == 4 and o2 == 10 and o3 == 5 and o4 == 4 and o5 == 9 and o6 == 22 and o7 == 31
+
+test "n = 0":
+    set n = 0
+    run until done, max 3000 ticks
+    assert o1 == 100 and o2 == 0 and o3 == 0 and o4 == -5 and o5 == 0 and o6 == 7 and o7 == 0
+
+test "n = 2":
+    set n = 2
+    run until done, max 3000 ticks
+    assert o1 == 100 and o2 == 1 and o3 == 2 and o4 == 1 and o5 == 1 and o6 == 13 and o7 == 0
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    assert!(c.program.subroutines.is_empty(), "{:?}", c.program.subroutines);
+    // Counter copies: only `j` (read after its loop). End registers: `i`, `j` and `v`.
+    let hidden = |tag: &str| c.program.states.iter().filter(|s| s.name.contains(tag)).map(|s| s.name.clone()).collect::<Vec<_>>();
+    assert_eq!(hidden("#k").len(), 1, "{:?}", hidden("#k"));
+    assert_eq!(hidden("#end").len(), 3, "{:?}", hidden("#end"));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure.map(|d| d.render("t", src)));
+    }
+    // With `--opt=size`, too (steps are only copied where that removes them).
+    for name in ["calculator", "primes", "functions"] {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/{name}.ticky"))).unwrap();
+        let c = compile(&src, &Options { opt: ticky_compiler::Opt::Size, ..opts() }).unwrap();
+        for r in run_tests(&c, &src) {
+            assert!(r.failure.is_none(), "{name} (size): test {} failed", r.name);
+        }
+    }
+}

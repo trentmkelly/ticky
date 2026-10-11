@@ -456,6 +456,7 @@ def gcd(a, b):
   - Functions with loops or waits, called from sequential code, are compiled **once as a
     subroutine**: arguments are assigned to its parameters, a return-address register records
     where to continue, and `return` jumps back through it. Calling one costs about a step.
+    One called from a single place (per process) is inlined there instead.
   - In `every` blocks everything is inlined (their loops are unrolled).
   - The cost report lists each function, how it was compiled and how often it's called.
 - Top-level code that only uses constants runs **at compile time**, including loops and
@@ -893,6 +894,13 @@ where operands must stay in step):
   can't wrap (and `(x * 6) // 3` is `x * 2`); `x // 4 // 4` is one shift.
 - **Comparisons of clamps.** `max(x, lo) > hi` with `lo < hi` is `x > hi` (likewise for `min`
   and other selects with a constant arm), so `clamp(x, lo, hi)`'s second test reads `x`.
+- **Loop counters.** `for k in range(…)` keeps a copy of its counter in `k` (Python leaves `k`
+  at its last value); when nothing reads `k` after the loop and the body doesn't assign it,
+  `k` is the counter itself. `for _ in range(n)` with an unused variable counts down from `n`,
+  so `n` needs no register of its own.
+- **Functions with loops called once** are inlined: no return address, call or return.
+- With `--opt=size`, a small step reached by plain jumps is copied into them only if that
+  removes it (under `speed`, also into some of them, which saves those paths a step).
 
 ### 11.3 Cost report
 

@@ -111,6 +111,13 @@ pub struct Expander<'a> {
     /// Functions compiled once and called as subroutines from sequential code (those with
     /// loops or waits); everything else is inlined.
     subs: HashSet<String>,
+    /// Call sites of each subroutine (by [`Expander::sub_key`]) expanded in this round.
+    sub_sites: HashMap<String, usize>,
+    /// Subroutines with a single call site (found in the previous round): inlined there
+    /// instead, saving the return-address register, the call and the return.
+    inline_once: HashSet<String>,
+    /// Reads of each name in the whole module (see [`count_reads`]).
+    reads: HashMap<String, usize>,
     /// Functions that change module variables (directly or through calls): a call to one
     /// can change values read earlier in the same expression.
     impure: HashSet<String>,
@@ -276,6 +283,72 @@ fn assigned(body: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// How often each name is read in `body`, everywhere (functions, blocks, processes, tests).
+/// Ports and `global` declarations count as reads: something outside the code sees them.
+/// Plain assignment and loop targets don't count; `x += …` does.
+fn count_reads(body: &[Stmt], out: &mut HashMap<String, usize>) {
+    fn expr(e: &Expr, out: &mut HashMap<String, usize>) {
+        visit(e, &mut |x| {
+            if let ExprKind::Name(n) = &x.kind {
+                *out.entry(n.clone()).or_default() += 1;
+            }
+        });
+    }
+    fn target(e: &Expr, out: &mut HashMap<String, usize>) {
+        match &e.kind {
+            ExprKind::Name(_) => {}
+            ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().for_each(|i| target(i, out)),
+            _ => expr(e, out),
+        }
+    }
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { targets, value } => {
+                targets.iter().for_each(|t| target(t, out));
+                expr(value, out);
+            }
+            StmtKind::AnnAssign { target: t, value, .. } => {
+                target(t, out);
+                value.iter().for_each(|v| expr(v, out));
+            }
+            StmtKind::AugAssign { target: t, value, .. } => {
+                expr(t, out);
+                expr(value, out);
+            }
+            StmtKind::Expr(e) | StmtKind::Assert(e) | StmtKind::WaitUntil(e) | StmtKind::WaitTicks(e) | StmtKind::Return(Some(e)) => expr(e, out),
+            StmtKind::TestSet { value: e, .. } | StmtKind::TestRun { ticks: e } => expr(e, out),
+            StmtKind::TestRunUntil { cond, max } => {
+                expr(cond, out);
+                expr(max, out);
+            }
+            StmtKind::Global(names) => names.iter().for_each(|n| *out.entry(n.clone()).or_default() += 1),
+            StmtKind::Port { name, .. } => *out.entry(name.clone()).or_default() += 1,
+            StmtKind::If { cond, body, orelse } => {
+                expr(cond, out);
+                count_reads(body, out);
+                count_reads(orelse, out);
+            }
+            StmtKind::While { cond, body } => {
+                expr(cond, out);
+                count_reads(body, out);
+            }
+            StmtKind::For { target: t, iter, body } => {
+                target(t, out);
+                expr(iter, out);
+                count_reads(body, out);
+            }
+            StmtKind::Every { period, body } => {
+                period.iter().for_each(|p| expr(p, out));
+                count_reads(body, out);
+            }
+            StmtKind::Def { body, .. } | StmtKind::Process { body, .. } | StmtKind::Test { body, .. } => count_reads(body, out),
+            StmtKind::Block { body, .. } | StmtKind::Sub { body, .. } => count_reads(body, out),
+            StmtKind::Return(None) | StmtKind::Pass | StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {}
+            StmtKind::Exit(_) | StmtKind::Call(_) => {}
+        }
+    }
+}
+
 fn globals_of(body: &[Stmt], out: &mut HashSet<String>) {
     for s in body {
         match &s.kind {
@@ -316,7 +389,7 @@ fn has_call(e: &Expr, fns: &HashMap<String, FnDef>) -> bool {
     found
 }
 
-fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+pub(crate) fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match &e.kind {
         ExprKind::Unary(_, a) | ExprKind::Not(a) | ExprKind::Attr(a, _) => visit(a, f),
@@ -372,6 +445,9 @@ impl<'a> Expander<'a> {
             next_id: 0,
             calls: BTreeMap::new(),
             subs: HashSet::new(),
+            sub_sites: HashMap::new(),
+            inline_once: HashSet::new(),
+            reads: HashMap::new(),
             sub_bodies: BTreeMap::new(),
             mem_keys: HashSet::new(),
             found_mem: HashSet::new(),
@@ -1415,7 +1491,11 @@ impl<'a> Expander<'a> {
         }
 
         if self.subs.contains(f) && !self.every {
-            return self.sub_call(f, &params, bound, span, out);
+            let key = self.sub_key(f);
+            *self.sub_sites.entry(key.clone()).or_default() += 1;
+            if !self.inline_once.contains(&key) {
+                return self.sub_call(f, &params, bound, span, out);
+            }
         }
         let id = self.fresh();
         let exit = self.fresh();
@@ -2096,11 +2176,37 @@ impl<'a> Expander<'a> {
             for x in args {
                 a.push(self.expr_scalar(x, out)?);
             }
-            let r = self.resolve(t);
+            // A loop variable that the body doesn't assign and that nothing reads outside the
+            // body (its value after the loop is never seen) becomes a temporary: the loop's
+            // counter, without a copy (see `cfg::Builder::for_range`).
+            let mut written = HashSet::new();
+            assigned(body, &mut written);
+            let mut inside = HashMap::new();
+            count_reads(body, &mut inside);
+            // A function's local can only be read in that function.
+            let everywhere = match self.frames.last() {
+                Some(f) if f.locals.contains(t) => {
+                    let mut own = HashMap::new();
+                    count_reads(&self.fns[&f.name].body, &mut own);
+                    own.get(t).copied()
+                }
+                _ => self.reads.get(t).copied(),
+            };
+            // (A name read nowhere, like `_`, may also be assigned in the body, by an inner
+            // `for _ in …`: those writes stay as they are, dead.)
+            let private = everywhere == inside.get(t).copied() && (!written.contains(t) || everywhere.is_none());
+            let alias = private && everywhere.is_some();
+            let r = if private { format!("#i{}.{t}", self.fresh()) } else { self.resolve(t) };
             self.set_shape(&r, Shape::Scalar, target.span)?;
+            if alias {
+                self.aliases.push(HashMap::from([(t.clone(), name(&r, target.span))]));
+            }
             self.loops.push(Loop::Real);
             let b = self.stmts(body);
             self.loops.pop();
+            if alias {
+                self.aliases.pop();
+            }
             let iter = Expr { kind: ExprKind::Call { func: func.clone(), args: a, kwargs: kwargs.clone() }, span: iter.span };
             out.push(stmt(StmtKind::For { target: name(&r, target.span), iter, body: b? }, span));
             return Ok(());
@@ -2177,8 +2283,8 @@ pub fn display(n: &str) -> String {
             return format!("{} in process `{p}`", quoted(rest));
         }
     }
-    // A comprehension's own names: `#s4.s` → `s`.
-    if n.starts_with("#s") || n.starts_with("#v") {
+    // A comprehension's own names: `#s4.s` → `s`; a loop's private variable: `#i4.k` → `k`.
+    if n.starts_with("#s") || n.starts_with("#v") || n.starts_with("#i") {
         if let Some((_, own)) = n.split_once('.') {
             return own.to_string();
         }
@@ -2339,9 +2445,16 @@ pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallI
         return Err(errs);
     }
     const ROUNDS: usize = 6;
+    // Subroutines called from one place, as counted by the previous round (round 0 compiles
+    // every one as a subroutine; the count doesn't depend on that choice).
+    let mut inline_once = HashSet::new();
+    let mut reads = HashMap::new();
+    count_reads(&m.body, &mut reads);
     for round in 0..ROUNDS {
         let mut ex = Expander::new(&fns, &consts, shapes.clone());
         ex.subs = sequential_fns(&fns);
+        ex.inline_once = std::mem::take(&mut inline_once);
+        ex.reads = reads.clone();
         ex.impure = impure_fns(&fns);
         ex.mem_keys = mem_keys.clone();
         let mut body = Vec::new();
@@ -2375,6 +2488,7 @@ pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallI
             }
         }
         let new: Vec<String> = ex.found_mem.difference(&mem_keys).cloned().collect();
+        inline_once = ex.sub_sites.iter().filter(|(_, n)| **n == 1).map(|(k, _)| k.clone()).collect();
         if round == 0 || (!new.is_empty() && round + 1 < ROUNDS) {
             mem_keys.extend(new);
             // Carry over the shapes of names that are the same every round (inlined calls'

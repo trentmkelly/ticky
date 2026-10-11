@@ -91,6 +91,68 @@ fn assign(target: &str, value: Expr, span: Span) -> Stmt {
     Stmt { kind: StmtKind::Assign { targets: vec![name(target, span)], value }, span }
 }
 
+/// Whether `stmts` read and write the name `var` (anywhere, including nested blocks).
+fn uses(stmts: &[Stmt], var: &str) -> (bool, bool) {
+    let (mut read, mut written) = (false, false);
+    let expr = |e: &Expr, read: &mut bool| {
+        crate::expand::visit(e, &mut |x| *read |= matches!(&x.kind, ExprKind::Name(n) if n == var));
+    };
+    for s in stmts {
+        let is_var = |t: &Expr| matches!(&t.kind, ExprKind::Name(n) if n == var);
+        match &s.kind {
+            StmtKind::Assign { targets, value } => {
+                for t in targets {
+                    let mut hit = false;
+                    expr(t, &mut hit);
+                    if is_var(t) || matches!(&t.kind, ExprKind::Tuple(_) | ExprKind::List(_)) && hit {
+                        written = true;
+                    } else {
+                        read |= hit;
+                    }
+                }
+                expr(value, &mut read);
+            }
+            StmtKind::AugAssign { target, value, .. } | StmtKind::AnnAssign { target, value: Some(value), .. } => {
+                if is_var(target) {
+                    written = true;
+                }
+                expr(target, &mut read);
+                expr(value, &mut read);
+            }
+            StmtKind::AnnAssign { target, value: None, .. } => written |= is_var(target),
+            StmtKind::Expr(e) | StmtKind::Assert(e) | StmtKind::WaitUntil(e) | StmtKind::WaitTicks(e) | StmtKind::Return(Some(e)) => {
+                expr(e, &mut read)
+            }
+            StmtKind::If { cond, body, orelse } => {
+                expr(cond, &mut read);
+                for b in [body, orelse] {
+                    let (r, w) = uses(b, var);
+                    read |= r;
+                    written |= w;
+                }
+            }
+            StmtKind::While { cond: e, body } | StmtKind::For { iter: e, body, .. } => {
+                expr(e, &mut read);
+                if let StmtKind::For { target, .. } = &s.kind {
+                    written |= is_var(target);
+                }
+                let (r, w) = uses(body, var);
+                read |= r;
+                written |= w;
+            }
+            StmtKind::Block { body, .. } => {
+                let (r, w) = uses(body, var);
+                read |= r;
+                written |= w;
+            }
+            // Anything else might do anything.
+            StmtKind::Global(_) | StmtKind::Def { .. } | StmtKind::Sub { .. } => (read, written) = (true, true),
+            _ => {}
+        }
+    }
+    (read, written)
+}
+
 impl Builder<'_> {
     fn new_step(&mut self, span: Span) -> usize {
         self.steps.push(Draft { stmts: Vec::new(), term: Term::Open, span });
@@ -268,9 +330,17 @@ impl Builder<'_> {
                 None => return Err(Diag::error(e.span, "the range step must be a constant")),
             },
         };
+        // A temporary loop variable (`#…`, or `P:#…` in a process: the expander made it
+        // private to the loop, so its value after the loop is never read) that the body only
+        // reads is the counter itself; one the body doesn't use at all counts down to 0, so
+        // `range(n)` needs no register for `n`.
+        let (read, written) = uses(body, var);
+        let private = var.split_once(':').map_or(var.as_str(), |(_, own)| own).starts_with('#') && !written;
+        let countdown = private && !read && step == 1 && (self.konst)(&start) == Some(0) && (self.konst)(&end).is_none();
         let id = self.hidden.len();
-        let k = format!("{var}#k{id}");
+        let k = if private { var.clone() } else { format!("{var}#k{id}") };
         self.hidden.push(k.clone());
+        let (start, end, step) = if countdown { (end, int(0, sp), -1) } else { (start, end, step) };
         // The end is evaluated once, before the loop (Python semantics).
         let end = if (self.konst)(&end).is_some() {
             end
@@ -298,7 +368,9 @@ impl Builder<'_> {
         self.loops.push(Loop { brk: x, cont: Cont::Latch(latch) });
         self.cur = b;
         // Python leaves the loop variable at its last value, so it is a copy of the counter.
-        self.steps[b].stmts.push(assign(var, name(&k, sp), sp));
+        if !private {
+            self.steps[b].stmts.push(assign(var, name(&k, sp), sp));
+        }
         self.block(body)?;
         if self.open() {
             self.steps[self.cur].stmts.push(advance);
@@ -352,7 +424,11 @@ fn fuse(steps: &mut [Draft], protected: &[usize]) {
                 continue;
             }
             let only = preds(steps, b) == 1;
-            if !only && (steps[b].stmts.len() > MAX_COPY || budget == 0) {
+            // With `--opt=size`, only copy when that removes `b` (every way into it is a plain
+            // jump, so each gets a copy and `b` goes): a copy for some predecessors saves
+            // those paths a step (2 ticks) but adds code.
+            let partial = || steps.iter().filter(|d| matches!(d.term, Term::Goto(Some(t)) if t == b)).count() != preds(steps, b);
+            if !only && (steps[b].stmts.len() > MAX_COPY || budget == 0 || crate::opt_size() && partial()) {
                 continue;
             }
             if !only {

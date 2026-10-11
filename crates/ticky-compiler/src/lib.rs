@@ -25,6 +25,12 @@ pub use codegen::Codegen;
 
 thread_local! {
     static CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this compilation is `--opt=size`: set by [`compile`].
+pub fn opt_size() -> bool {
+    SIZE.with(|c| c.get())
 }
 
 /// Whether this compilation has runtime checks (`--checks`): set by [`compile`].
@@ -104,6 +110,7 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     ticky_factorio::set_quality_pool(opts.quality);
     ticky_factorio::items::set_space_age(opts.space_age);
     set_checks(opts.checks);
+    SIZE.with(|c| c.set(opts.opt == Opt::Size));
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
     let fast = compile_module(&module, opts, true)?;
     if opts.opt == Opt::Speed {
