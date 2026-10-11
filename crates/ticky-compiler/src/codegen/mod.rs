@@ -188,6 +188,7 @@ fn arith(a: Operand, op: ArOp, b: Operand, out: Sig) -> Kind {
     Kind::Arith(Arith { first: a, first_nets: Nets::BOTH, second: b, second_nets: Nets::BOTH, op, out })
 }
 
+#[derive(Clone)]
 struct Cg {
     net: Netlist,
     nets: Vec<NetSpec>,
@@ -196,8 +197,8 @@ struct Cg {
     run: Sig,
     rp: Sig,
     st: Sig,
-    /// `warm[i]` is 1 from `i + 1` ticks after RP: taps of a shared start-up delay line.
-    warm: Vec<Sig>,
+    /// Start-up signals of every-tick blocks.
+    warm: pipelined::Warm,
     bvals: Vec<BVal>,
     each: Sig,
     everything: Sig,
@@ -416,7 +417,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         run,
         rp,
         st,
-        warm: Vec::new(),
+        warm: Default::default(),
         bvals: Vec::new(),
         each: t.special("signal-each"),
         everything: t.special("signal-everything"),
@@ -436,6 +437,8 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     }
     let mut run_values = vec![(run, 1)];
     run_values.extend(clocks.iter().flatten().map(|k| (*k, 1)));
+    // The start-up counter of every-tick blocks, if they use one, counts like a clock.
+    run_values.extend(pipelined::plan_warm(&mut cg, p, &live, &comb)?.map(|w| (w, 1)));
     let run_switch = cg.net.add(Kind::Constant(ConstComb { values: run_values, on: autostart }), Role::RunSwitch);
     cg.net.entities[run_switch].description = Some(
         "Ticky RUN switch: turn this constant combinator ON to start the program. Turning it off stops and resets it."
@@ -476,13 +479,15 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     let shared = Shared { state_sig, state_bun, input_raw, ticks };
     // Where combinational outputs are read from.
     let mut comb_ref: HashMap<usize, Ref> = HashMap::new();
+    let mut comb_red: HashMap<usize, usize> = HashMap::new();
 
     let mut blocks = Vec::new();
     for (bi, b) in p.blocks.iter().enumerate() {
         let first_ent = cg.net.entities.len();
         if let Some(pipe) = &b.pipe {
-            let (direct, extra) = pipelined::pipelined_block(&mut cg, p, bi, b, pipe, &shared, &live, &comb)?;
+            let (direct, red, extra) = pipelined::pipelined_block(&mut cg, p, bi, b, pipe, &shared, &live, &comb)?;
             comb_ref.extend(direct);
+            comb_red.extend(red);
             blocks.push(BlockStats {
                 span: b.span,
                 requested: b.requested,
@@ -502,7 +507,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         procs.push(procs::main_proc(&mut cg, p, m, &shared, *any, &live)?);
     }
 
-    ports::output_ports(&mut cg, p, &shared, &comb_ref, &mut port_ents, outputs_west);
+    ports::output_ports(&mut cg, p, &shared, &comb_ref, &comb_red, &mut port_ents, outputs_west);
     let screen_lamps = ports::screens(&mut cg, p, &shared);
     cg.bfinish();
 

@@ -944,3 +944,49 @@ elsewhere).
   of one dividend, a floor result as a select's pass, INT_MIN/INT_MAX) MATCH 199 ticks.
 - Final build: `FUZZ_N=100 tools/verify.sh` clean; in-game 36/36 examples and
   cubium-generator (Cubium loaded, 1599 ticks) MATCH.
+## 2026-10-11: pipelined blocks — carry wires, start-up counter, wire sums
+
+All in `codegen/pipelined.rs` and `pipeline.rs`. Bench vs main: 2149 → 2077 combinators
+(histogram 122 → 98, math 78 → 61, warehouse 50 → 43, alarms 60 → 51, inventory 46 → 43,
+readouts, signals 3 each, dice, tally 2, arrays, demo 1); latency math 9 → 8, warehouse 9 → 7,
+nothing grew.
+
+- **Carry wires** (`Delays`): carry wire `d` is a private red wire holding the bus as it was
+  `d` ticks ago: wire 1 is one decider copying the needed signals off the bus (condition
+  `RUN ≥ MIN`, always true, so it follows the bus while RUN is off like the old chains), each
+  further wire one `each + 0`. A scalar combinator (arith, comparison, select arm, condition,
+  comb-output decider) reads the delay most of its operands share from that wire on red, the
+  rest on green; scalar output ports read a carry wire on red too (`comb_red`, ports.rs).
+  Anything else (bundle combinators read their bundle on red; register loads and conditions)
+  gets a tap `s + 0` from wire `d - 1` onto the bus. Bundles keep their own delay chains
+  (their signals may overlap; that's most of what's left: histogram 20, warehouse 12).
+- **Trial builds**: `pipelined_block` builds the block on clones of `Cg` (now `Clone`, as is
+  `BVal`) for each schedule (`Pipe::taus`: ALAP, ASAP), with and without inlined conditions,
+  and 0, 1, 2, … carry wires (until a build doesn't use them all), keeping the fewest
+  combinators; this replaced the delay estimate that picked the schedule.
+  `TICKY_DUMP_PIPE=1` prints every trial.
+- **Start-up** (`Warm`, moved here from registers.rs): when cheaper than the chain
+  (`plan_warm`, before the RUN switch is built), a counter W fed +1 by the RUN switch:
+  `[RP ≠ 0 ∧ W ≤ cap] → W` and `[RP ≠ 0 ∧ W > cap] → W = cap` (stops at cap + 1; cap is the
+  largest threshold), the enable for latency L is `[RP ≠ 0 ∧ W ≥ L + 1] → 1` and the enable
+  conditions test `W ≥ L + 1` directly. Same ticks as the chain from a start (and after RUN
+  off for ≥ L ticks); after a shorter off the chain still held the old run's taps and
+  committed at once (tally even skipped a tick), while the counter re-warms fully, like a
+  fresh start. Test `pipelines_share_delays` checks RUN off/on gives the first run's trace.
+- **Wire sums** (`pipeline::wire_sums`): sums (and `* k`) of single-use values that don't
+  depend on own state are transparent; their parts write the sum's signal with a factor
+  (comparisons/conditions/constant arms scale, `x - y` swaps, `* k` / `/ k` scale; a select's
+  signal arms scale through their single-use conditions). Scheduling gives a transparent
+  node no lag (`lag`), so its parts share a tick (ASAP is aligned afterwards) and input depths
+  shrink: latency can drop. Own-state paths are untouched, so which blocks pipeline doesn't
+  change.
+- **Inlined conditions** (`inline_conds`): a comparison/one-arm condition used only to choose
+  nonzero constants in selects is tested by those arms' deciders (operands read a tick later).
+- **Timing fuzzer** `tools/fuzz_pipes.py`: pipelined blocks (combinational outputs, half
+  with state) with inputs changing every few ticks; the trace must match Python for one
+  alignment. The other fuzzers hold inputs constant, so they miss iteration-mixing bugs: a
+  carry wire off by one passed fuzz_blocks/fuzz_exprs and failed here 8/60.
+- Checks: sim traces identical to main on every difftest-examples line except math and
+  warehouse (pure shifts by their latency drop) and dice (random streams follow entity
+  order); verify FUZZ_N=100 plus fuzz_pipes 4×300, blocks/level2/exprs 150 on other seeds.
+  fuzz_level2 seed 9 has two "no room for a wire relay" layout failures, same on main.

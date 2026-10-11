@@ -826,9 +826,9 @@ feeds back into itself through a combinator: each state's next value is a consta
 conditional constants (latch logic, checked by the load deciders themselves), or an
 accumulation `x += w` (optionally conditional, optionally with constant overrides such as a
 reset) where `w` doesn't depend on the block's own state. Inputs then flow through continuously
-and delay chains keep every combinator's operands on the same iteration. A pipelined block
-starts committing `L` ticks after the program starts, so it only ever uses inputs read after
-the start. Other blocks are multi-cycle with `P = depth + 1`; `x = (x + 1) % N` still needs
+and delays keep every combinator's operands on the same iteration. A pipelined block
+starts committing `L` ticks after the program starts (and again after RUN is turned off and
+on), so it only ever uses inputs read after the start. Other blocks are multi-cycle with `P = depth + 1`; `x = (x + 1) % N` still needs
 `P = 3` (planned: the single-decider form).
 
 ---
@@ -872,8 +872,8 @@ work and bundle/array operations scale far better.
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
 
 Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so
-plain code costs about what hand-built logic would (outside pipelined `every tick:` blocks,
-where operands must stay in step):
+plain code costs about what hand-built logic would (in pipelined `every tick:` blocks too,
+where operands must stay in step, with the restrictions noted):
 
 - **Sums on the wire.** `a + b - c` (and `* k` of such sums) costs no adders when the parts
   are only used there: each part's combinator writes the result signal, with its sign or
@@ -894,6 +894,17 @@ where operands must stay in step):
   as with `>`) and a table, instead of a comparison and selects per candidate.
 - **Reads and writes of bundle signals** go straight from and to the bundle's wire when the
   value is only copied.
+- **Delays in pipelines.** A pipelined block keeps old values on shared red carry wires, one
+  per tick of delay, each holding the bus as it was that many ticks ago: one combinator per
+  tick for the whole block rather than one per delayed value. A combinator whose delayed
+  operands are equally old reads them there; anything else gets one copy from the right wire.
+  The block is built with as many carry wires as pay off.
+- **Pipelines** get sums on the wire (when the parts don't depend on the block's own state;
+  this also shortens the pipeline, so latency can drop) and conditions tested by the select
+  deciders themselves; gated selects stay in multi-cycle logic.
+- **Start-up.** The delay before pipelined blocks start committing is one saturating counter
+  (fed by the RUN switch like a block clock) and one decider per latency, rather than a decider
+  per tick, when that's fewer.
 - **Shared terms in selects.** `x + d if c else x` is `x + (d if c else 0)`: one sum and one
   decider. Python's `%` on numbers that may be negative is this shape, so `a % 10 + b` costs
   two combinators fewer.

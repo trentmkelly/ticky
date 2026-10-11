@@ -9,7 +9,7 @@ use crate::ir::{BOp, BTerm, FOut, Graph, Op, V};
 
 /// The wires of one bundle value. Consumers read it on red (or green, for the second
 /// bundle of an element-wise operation); the wire of each colour is made when first needed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct BVal {
     /// Producing entities; `true` for constant combinators (single-sided).
     prods: Vec<(EntId, bool)>,
