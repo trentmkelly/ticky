@@ -3,6 +3,7 @@
 # usage: tools/bench.sh > before.txt; (change things); tools/bench.sh > after.txt; diff before.txt after.txt
 T=${TICKY:-./target/release/ticky}
 printf "%-14s %6s %6s %10s %8s\n" example combs steps latency tiles
+# TOTAL: summed combinators and steps, and the summed area of the footprints.
 for f in examples/*.ticky; do
   n=$(basename "$f" .ticky)
   $T check "$f" 2>&1 | python3 -c "
@@ -15,4 +16,5 @@ m = re.search(r'main program +(\d+) steps', t)
 l = ','.join(re.findall(r'latency (\d+)', t)) or '-'
 w = re.search(r'(\d+)×(\d+) tiles', t)
 print(f'{\"$n\":<14} {c.group(1):>6} {m.group(1) if m else \"-\":>6} {l:>10} {w.group(1)+\"x\"+w.group(2):>8}')"
-done
+done | awk '{ print } $2 ~ /^[0-9]+$/ { c += $2 } $3 ~ /^[0-9]+$/ { s += $3 } split($5, wh, "x") == 2 { a += wh[1] * wh[2] }
+  END { printf "%-14s %6d %6d %10s %8s\n", "TOTAL", c, s, "-", a }'

@@ -778,3 +778,26 @@ penalty, scoring maths). Changes, in order, each verified with all example tests
   first seven changes and 37/37 (incl. bestof ties and the generator with Cubium loaded) on
   the final build; a deep fuzz run (105,800 expressions, 1,100 programs) was clean; test
   `optimizations_apply` pins the small probe at ≤ 41 entities.
+
+## 2026-10-11: codegen/ and fuse/ split into modules; tools/verify.sh
+
+Pure reorganisation (moved code, visibility, imports; blueprints of every example
+byte-identical under `build --json`, `--opt size --checks`, `--place anneal`, `check` and
+`TICKY_DUMP_IR`), so concurrent compiler work lands in separate files:
+
+- `codegen/mod.rs`: shared types/helpers, `Cg` core (`alloc`, `core`, checks), `Shared`,
+  live/combinational states, top-level `codegen()`. `logic.rs`: `Cg::logic` (step/period
+  logic: clusters, gating, `inline_cond`, wire sums, selects). `pipelined.rs`: every-tick
+  blocks (`at_ref` delays). `period.rs`: `every N` clocks, EI/ES pulses (extracted from
+  `codegen()` as `period_block`). `procs.rs`: `main_proc` step machine. `registers.rs`:
+  `register`/`bregister`, samples, `counter`, `warm`, `accumulator`, `Writer`. `bundles.rs`:
+  `BVal` wires, `emit_bundle`, `emit_from_bundle`. `ports.rs`: input/output ports, screens.
+- `fuse/mod.rs`: plan types, DNF helpers, `Fuser` core (`dnf`, `rebuild`, conditions).
+  `plans.rs`: `plan`/`split`/`writer_plan`. One file per pattern rewrite: `lookups.rs`,
+  `counts.rs`, `argmax.rs`, `writes.rs` (`combine_writes`). New rewrites: a new file with an
+  `impl Fuser<'_>` block, hooked in from `rebuild` (or `split`).
+- `tools/verify.sh`: release build, frozen copy of the binary in a temp dir, `cargo test
+  --release`, `tools/bench.sh`, and every `tools/fuzz_*.py` with `TICKY=` that copy
+  (`FUZZ_N`, default 20; `FUZZ_SEED`, default 1; `BENCH_OUT=file` keeps the bench table).
+  Non-zero exit on any failure; ~40 s at the default size. `tools/bench.sh` now ends with a
+  TOTAL line (combinators, steps, summed tile area).
