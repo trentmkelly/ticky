@@ -901,6 +901,9 @@ where operands must stay in step):
 - **Functions with loops called once** are inlined: no return address, call or return.
 - With `--opt=size`, a small step reached by plain jumps is copied into them only if that
   removes it (under `speed`, also into some of them, which saves those paths a step).
+- **Shared registers.** Variables of one process that are never live at the same time (two
+  loops' counters, results of separate phases) share one register. Anything another process
+  or `every` block mentions, outputs and bundles keep their own.
 
 ### 11.3 Cost report
 

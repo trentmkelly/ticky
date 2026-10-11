@@ -697,3 +697,44 @@ test "n = 2":
         }
     }
 }
+
+/// Register sharing: variables never live at the same time use one register. `s` keeps its
+/// initial value until it's reassigned (and `p`, a copy of it, shares its register); the two
+/// loop counters share one; `p` is carried across a wait. Reading a variable before it's
+/// assigned is still an error when it could otherwise share.
+#[test]
+fn registers_are_shared() {
+    let src = r#"input  go: bool @ G
+output total: int @ T
+output prod: int @ P
+output done: bool @ D
+s = 5
+wait until go
+t = 0
+for i in range(4):
+    t += i
+    wait 1
+total = t + s
+p = 1
+for j in range(1, 5):
+    p *= j
+wait 3
+s = p
+prod = p + s
+done = True
+
+test "shared registers":
+    set go = True
+    run until done, max 200 ticks
+    assert total == 11 and prod == 48
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+    }
+    let holds: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).filter(|d| d.starts_with("variable") && d.ends_with("(hold)")).collect();
+    // `t`, `s`, one loop counter and the three outputs (9 without sharing).
+    assert_eq!(holds.len(), 6, "{holds:?}");
+    let e = error_of("input  a: int @ A\noutput o: int @ O\nwait 1\nx = a\no = x\nwait 1\no = y + 1\ny = a + 2\nwait 1\no = y\n");
+    assert!(e.contains("`y` might be used before it's assigned"), "{e}");
+}
