@@ -23,8 +23,10 @@ use crate::program::SrcKind;
 pub struct Pipe {
     /// Ticks between reading the inputs and the iteration that uses them.
     pub latency: u32,
-    /// Time offset of each node (by node index); `None` for constants and unused nodes.
-    pub tau: Vec<Option<i32>>,
+    /// Candidate schedules (as late as possible, then as soon as possible, if different): the
+    /// time offset of each node (by node index), `None` for constants and unused nodes.
+    /// Codegen builds the block with each and keeps the smaller.
+    pub taus: Vec<Vec<Option<i32>>>,
     /// Registers updated as accumulators.
     pub accs: Vec<(usize, Acc)>,
 }
@@ -260,25 +262,11 @@ pub fn plan(g: &mut Graph, srcs: &[SrcKind], plans: &mut Vec<(usize, WriterPlan)
             }
         }
     }
-    // Neither schedule always wins (late is worse when a result has many consumers): keep
-    // the one needing fewer delay combinators.
-    let delays = |tau: &[Option<i32>]| -> i32 {
-        let mut total = 0;
-        for &u in &live {
-            let Some(tu) = tau[u as usize] else { continue };
-            let mut last = latest[u as usize].unwrap_or(tu);
-            for &w in &users[u as usize] {
-                if let Some(tw) = tau[w as usize] {
-                    last = last.max(tw - 1);
-                }
-            }
-            total += (last - tu).max(0);
-        }
-        total
-    };
-    if delays(&asap) < delays(&tau) {
-        tau = asap;
+    // Neither schedule always wins (late is worse when a result has many consumers).
+    let mut taus = vec![tau];
+    if asap != taus[0] {
+        taus.push(asap);
     }
     *plans = rest;
-    Some(Pipe { latency: latency as u32, tau, accs })
+    Some(Pipe { latency: latency as u32, taus, accs })
 }

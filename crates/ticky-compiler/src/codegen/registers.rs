@@ -1,6 +1,5 @@
 //! State-holding machinery: registers (hold decider + guarded loads, scalar and bundle),
-//! sample registers, the step-timer style counter, the shared start-up delay line
-//! ([`Cg::warm`]) and the every-tick accumulator.
+//! sample registers, the step-timer style counter and the every-tick accumulator.
 
 use ticky_factorio::*;
 use ticky_syntax::Diag;
@@ -185,18 +184,6 @@ impl Cg {
             Ref::Op(Operand::Const(_)) => unreachable!("sampling a constant"),
         })
     }
-
-    /// A signal that turns on `n` ticks (n ≥ 1) after RP does, and off with it.
-    pub(super) fn warm(&mut self, n: usize) -> Result<Sig, Diag> {
-        while self.warm.len() < n {
-            let prev = self.warm.last().copied().unwrap_or(self.rp);
-            let w = self.alloc()?;
-            self.core(dec_const(vec![c(prev, CmpOp::Ne, 0)], w, 1), format!("control: start-up delay {}", self.warm.len() + 1));
-            self.warm.push(w);
-        }
-        Ok(self.warm[n - 1])
-    }
-
 }
 
 /// One writer of a register, as seen by codegen.

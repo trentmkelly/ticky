@@ -62,8 +62,9 @@ pub(super) fn input_ports(cg: &mut Cg, p: &Program, port_ents: &mut [EntId]) -> 
     Ok((input_raw, controls))
 }
 
-/// Output ports. `comb_ref`: where combinational outputs are read from.
-pub(super) fn output_ports(cg: &mut Cg, p: &Program, shared: &Shared, comb_ref: &HashMap<usize, Ref>, port_ents: &mut [EntId], outputs_west: bool) {
+/// Output ports. `comb_ref`: where combinational outputs are read from; `comb_red`: those
+/// read from a red (carry) wire rather than the bus.
+pub(super) fn output_ports(cg: &mut Cg, p: &Program, shared: &Shared, comb_ref: &HashMap<usize, Ref>, comb_red: &HashMap<usize, usize>, port_ents: &mut [EntId], outputs_west: bool) {
     let t = SignalTable::base();
     let run = cg.run;
     // Output ports: the state's value while running, 0 when stopped.
@@ -110,6 +111,10 @@ pub(super) fn output_ports(cg: &mut Cg, p: &Program, shared: &Shared, comb_ref: 
                 let outs = s.binit.iter().map(|(sg, k)| out_const(*sg, *k)).collect();
                 (dec(vec![green(c(run, CmpOp::Ne, 0))], outs), None)
             }
+            (false, Some(Ref::Op(Operand::Sig(x))), _) if comb_red.contains_key(&si) => {
+                let a = Arith { first: Operand::Sig(x), first_nets: Nets::RED, second: Operand::Sig(run), second_nets: Nets::GREEN, op: ArOp::Mul, out: port.sig };
+                (Kind::Arith(a), None)
+            }
             (false, Some(Ref::Op(Operand::Sig(x))), _) => (arith(Operand::Sig(x), ArOp::Mul, Operand::Sig(run), port.sig), None),
             (_, Some(_), _) => unreachable!("output of the wrong kind"),
             (false, None, _) => (arith(Operand::Sig(run), ArOp::Mul, Operand::Const(s.init), port.sig), None),
@@ -132,6 +137,9 @@ pub(super) fn output_ports(cg: &mut Cg, p: &Program, shared: &Shared, comb_ref: 
         cg.nets[0].members.push((id, Conn::InGreen));
         if let Some(x) = reads {
             cg.bread(x, id, false);
+        }
+        if let Some(&n) = comb_red.get(&si) {
+            cg.nets[n].members.push((id, Conn::InRed));
         }
         port_ents[pi] = id;
         if outputs_west {
