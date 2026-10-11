@@ -962,3 +962,72 @@ test "behaviour":
     assert_eq!(has("samples of main: inputs (load)"), 1, "staged inputs");
     assert!(descs.iter().any(|d| d.contains("(hold); ") && d.contains("sample of")), "shared holds: {descs:?}");
 }
+
+#[test]
+fn sorting_networks_become_ranks() {
+    // A hand-written sort's used outputs (scalars, a state array's slots, values never
+    // negative), and min/max trees that are order statistics, as selector ranks; a tree that
+    // isn't one (`mix`) stays. Zeros, duplicates and the ends of the range included.
+    // `ticky check` counted 186 combinators before this, 97 after.
+    let src = r#"input  a: int @ A
+input  b: int @ B
+input  c: int @ C
+input  d: int @ D
+input  e: int @ E
+output med: int @ M
+output second: int @ S
+output low: int @ L
+output mix: int @ X
+output small: int @ Q
+
+hist = [0] * 4
+n = 0
+
+def sort(xs):
+    for i in range(len(xs) - 1):
+        for j in range(len(xs) - 1 - i):
+            if xs[j] > xs[j + 1]:
+                t = xs[j]
+                xs[j] = xs[j + 1]
+                xs[j + 1] = t
+    return xs
+
+every 30 ticks:
+    med = sort([a, b, c, d, e])[2]
+    hist[n % 4] = a
+    n += 1
+    second = sort(hist)[1]
+    low = min(max(a, b), max(c, d), max(a, e))
+    mix = max(min(a, b), min(c, d))
+    small = sort([a & 1023, b & 1023, c & 1023, d & 1023])[1]
+
+test "order statistics":
+    set a = 5
+    set b = -3
+    set c = 0
+    set d = 5
+    set e = 2147483647
+    run 150 ticks
+    assert med == 5 and second == 5 and low == 5 and mix == 0 and small == 5
+    set a = -2147483648
+    set b = 0
+    set c = 0
+    set d = -7
+    set e = 9
+    run 150 ticks
+    assert med == 0 and second == -2147483648 and low == 0 and mix == -7 and small == 0
+    set a = 4
+    set b = 4
+    set c = -1
+    set d = 1023
+    set e = -1
+    run 150 ticks
+    assert med == 4 and second == 4 and low == 4 and mix == 4 and small == 4
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 100, "{combinators} combinators (100 when written, ports included)");
+}

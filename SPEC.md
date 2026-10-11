@@ -892,6 +892,10 @@ where operands must stay in step, with the restrictions noted):
 - **Running maximum.** `best, top = B, T` followed by `if s_i > top: best, top = K_i, s_i` for
   three or more candidates is one selector combinator (largest score, ties to the earliest,
   as with `>`) and a table, instead of a comparison and selects per candidate.
+- **Sorting networks.** A hand-written sort (compare-and-swaps), or `min`/`max` nested so
+  the result is the k-th smallest of up to 16 values (median of 3, …), becomes selector
+  combinators ranking the values (about 5 combinators per result used, any values, zeros and
+  ties included); results nobody reads cost nothing.
 - **Reads and writes of bundle signals** go straight from and to the bundle's wire when the
   value is only copied.
 - **Delays in pipelines.** A pipelined block keeps old values on shared red carry wires, one

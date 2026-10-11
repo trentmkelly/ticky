@@ -1040,6 +1040,8 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
                 let mut plans = Vec::new();
                 let raw = std::mem::take(&mut graph.checks);
                 let mut fz = Fuser::new(&mut graph);
+                let roots: Vec<V> = next.iter().map(|(_, v)| *v).chain(raw.iter().map(|c| c.0)).collect();
+                fz.plan_order_stats(&roots, pipeline && requested.is_none() && raw.is_empty() && !natural);
                 for (si, v) in next {
                     let own = srcs.iter().position(|k| *k == SrcKind::Own(si)).map(|id| fz.g.src(id as u32));
                     if let Some(p) = fz.writer_plan(v, own) {
@@ -1723,6 +1725,16 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
         // Fusion: plans for every write, condition lists for branches and waits.
         {
             let mut fz = Fuser::new(&mut g);
+            let mut roots: Vec<V> = Vec::new();
+            for s in &steps {
+                roots.extend(s.writes.iter().map(|(_, v)| *v).chain(s.checks.iter().map(|c| c.fail)));
+                match &s.kind {
+                    StepKind::Run(Next::Branch(c, ..)) | StepKind::WaitUntil(c, _) => roots.push(c.node),
+                    StepKind::WaitTicks(WaitN::Dyn(m), _) => roots.push(*m),
+                    _ => {}
+                }
+            }
+            fz.plan_order_stats(&roots, false);
             for s in &mut steps {
                 for &(si, v) in &s.writes {
                     let own = srcs.iter().position(|k| *k == SrcKind::Own(si)).map(|id| fz.g.src(id as u32));
