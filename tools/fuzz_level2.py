@@ -2,9 +2,11 @@
 """Fuzz functions and arrays against Python.
 
 Random programs define a few functions (parameters, locals, loops, early returns), use an
-array with constant and runtime indexes, and call the functions from expressions (including
-inside `and`/`or`/conditional expressions, where Python short-circuits). Final values are
-compared with Python's own execution.
+array with constant and runtime indexes, assign tuples of variables and elements (swaps and
+rotations, indexes from loop variables), and call the functions from expressions (including
+inside `and`/`or`/conditional expressions, where Python short-circuits). Some programs run as
+one `every` block instead of the main program. Final values are compared with Python's own
+execution.
 
 usage: tools/fuzz_level2.py [COUNT] [SEED]
 """
@@ -76,6 +78,8 @@ class Gen:  # pylint: disable=too-many-instance-attributes
         """One statement (as source lines)."""
         k = self.r.random()
         if depth == 0 or k < 0.45:
+            if self.r.random() < 0.12:
+                return [f"{ind}{self.tuple_assign()}"]
             if self.r.random() < 0.2:
                 return [f"{ind}arr[{self.expr(1)} % 4] = {self.expr()}"]
             v = self.r.choice(self.assignable)
@@ -99,6 +103,31 @@ class Gen:  # pylint: disable=too-many-instance-attributes
             self.loops -= 1
             return [f"{ind}for {i} in range({self.r.randint(0, 4)}):"] + body
         return [f"{ind}{self.r.choice(self.assignable)} = {self.expr()}"]
+
+    def index(self):
+        """An index into `arr`: constant, from a loop variable, or any expression."""
+        loop_vars = [v for v in self.readable if v.startswith("i")]
+        k = self.r.random()
+        if k < 0.4 and loop_vars:
+            return f"({self.r.choice(loop_vars)} + {self.r.randint(0, 3)}) % 4"
+        if k < 0.6:
+            return str(self.r.randint(-4, 3))
+        return f"{self.expr(1)} % 4"
+
+    def tuple_assign(self):
+        """`t1, t2[, t3] = …` over scalars and array elements, often a swap or rotation."""
+        targets = []
+        for _ in range(self.r.choice([2, 2, 3])):
+            if self.r.random() < 0.6:
+                targets.append(f"arr[{self.index()}]")
+            else:
+                targets.append(self.r.choice(self.assignable))
+        if self.r.random() < 0.6:
+            values = targets[1:] + targets[:1]
+            values = [v if self.r.random() < 0.8 else self.expr(1) for v in values]
+        else:
+            values = [self.expr(1) for _ in targets]
+        return f"{', '.join(targets)} = {', '.join(values)}"
 
     def block(self, ind, depth):
         """A few statements."""
@@ -142,8 +171,10 @@ def main():  # pylint: disable=too-many-locals
         g = Gen(r)
         x, y = r.randint(-20, 20), r.randint(-20, 20)
         src = ["arr = [3, -1, 4, 1]", "a = 0", "b = 1", "c = 2"]
-        # Functions see their parameters, locals and the module's variables.
-        for k in range(r.randint(1, 3)):
+        every = r.random() < 0.3
+        # Functions see their parameters, locals and the module's variables. (Not in `every`
+        # programs: inlined into unrolled loops, they make circuits too big to test quickly.)
+        for k in range(0 if every else r.randint(1, 3)):
             src += g.function(f"f{k}")
             g.funcs.append((f"f{k}", 2))
         g.readable, g.assignable = ["a", "b", "c", "x", "y"], ["a", "b", "c"]
@@ -157,14 +188,21 @@ def main():  # pylint: disable=too-many-locals
         tested += 1
         lines = ["input x: int @ X", "input y: int @ Y"]
         lines += [f"output o{i}: int @ {s}" for i, s in enumerate("ABCEFGH")] + ["output done: bool @ D"]
-        lines += src + body
-        lines += [f"o{i} = {v}" for i, v in enumerate(["a", "b", "c", "arr[0]", "arr[1]", "arr[2]", "arr[3]"])]
-        lines.append("done = True")
+        outs = [f"o{i} = {v}" for i, v in enumerate(["a", "b", "c", "arr[0]", "arr[1]", "arr[2]", "arr[3]"])]
+        if every:
+            # The same program as one `every` block (loops unroll, so loop-variable indexes
+            # become constants): it starts from the initial values on every run.
+            lines += ["every 1000 ticks:"] + ["    " + l for l in src + body + outs + ["done = True"]]
+        else:
+            lines += src + body + outs + ["done = True"]
         with tempfile.NamedTemporaryFile("w", suffix=".ticky", delete=False) as f:
             f.write("\n".join(lines) + "\n")
             path = f.name
         cmd = [TICKY, "sim", path, "--ticks", "30000", f"--set=x={x}", f"--set=y={y}"]
         out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if out.returncode != 0 and every and "too much branching" in out.stderr:
+            tested -= 1  # an `every` block's limit on unrolled `break`s, not a bug
+            continue
         if out.returncode != 0:
             failed += 1
             print(f"COMPILE FAILURE ({path}):\n{out.stderr[-1500:]}")

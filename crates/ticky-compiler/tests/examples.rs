@@ -1073,3 +1073,131 @@ test "order statistics":
     let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
     assert!(combinators <= 100, "{combinators} combinators (100 when written, ports included)");
 }
+
+/// Tuple assignments to array elements and variables: every value is taken before the first
+/// store, even when a value is just a name (an element at an index that is constant once the
+/// loop unrolls, or a variable that an earlier target assigns), in `every` blocks, the main
+/// program, nested and `while` loops, and on bundle signals; and before a later value's call
+/// can change them.
+#[test]
+fn tuple_assignments_take_values_first() {
+    let every = r#"input a: int @ A
+input b: int @ B
+output o0: int @ X
+output o1: int @ Y
+output o2: int @ Z
+output o3: int @ W
+output o4: int @ V
+output o5: int @ U
+output o6: int @ T
+output o7: int @ S
+
+def swap2(ys, i):
+    ys[i], ys[i + 1] = ys[i + 1], ys[i]
+    return ys
+
+every 30 ticks:
+    xs = [a, b, a + b]
+    for j in range(1):
+        xs[0], xs[j + 1] = xs[j + 1], xs[0]
+    o0 = xs[0] * 100 + xs[1]
+    ys = [a, b, 7]
+    for i in range(2):
+        for j in range(2 - i):
+            if ys[j] > ys[j + 1]:
+                ys[j], ys[j + 1] = ys[j + 1], ys[j]
+    o1 = ys[0] * 10000 + ys[1] * 100 + ys[2]
+    zs = [a, b]
+    m = 9
+    for j in range(1):
+        m, zs[j] = zs[j], m
+    o2 = m * 100 + zs[0]
+    ws = [a, b]
+    n = 0
+    for j in range(1):
+        zs[j], n = n + 4, zs[j + 1]
+        ws[(n + 10) % 2], ws[1 - (n + 10) % 2] = ws[1], ws[0]
+    o3 = zs[0] * 100 + n
+    o4 = ws[0] * 100 + ws[1]
+    vs = [a, b, 3]
+    for j in range(2):
+        vs[j], vs[j + 1], vs[2 - j] = vs[j + 1], vs[2 - j], vs[j]
+    o5 = vs[0] * 10000 + vs[1] * 100 + vs[2]
+    k = 0
+    us = [a, b]
+    for j in range(1):
+        k, us[k] = 1, 50
+    o6 = us[0] * 100 + us[1] + k * 1000000
+    ts = swap2([a, b, 1], 1)
+    o7 = ts[0] * 10000 + ts[1] * 100 + ts[2]
+
+test "swaps":
+    set a = 5
+    set b = -3
+    run 100
+    assert o0 == -295
+    assert o1 == -29493
+    assert o2 == 509
+    assert o3 == 397
+    assert o4 == 497
+    assert o5 == -29697
+    assert o6 == 1000550
+    assert o7 == 50097
+"#;
+    let main = every.replace("every 30 ticks:\n", "while True:\n    wait 30\n").replace("run 100", "run 1000");
+    let misc = r#"input a: int @ A
+input b: int @ B
+input s: Bundle
+output o0: int @ X
+output o1: int @ Y
+output o2: int @ Z
+output o3: Bundle
+
+every 30 ticks:
+    c = s
+    for q in range(1):
+        c["iron-plate"], c["copper-plate"] = c["copper-plate"], c["iron-plate"] + q
+    o3 = c
+    t = 0
+    for q in range(2):
+        t, c["coal"] = c["coal"] + q, t
+    o2 = t * 100 + c["coal"]
+
+while True:
+    xs = [a, b, 1, 2]
+    j = 0
+    while j < 3:
+        if xs[j] > xs[j + 1]:
+            xs[j], xs[j + 1] = xs[j + 1], xs[j]
+        j += 1
+    o0 = xs[3] * 100 + xs[0]
+    ys = [a, b]
+    for k in range(2):
+        for j in range(1):
+            ys[j], ys[k] = ys[1 - k], ys[j]
+    o1 = ys[0] * 100 + ys[1]
+    wait 5
+
+test "misc":
+    set a = 5
+    set b = -3
+    set s = {"iron-plate": 10, "copper-plate": 20, "coal": 3}
+    run 1000
+    assert o0 == 497
+    assert o1 == 505
+    assert o3["iron-plate"] == 20 and o3["copper-plate"] == 10
+    assert o2 == 103
+"#;
+    // A later value's call changes what an earlier value read (tuples and lists alike).
+    let calls = "output o0: int @ A\noutput o1: int @ B\noutput o2: int @ C\noutput o3: int @ E\n\
+                 arr = [3, -1, 4, 1]\ndef f(p):\n    arr[0] = p\n    return 1\n\
+                 arr[1], arr[2] = arr[0] + 10, f(7) + arr[0]\no0 = arr[1]\no1 = arr[2]\n\
+                 b = 0\narr[b], b = arr[3] * 2, f(9)\nys = [arr[0] - 1, f(4)]\no2 = arr[0] * 100 + arr[1]\no3 = ys[0]\n\
+                 test \"t\":\n    run 300 ticks\n    assert o0 == 13 and o1 == 8 and o2 == 413 and o3 == 1\n";
+    for src in [every, main.as_str(), misc, calls] {
+        let c = compile(src, &opts()).unwrap();
+        for r in run_tests(&c, src) {
+            assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", src)));
+        }
+    }
+}

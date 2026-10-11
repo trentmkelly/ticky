@@ -1112,3 +1112,26 @@ after the register changes; 231 → 134 before them).
 - Found, not fixed (expand.rs, reported): a tuple swap of array elements inside a `for`
   loop, `xs[j], xs[j + 1] = xs[j + 1], xs[j]`, assigns the second target the updated value
   (`[5, -3]` → `[-3, -3]`); with `t = xs[j]` swaps, or outside loops, it's right.
+
+## 2026-10-11: tuple assignment fixes (values taken before any store)
+
+- **Fix: held values that were names.** When a tuple assignment has signal-array or
+  runtime-index targets, `assign_to` takes every value first, then assigns left to right; it
+  held each value with `bind`, which leaves a plain name as it is. A name can be one of the
+  targets: `xs[j], xs[j + 1] = xs[j + 1], xs[j]` in a loop that unrolls (`every` blocks,
+  `j` a constant) reads elements `xs.1`, `xs.0`, and the first store changed the second
+  value (`[5, -3]` → `[-3, -3]`); `m, zs[j] = zs[j], m` did the same with the variable `m`
+  in the main program, and `t, b["coal"] = b["coal"] + q, t` on a bundle. Values are now
+  copied with `freeze` (constants aren't). Bench unchanged.
+- **Fix: tuple and list displays didn't freeze values a later call changes.**
+  `arr[1], arr[2] = arr[0] + 10, f(7) + arr[0]` with `f` writing `arr[0]` read `arr[0]` after
+  the call; `ExprKind::Tuple`/`List` now use `exprs_in_order` like call arguments do.
+- Test `tuple_assignments_take_values_first`. `tools/fuzz_level2.py` now generates tuple
+  assignments over variables and elements (swaps/rotations, indexes from loop variables), and
+  runs 30% of programs as one `every 1000 ticks` block (no functions there: inlined into
+  unrolled loops they took minutes per program; "too much branching" is skipped). Before the
+  fix it found 14–23 mismatches per 300 programs; after, none (seeds 1–3, 300 each).
+- Open, not a tuple bug: the `every` mode found a miscompile on main since merge 7edb202
+  (opt/pipe; both of its commits and the other parent are fine alone): a loop of runtime-index
+  writes to `arr` with `u1 = (arr[3] if x else arr[0])` gives arr[0] = 3 where Python gives
+  1 (x = y = -20). Reported to the lead; fuzz_level2 seeds 2 and 3 hit it once each.
