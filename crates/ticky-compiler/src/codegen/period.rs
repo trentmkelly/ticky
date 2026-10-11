@@ -32,7 +32,11 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
     if let Some(k) = clock {
         cg.core(dec_copy(vec![c(k, CmpOp::Lt, n), c(rp, CmpOp::Ne, 0)], k), format!("{what}: clock, period {n}"));
     }
-    cg.core(dec_const(gate(clock, 1), ei, 1), format!("{what}: sample pulse"));
+    // Only built when something reads it: a sample, or the warm-up latch.
+    let samples = b.srcs.iter().any(|k| !matches!(k, SrcKind::Own(_)));
+    if samples || warm.is_some() {
+        cg.core(dec_const(gate(clock, 1), ei, 1), format!("{what}: sample pulse"));
+    }
     let mut es_conds = gate(clock, phase_es);
     if let Some(w) = warm {
         cg.core(
