@@ -890,6 +890,7 @@ unchanged (2254 → 2240, −14).
   the merges. About half the programs of fuzz_programs/fuzz_procs/fuzz_level2 share
   registers; fuzzers clean (level2 compile failures: the same layout/signals/branching ones as
   before). In-game difftest MATCH: calculator, primes, ranking, functions.
+
 ## 2026-10-11: select stages (codegen/selects.rs): passes, flattening, several private wires
 
 Replaces the "gated selects" and `inline_cond` of `logic()` with a planner
@@ -917,7 +918,10 @@ elsewhere).
   literals per decider while flattening. After planning, `logic()` keeps only producers still
   reachable through the wired operands (flattening leaves some values unread).
 - A select can be another stage's pass if it passes nothing itself.
-- Results: cubium-generator 155 → 141, dashboard −1, bundles −1, histogram −1, nothing grew.
+- Results (on main after the IR rewrites, front end and register sharing, with the floor
+  groups below): cubium-generator 151 → 138, bundles 53 → 52, guess 39 → 38, total 2149 →
+  2134; nothing grew. (Before those merges: cubium 155 → 141, dashboard and histogram −1.)
+  200 random main programs: 38 smaller, none larger.
   The random-expression fuzzer only uses `every tick:` (pipelined, not this code); a variant
   with `every 30 ticks:` and clamp/nested-select/shared-operand shapes (2300 expressions) was
   clean, and 48 random 20-output blocks compiled smaller or equal output by output.
