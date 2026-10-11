@@ -990,3 +990,39 @@ nothing grew.
   warehouse (pure shifts by their latency drop) and dice (random streams follow entity
   order); verify FUZZ_N=100 plus fuzz_pipes 4×300, blocks/level2/exprs 150 on other seeds.
   fuzz_level2 seed 9 has two "no room for a wire relay" layout failures, same on main.
+
+## 2026-10-11: registers, holds and clocks (main 2171 → 2051)
+
+Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to mod.rs):
+
+- **Shared deciders** (`Cg::shared`/`hold`/`flush_shared`): deciders that differ only in
+  their outputs are built once with all of them. Holds of registers and samples held under
+  identical conditions (`[conds] → x copy, y copy, …`), every initial value and PC start
+  (`[ST≠0] → x = 1, pc = 1, …`), the PC holds and "RUN delayed" (`[RUN≠0]`). Merged per
+  block/process (flushed at its end, so its stats count them); deciders testing only
+  RUN/RP/ST are merged program-wide (flushed before the output ports, so per-block counts
+  leave them out). `Cond` now derives `PartialEq`. −83.
+- **Increments** (`registers::increments`, `Cg::register_incs`): a load of `own + a` /
+  `own ± k` adds `a` (or `k`) to a register that keeps holding: `a × en` (or, for a guarded
+  one, its enable decider and `a × eg`), and a constant is one decider `[en≠0 ∧ guard] → x =
+  k` reading the guard on the commit tick (like direct loads; the step's depth already
+  covers that). The hold doesn't stop for increments, so a register written only by them
+  shares the program-wide `[ST=0 ∧ RUN≠0]` hold. Resets etc. stay ordinary loads. Applied in
+  period blocks and processes, not pipelined blocks (they have their own `accumulator`).
+  Plans are rewritten before `logic()`, so the adder isn't built. −33.
+- **No unused sample pulse**: a period block that samples nothing (and has no warm-up
+  latch) builds no EI decider. blinker, calculator, demo ×2: −4.
+- **Staged inputs** (`ports::staged_inputs`): scalar inputs read by nothing but one sampler
+  (a non-pipelined block or a process, no live reads) that samples two or more of them: the
+  ports write onto a private red wire instead of the bus, and one `each(red) × en(green)`
+  loads them all under the ports' own signals (which then name the samples; one shared
+  hold). −5 (bestof −3).
+- **Shared clocks** (`period::clocks`): blocks of the same period share one clock. No
+  example has two; demo's 30/60 would need the commit pulse to test two phases (an OR),
+  but enable pulses and checks extend the pulse's conditions as one AND-term — not done.
+- Not done: merging loads that fire on the same commit (values written under the
+  register's name onto a staging wire, one `[en≠0] → x1, x2, …` decider) needs `logic()`
+  (logic.rs, another agent's file) to write chosen roots under a given signal onto a given
+  wire; est. −24 (sorting −13). Bundle loads as deciders testing the clock phase (dropping
+  EI/ES): few blocks qualify.
+- Test `registers_share_and_increment`. Verification: below.

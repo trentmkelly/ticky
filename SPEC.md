@@ -922,6 +922,10 @@ where operands must stay in step, with the restrictions noted):
 - **Shared registers.** Variables of one process that are never live at the same time (two
   loops' counters, results of separate phases) share one register. Anything another process
   or `every` block mentions, outputs and bundles keep their own.
+- **Registers.** `x += a` (and `x -= k`) adds to the held value instead of reloading it: no
+  adder, and a constant step is one decider. Registers and samples held under the same
+  conditions share one hold decider, all initial values are one decider, and blocks of the
+  same period share a clock.
 
 ### 11.3 Cost report
 
