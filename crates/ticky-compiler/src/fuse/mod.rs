@@ -9,9 +9,9 @@
 //!
 //! Layout: this file has the plan types, DNF helpers and the core of [`Fuser`] (`dnf`,
 //! `rebuild`, conditions). `plans.rs` splits register updates into guarded loads. Pattern
-//! rewrites live one per file: `lookups.rs` (table lookups), `counts.rs` (counting matches),
-//! `argmax.rs` (running maximum), `writes.rs` (combined bundle writes), `sortnet.rs`
-//! (sorting networks, order statistics). Add new pattern
+//! rewrites live one per file: `lookups.rs` (table lookups, picks among bundle reads, shared
+//! index wires), `counts.rs` (counting matches), `argmax.rs` (running maximum), `writes.rs`
+//! (combined bundle writes), `sortnet.rs` (sorting networks, order statistics). Add new pattern
 //! rewrites as their own file here, as an `impl Fuser<'_>` block, hooked in from
 //! [`Fuser::rebuild`] (or `Fuser::split` for register loads).
 
@@ -318,6 +318,7 @@ impl<'g> Fuser<'g> {
                 let b = self.rebuild(b);
                 self.g.bcount(b)
             }
+            Op::Sel(_) if self.picked_read(v).is_some() => self.picked_read(v).unwrap(),
             Op::Sel(arms) => {
                 let arms = arms.into_iter().map(|(c, x)| (self.cond_node(c), self.rebuild(x))).collect();
                 self.g.sel(arms)
@@ -404,7 +405,12 @@ impl<'g> Fuser<'g> {
             BTerm::DFilter(d, b, conds, out) => BTerm::DFilter(self.rebuild(d), self.rebuild(b), conds, out),
             BTerm::K(vals) => BTerm::K(vals),
             BTerm::Shift(s, x, c) => BTerm::Shift(s, self.rebuild(x), c),
-            BTerm::Hot(t, ix, c) => BTerm::Hot(self.rebuild(t), self.rebuild(ix), c),
+            BTerm::Hot(t, ix, c) => {
+                let t = self.rebuild(t);
+                let ix = self.shared_hot_index(ix);
+                BTerm::Hot(t, ix, c)
+            }
+            BTerm::HotEq(t, x, c) => BTerm::HotEq(self.rebuild(t), self.rebuild(x), c),
             BTerm::Fold(b, op, c, s) => BTerm::Fold(self.rebuild(b), op, c, s),
         }
     }

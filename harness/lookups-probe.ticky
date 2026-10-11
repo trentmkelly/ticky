@@ -1,0 +1,36 @@
+# In-game probe for the lookup rewrites (one-hot by a scalar / bundle read, shared index
+# wire, filter totals, conditions reading a bundle on red). MATCH on 2026-10-11 with:
+#   ticky difftest harness/lookups-probe.ticky --ticks 260 --set 'a=coal:2,stone:5,signal-A:3,iron-plate:7'
+#     --set 'b=coal:2,stone:2,signal-A:2,wood:4' --set x=2 --set y=0 --set y=3@40
+#     --set 'a=coal:4,stone:4,wood:9@60' --set x=-3@80 --set y=1@100 --set 'b={}@120' --set 'a={}@140'
+#     --set y=2@160 --set x=0@180 --set 'a=coal:1,stone:1@200'
+#     --set 'b=coal:1,stone:9,signal-A:5,iron-plate:-2@220' --set y=-1@230
+input a: Bundle
+input b: Bundle
+input x: int @ X
+input y: int @ Y
+output o0: int @ O
+output o1: Signal
+output o2: int @ P
+output o3: int @ Q
+output o4: Signal
+output o5: int @ R
+output o6: int @ S
+every 10 ticks:
+    arr = [1, 2, 3, 4]
+    arr[(x + 1) % 4] = x * 2
+    o0 = [a["coal"], a["stone"], a["signal-A"], a["iron-plate"]][(x + 1) % 4] * 1000 + arr[(x + 1) % 4]
+    o1 = S("wood") if a["coal"] == 1 else S("water") if a["coal"] == 2 else S("signal-X") if a["coal"] == 4 else Bundle().argmax()
+    o2 = 300 * ((1 if b["coal"] == 2 else 0) + (1 if b["stone"] == 2 else 0) + (1 if b["signal-A"] == 2 else 0)) - y
+    o3 = (5 if b["coal"] == a["stone"] and b["stone"] < y and b["signal-A"] >= 2 else -1) * x
+    o4 = S("wood") if y == 1 else S("water") if y == 2 else S("signal-X") if y == 3 else Bundle().argmax()
+    o5 = [b["coal"], b["wood"], b["iron-plate"]][y] if 0 <= y < 3 else 99
+    best = 0
+    top = 0
+    if a["coal"] > top:
+        best, top = 7, a["coal"]
+    if a["stone"] > top:
+        best, top = 8, a["stone"]
+    if a["wood"] > top:
+        best, top = 9, a["wood"]
+    o6 = best + x
