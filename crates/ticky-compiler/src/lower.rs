@@ -5,7 +5,7 @@ use ticky_syntax::ast::{self, BinOp, BoolOp, Expr, ExprKind, UnOp};
 use ticky_syntax::{Diag, Span};
 
 use crate::bundle::{self, Kind};
-use crate::ir::{BTerm, Graph, V};
+use crate::ir::{BTerm, Graph, Op, V};
 
 /// Resolves names to values; implemented differently for constants, blocks and tests.
 pub trait Names {
@@ -580,13 +580,33 @@ fn log2_const(g: &Graph, v: V) -> Option<i32> {
 
 /// Python `//`: floors. Free when both operands are provably non-negative.
 pub fn floor_div(g: &mut Graph, a: V, b: V) -> V {
+    let facts = g.path_facts();
+    // `(x * c1) // c2` where the product can't wrap is the real quotient `x * c1 / c2`
+    // floored, so with `c1` dividing `c2` it's `x // (c2 / c1)`, and with `c2` dividing `c1`
+    // it's `x * (c1 / c2)`: one combinator instead of two (or four, with the correction).
+    if let (Op::Ar(ArOp::Mul, x, kv), Some(c2)) = (g.op(a).clone(), g.as_const(b)) {
+        if let (Some(c1), true) = (g.as_const(kv), c2 != 0) {
+            let (c1, c2) = (c1 as i64, c2 as i64);
+            let xi = g.iv_under(x, &facts);
+            let fits = |v: i64| (i32::MIN as i64..=i32::MAX as i64).contains(&v);
+            if fits(xi.lo * c1) && fits(xi.hi * c1) {
+                if c2 % c1 == 0 && fits(c2 / c1) {
+                    let k = g.konst((c2 / c1) as i32);
+                    return floor_div(g, x, k);
+                }
+                if c1 % c2 == 0 && fits(c1 / c2) {
+                    let k = g.konst((c1 / c2) as i32);
+                    return g.ar(ArOp::Mul, x, k);
+                }
+            }
+        }
+    }
     // Arithmetic shift right is floor division by a power of two, negatives included.
     if let Some(k) = log2_const(g, b) {
         let kv = g.konst(k);
         return g.ar(ArOp::Shr, a, kv);
     }
     let q = g.ar(ArOp::Div, a, b);
-    let facts = g.path_facts();
     if g.iv_under(a, &facts).nonneg() && g.iv_under(b, &facts).nonneg() {
         return q;
     }

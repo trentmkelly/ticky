@@ -886,6 +886,13 @@ where operands must stay in step):
   as with `>`) and a table, instead of a comparison and selects per candidate.
 - **Reads and writes of bundle signals** go straight from and to the bundle's wire when the
   value is only copied.
+- **Shared terms in selects.** `x + d if c else x` is `x + (d if c else 0)`: one sum and one
+  decider. Python's `%` on numbers that may be negative is this shape, so `a % 10 + b` costs
+  two combinators fewer.
+- **Scaled division.** `(x * 1000) // 10000` is `x // 10` when `x`'s range proves the product
+  can't wrap (and `(x * 6) // 3` is `x * 2`); `x // 4 // 4` is one shift.
+- **Comparisons of clamps.** `max(x, lo) > hi` with `lo < hi` is `x > hi` (likewise for `min`
+  and other selects with a constant arm), so `clamp(x, lo, hi)`'s second test reads `x`.
 
 ### 11.3 Cost report
 

@@ -567,3 +567,36 @@ test "behaviour":
     let c = compile(&src, &opts()).unwrap();
     assert!(c.cg.netlist.entities.iter().any(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Selector(_))));
 }
+
+#[test]
+fn algebraic_rewrites() {
+    // Python `%` shares `r` between its arms (`r + (10 if r < 0 else 0)`); `* 1000 // 10000`
+    // of a clamped value is `// 10`; `max(a, 3) > 7` is `a > 7`, and `clamp`'s second test
+    // reads its input. 47 combinators before these rewrites.
+    let src = r#"input a: int @ A
+input b: int @ B
+output o: int @ O
+output p: int @ P
+output q: int @ Q
+every 10 ticks:
+    o = a % 10 + b
+    p = clamp(a, -50, 100) * 1000 // 10000
+    q = clamp(b, -5, 5) + (1 if max(a, 3) > 7 else 0)
+
+test "behaviour":
+    set a = -17
+    set b = 4
+    run 30 ticks
+    assert o == 7 and p == -2 and q == 4
+    set a = 250
+    set b = -9
+    run 30 ticks
+    assert o == -9 and p == 10 and q == -4
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 40, "{combinators} combinators (40 when written, ports and controls included)");
+}

@@ -778,3 +778,36 @@ penalty, scoring maths). Changes, in order, each verified with all example tests
   first seven changes and 37/37 (incl. bestof ties and the generator with Cubium loaded) on
   the final build; a deep fuzz run (105,800 expressions, 1,100 programs) was clean; test
   `optimizations_apply` pins the small probe at ≤ 41 entities.
+
+## 2026-10-11: IR algebraic rewrites (examples 2254 → 2171 combinators, −3.7%)
+
+Exact rewrites at node construction (ir.rs, lower.rs), so both emitters get them:
+- **Shared term out of a select** (`Graph::mux_factor`, from `mux_tf`; `mux` now ends in
+  `mux_tf`): arms `x ± d` / `x`, or `x + d1` / `x + d2`, become `x ± (d1 if c else d2)`. Exact
+  with wrapping. The new sum's interval is narrowed in place to the select's (`op_iv`, split
+  out of `intern_hint`), else `r + (b if r < 0 else 0)` from `floor_mod` would lose the
+  `[0, b)` bound and later floors would grow corrections. Skipped for nodes using `Each`
+  (comprehension lowering matches select shapes). Biggest wins: sorting 261 → 231, math
+  94 → 78, counters 43 → 38, screen 59 → 53, functions 79 → 74.
+- **Mul-then-floor-div** (`floor_div`, before the shift case): `(x * c1) // c2` with `x`'s
+  range (under the path facts) proving `x * c1` fits: `c1 | c2` → `x // (c2/c1)`, `c2 | c1`
+  → `x * (c1/c2)`. Cubium's `ore_score` (`* 1000 // 10000` of 0..20000): 153 → 151. Its
+  `jelly_need` doesn't fire: `JELLY_GOAL - jelly` is a wire input, unbounded above.
+- **Compare a select** (`Graph::cmp_select`, both operand orders): if intervals under one
+  arm's condition decide that arm's comparison, and the other arm's comparison agrees under
+  that condition, the select goes (`max(x, lo) > hi` → `x > hi`; clamp's second test now
+  reads `x`); if both arms decide, it's a constant or the condition. Interval decisions moved
+  to `decide()`. inventory 49 → 46, cubium 155 → 153, dashboard, histogram, math −1.
+- **Shift chains** (`ar`): `(x >> j) >> k` → `x >> (j + k)` when below 32. thermostat's
+  `smooth // 4` of `(…) // 4`: same count (the inner value is state), one stage shallower.
+- Looked for more with an IR-pattern scan of all examples: the 16 `(x * k) % 41`-style nodes
+  (sorting's PRNG, guess) have FULL-range `x`, so nothing exact applies. Sorting networks'
+  min/max pairs could use `hi = a + b - lo` (exact with wrapping), but `a`, `b` are shared, so
+  that costs the same without codegen help; not done.
+- Verification: no example grew; `cargo test` (new `algebraic_rewrites`, 47 → 40 entities);
+  fuzz_exprs 2×4,600, fuzz_programs 2×300, fuzz_blocks 2×300, fuzz_procs 2×200,
+  fuzz_bundles 2×300, fuzz_signals 2×200, fuzz_level2 2×100, plus an ad-hoc fuzzer of these
+  shapes (bounded `%`, clamps, `* c1 // c2`; `every tick:` and `every 30 ticks:`) 12,880
+  expressions: 0 mismatches. One fuzz_level2 program hit "no room for a wire relay"; the
+  baseline binary fails it the same way (the layout bug noted 2026-10-10). Not difftested in game.
+
