@@ -784,3 +784,51 @@ test "arms":
     let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
     assert!(combinators <= 50, "{combinators} combinators (50 when written, ports included)");
 }
+
+#[test]
+fn floor_division_by_constant() {
+    // `//` and `%` by a constant: one decider correcting the dividend (on a private wire)
+    // and the results, plus the divider(s); `//` and `%` of one dividend share the decider.
+    // 49 combinators before this (ports included).
+    let src = r#"input  x: int @ X
+input  y: int @ Y
+output a: int @ A
+output b: int @ B
+output c: int @ C
+output d: int @ D
+
+every 10 ticks:
+    a = (x - y) // 7 + 1
+    b = (x - y) % 7 + 1
+    c = (x + y) // -5 + (x * 3) % -4 + 1
+    d = ((x - 3 * y) // 1000 if x > y else 5) + 2
+
+test "floors":
+    set x = 5
+    set y = 9
+    run 30 ticks
+    assert a == 0 and b == 4 and c == -3 and d == 7
+    set x = -2147483648
+    set y = 0
+    run 30 ticks
+    assert a == -306783378 and b == 6 and c == 429496730 and d == 7
+    set x = 3
+    set y = -4
+    run 30 ticks
+    assert a == 2 and b == 1 and c == -2 and d == 2
+    set x = 2000
+    set y = -999
+    run 30 ticks
+    assert a == 429 and b == 4 and c == -200 and d == 6
+    set x = -14
+    set y = 0
+    run 30 ticks
+    assert a == -1 and b == 1 and c == 1 and d == 7
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 44, "{combinators} combinators (44 when written, ports included)");
+}

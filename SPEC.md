@@ -884,6 +884,9 @@ where operands must stay in step):
   `x if x > 0 else 0` one. Both arms can be computed values passed through.
 - **Nested selects** used only by the outer one become one stage, one decider per distinct
   result: `min(max(x, lo), hi)` is three deciders, `A if c else (B if d else x)` three.
+- **Floor division by a constant.** `a // k` is two combinators (a decider correcting the
+  dividend and the result for negative `a`, and the divider), `a % k` too, both together
+  three.
 - **Lookups.** `A if x == 1 else B if x == 2 else …` choosing signals is a constant table and
   one decider. A count like `(xs[0] == k) + (xs[1] == k) + …` is one filter and one total.
 - **Running maximum.** `best, top = B, T` followed by `if s_i > top: best, top = K_i, s_i` for

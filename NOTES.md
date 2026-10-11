@@ -923,3 +923,18 @@ elsewhere).
   clean, and 48 random 20-output blocks compiled smaller or equal output by output.
 - In-game: a probe (max of a computed value, clamp, positive part, two passes on two wires,
   nested select; INT_MIN included) MATCH 259 ticks. Test `select_stages`.
+- **Floor `//` and `%` by a constant** (`logic.rs`: `floor_groups`, `emit_floor`): the lowering
+  gives `q - [r < 0]` and `r + k·[r < 0]` (Div, Mod, comparison/condition: 3-4 combinators).
+  Instead, with c = [a < 0]: `a // k = tdiv(a + c, k) − c`, `a % k = tmod(a + c, k) +
+  (k − 1)·c` (k < 0: c = [a > 0], `a − c`, `k + 1`); checked exhaustively over small values,
+  random ones and the ends of the range (INT_MIN + 1 can't overflow). One decider reads `a`
+  from the bus and writes ±c onto `a`'s own signal *on the results' private wire* plus the
+  corrections onto the results; the divider(s) read `a` with both colours (bus value + the
+  correction). So `//` is 2 combinators, and `//` with `%` of the same dividend 3. Needs: the
+  dividend on the bus (forced), its signal reserved on that wire, the results local (or a
+  pass; wire sums allowed, factor ±1 for `//`, 1 for `%`), one group per dividend (two would
+  add their corrections). No different-signals-to-different-nets output was needed: both
+  outputs go to the private wire, and only the dividers read the dividend's name there.
+  cubium-generator −1, guess −1 (most other examples' divisions write bundles or are
+  pipelined). Test `floor_division_by_constant`; in-game probe (both signs of k, `//` and `%`
+  of one dividend, a floor result as a select's pass, INT_MIN/INT_MAX) MATCH 199 ticks.

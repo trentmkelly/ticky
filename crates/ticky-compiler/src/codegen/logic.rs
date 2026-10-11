@@ -92,12 +92,16 @@ impl Cg {
                 consumers.entry(o).or_default().push(v);
             }
         }
+        // Floor division and modulo by a constant: the dividend is read from the bus.
+        let mut floors = floor_groups(g, &producers, &|v| consumers.get(&v).cloned().unwrap_or_default());
+        let floor_bus: std::collections::HashSet<V> = floors.iter().map(|f| f.a).collect();
         let local = |v: V| -> bool {
             pass_of.contains_key(&v)
                 || is_scalar_op(v)
                     && !is_root.contains(&v)
                     && !plan.has_pass(v)
                     && !plan.force_bus.contains(&v)
+                    && !floor_bus.contains(&v)
                     && consumers.get(&v).is_some_and(|cs| cs.iter().all(|c| is_scalar_op(*c) && cluster[c] == cluster[&v]))
         };
         // A value computed only to be one signal of a bundle (`{s: x, …}`) is written onto
@@ -216,6 +220,36 @@ impl Cg {
             })
             .collect();
         let direct = |x: V| direct_reads.get(&x).copied();
+        // A floor group's results, with their multipliers, must be on one private wire (where
+        // its decider's corrections go).
+        let wire_key = |t: V| match pass_of.get(&t) {
+            Some(&(_, i)) if i > 0 => (t, usize::MAX),
+            _ => (V::MAX, cluster[&t]),
+        };
+        floors.retain_mut(|f| {
+            if let Some((q, d, _)) = f.div {
+                match fold.get(&d) {
+                    Some(&(t, m)) if transparent.contains(&q) && (m == 1 || m == -1) && local(t) => f.div_to = Some((t, m as i32)),
+                    _ => return false,
+                }
+            }
+            if let Some((r, _)) = f.rem {
+                match fold.get(&r).copied().unwrap_or((r, 1)) {
+                    (t, 1) if !transparent.contains(&r) && local(t) => f.rem_to = Some(t),
+                    _ => return false,
+                }
+            }
+            let ts: Vec<V> = f.div_to.map(|(t, _)| t).into_iter().chain(f.rem_to).collect();
+            ts.iter().all(|&t| wire_key(t) == wire_key(ts[0]))
+        });
+        // Members of a floor group: emitted with the group (and only the `%` result, a sum's
+        // target, has a signal).
+        let mut floor_at: HashMap<V, usize> = HashMap::new();
+        for (i, f) in floors.iter().enumerate() {
+            for v in [Some(f.m), f.div.map(|d| d.1), f.div.map(|d| d.2), f.rem.map(|r| r.0), f.rem.map(|r| r.1)].into_iter().flatten() {
+                floor_at.insert(v, i);
+            }
+        }
         let mut node_ref: HashMap<V, Ref> = HashMap::new();
         let mut local_sig: HashMap<V, Sig> = HashMap::new();
         let mut local_pools: HashMap<usize, VecDeque<Sig>> = HashMap::new();
@@ -241,8 +275,36 @@ impl Cg {
             }
             reserved.entry(cluster[&m]).or_default().push(s);
         }
+        // A floor group's dividend signal carries its correction on the results' wire.
+        let mut floor_sig: Vec<Option<Sig>> = Vec::new();
+        for f in &floors {
+            let a = match *g.op(f.a) {
+                Op::Src(i) => src(i).sig(),
+                _ => match node_ref.get(&f.a) {
+                    Some(r) => r.sig(),
+                    None => {
+                        let s = self.alloc()?;
+                        node_ref.insert(f.a, Ref::Op(Operand::Sig(s)));
+                        s
+                    }
+                },
+            };
+            let t = f.div_to.map(|(t, _)| t).or(f.rem_to).unwrap();
+            if own_wire.contains_key(&t) {
+                // Alone on the wire with the select's signal.
+                floor_sig.push((local_sig[&t] != a).then_some(a));
+            } else {
+                // (Two inputs on one signal, or an input on a select's signal: no.)
+                let res = reserved.entry(cluster[&t]).or_default();
+                floor_sig.push((!res.contains(&a)).then_some(a));
+                res.push(a);
+            }
+        }
         for &v in &producers {
             if fold.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || direct_reads.contains_key(&v) {
+                continue;
+            }
+            if floor_at.get(&v).is_some_and(|&i| floor_sig[i].is_some() && floors[i].rem.map(|r| r.0) != Some(v)) {
                 continue;
             }
             if let Some((_, s)) = bundle_writes.get(&v) {
@@ -270,8 +332,17 @@ impl Cg {
             }
         };
         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
+        let mut floor_done: std::collections::HashSet<usize> = Default::default();
 
         for v in producers {
+            if let Some(&i) = floor_at.get(&v) {
+                if let Some(a) = floor_sig[i] {
+                    if floor_done.insert(i) {
+                        self.emit_floor(&floors[i], a, &local_sig, &own_wire, &cluster, &mut cluster_net, what);
+                    }
+                    continue;
+                }
+            }
             if is_bun_op(v) {
                 let out = node_ref[&v].bun();
                 self.emit_bundle(g, v, out, &locate, &direct, &|x| bundle_writes.contains_key(&x), what);
@@ -449,6 +520,38 @@ impl Cg {
         Ok(node_ref)
     }
 
+    /// A floor group (see [`Floor`]): the decider and the divider(s).
+    fn emit_floor(&mut self, f: &Floor, a: Sig, local_sig: &HashMap<V, Sig>, own_wire: &HashMap<V, usize>, cluster: &HashMap<V, usize>, cluster_net: &mut HashMap<usize, usize>, what: &str) {
+        let t = f.div_to.map(|(t, _)| t).or(f.rem_to).unwrap();
+        let wire = match own_wire.get(&t) {
+            Some(&n) => n,
+            None => self.cluster_net(cluster_net, cluster[&t]),
+        };
+        let (cmp, s) = if f.k > 0 { (CmpOp::Lt, 1) } else { (CmpOp::Gt, -1) };
+        let mut outs = vec![out_const(a, s)];
+        let mut ops = Vec::new();
+        if let Some((t, m)) = f.div_to {
+            outs.push(out_const(local_sig[&t], -m));
+            ops.push((ArOp::Div, f.k * m, local_sig[&t], "floor division"));
+        }
+        if let Some(t) = f.rem_to {
+            outs.push(out_const(local_sig[&t], if f.k > 0 { f.k - 1 } else { f.k + 1 }));
+            ops.push((ArOp::Mod, f.k, local_sig[&t], "floor modulo"));
+        }
+        let id = self.net.add(dec(vec![cnd(a, cmp)], outs), Role::Core);
+        self.net.entities[id].description = Some(format!("{what}: floor correction"));
+        self.nets[0].members.push((id, Conn::InGreen));
+        self.nets[wire].members.push((id, Conn::OutRed));
+        for (op, k, out, label) in ops {
+            // The dividend from the bus plus its correction from the wire (both colours).
+            let id = self.net.add(arith(Operand::Sig(a), op, Operand::Const(k), out), Role::Core);
+            self.net.entities[id].description = Some(format!("{what}: {label}"));
+            self.nets[0].members.push((id, Conn::InGreen));
+            self.nets[wire].members.push((id, Conn::InRed));
+            self.nets[wire].members.push((id, Conn::OutRed));
+        }
+    }
+
     /// The red wire of logic cluster `k`, made when first needed.
     fn cluster_net(&mut self, nets: &mut HashMap<usize, usize>, k: usize) -> usize {
         *nets.entry(k).or_insert_with(|| {
@@ -456,4 +559,79 @@ impl Cg {
             self.nets.len() - 1
         })
     }
+}
+
+/// Python `//` and `%` by a constant `k` (lowered as `q - [r < 0]` and `r + k·[r < 0]`, with
+/// `q`, `r` the truncated quotient and remainder; `>` when k < 0) as one decider and the
+/// divider(s): with c = [a < 0],
+///
+///   a // k = tdiv(a + c, k) − c        a % k = tmod(a + c, k) + (k − 1)·c
+///
+/// (k < 0: c = [a > 0], a − c, and k + 1). Exact over the whole range, INT_MIN included. The
+/// decider reads `a` from the bus and writes ±c onto `a`'s own signal on the results' private
+/// wire, where the dividers read it summed with `a` from the bus, plus the corrections onto
+/// the results.
+pub(super) struct Floor {
+    a: V,
+    k: i32,
+    /// The truncated remainder (`Mod`).
+    m: V,
+    /// `//`: the result `q - [r < 0]`, the quotient, the comparison.
+    div: Option<(V, V, V)>,
+    /// `%`: the result `r + k·[r < 0]`, the condition.
+    rem: Option<(V, V)>,
+    /// Where the results go (wire sums): the quotient's target and multiplier (±1), the
+    /// remainder's target (multiplier 1).
+    div_to: Option<(V, i32)>,
+    rem_to: Option<V>,
+}
+
+/// Floor groups by dividend (one per dividend: two would add their corrections together).
+fn floor_groups(g: &Graph, producers: &[V], users: &dyn Fn(V) -> Vec<V>) -> Vec<Floor> {
+    let mut out: Vec<Floor> = Vec::new();
+    let zero = |v: V| g.as_const(v) == Some(0);
+    let only = |v: V| -> Option<V> {
+        let mut u = users(v);
+        u.dedup();
+        match u.as_slice() {
+            [x] => Some(*x),
+            _ => None,
+        }
+    };
+    for &m in producers {
+        let Op::Ar(ArOp::Mod, a, kv) = *g.op(m) else { continue };
+        let Some(k) = g.as_const(kv) else { continue };
+        if g.as_const(a).is_some() || matches!(k, -1..=1 | i32::MIN) || out.iter().any(|f| f.a == a) {
+            continue;
+        }
+        let op = if k > 0 { CmpOp::Lt } else { CmpOp::Gt };
+        let (mut div, mut rem) = (None, None);
+        let mut mu = users(m);
+        mu.sort_unstable();
+        mu.dedup();
+        for &u in &mu {
+            match g.op(u) {
+                Op::Cmp(o, x, z) if *o == op && *x == m && zero(*z) => {
+                    let Some(q) = only(u) else { continue };
+                    if let Op::Ar(ArOp::Sub, d, c) = *g.op(q) {
+                        if c == u && matches!(*g.op(d), Op::Ar(ArOp::Div, a2, k2) if a2 == a && k2 == kv) && only(d) == Some(q) {
+                            div = Some((q, d, u));
+                        }
+                    }
+                }
+                Op::Dec(arms) if matches!(arms.as_slice(), [(d, kk)] if *kk == k && matches!(d.as_slice(), [t] if matches!(t.as_slice(), [l] if l.op == op && l.a == m && zero(l.b)))) => {
+                    let Some(r) = only(u) else { continue };
+                    if matches!(*g.op(r), Op::Ar(ArOp::Add, x, y) if (x, y) == (m, u) || (x, y) == (u, m)) {
+                        rem = Some((r, u));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let inside = [div.map(|d: (V, V, V)| d.2), rem.map(|r: (V, V)| r.0), rem.map(|r: (V, V)| r.1)];
+        if (div.is_some() || rem.is_some()) && mu.iter().all(|u| inside.contains(&Some(*u))) {
+            out.push(Floor { a, k, m, div, rem, div_to: None, rem_to: None });
+        }
+    }
+    out
 }

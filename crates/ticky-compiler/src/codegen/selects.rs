@@ -422,8 +422,9 @@ impl Ctx<'_> {
         Ok(done)
     }
 
-    /// `x` can be computed onto the stage's private wire: only the stage uses it. (A select that
-/// isn't flattened can be too, if it passes nothing itself; checked once all are planned.)
+    /// `x` can be computed onto the stage's private wire: only the stage uses it. (A select
+    /// that isn't flattened can be too, if it passes nothing itself; checked once all are
+    /// planned.)
     fn passable(&self, x: V, inside: &dyn Fn(&V) -> bool, guards: &HashSet<V>) -> bool {
         let g = self.g;
         g.as_const(x).is_none()
