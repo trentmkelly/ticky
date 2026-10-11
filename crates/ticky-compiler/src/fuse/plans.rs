@@ -33,6 +33,12 @@ impl Fuser<'_> {
             loads.push(Load { guard, val: LoadVal::Node(r), direct: false });
             return;
         }
+        // So is an order statistic (a sorting network's output) as selectors.
+        if self.order_stats.contains_key(&v) {
+            let r = self.rebuild(v);
+            loads.push(Load { guard, val: LoadVal::Node(r), direct: false });
+            return;
+        }
         if let Some((t, f, a, b)) = self.g.as_mux(v) {
             // The top-level split is cheap (two loads) and saves the select stage.
             let top = is_true(&guard);

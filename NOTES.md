@@ -1071,3 +1071,44 @@ after the register changes; 231 → 134 before them).
   negative constant over a stepped range, `min`/`abs` elements, runtime reads, `sum`,
   `sorted`; INT_MIN/INT_MAX inputs) MATCH 399 ticks (117 combinators, 415 unrolled). Both
   re-run after rebasing onto main (frozen release copy).
+## 2026-10-11: sorting networks → selector ranks (fuse/sortnet.rs)
+
+- A min/max node is the exact select shape only: `Mux { t: Cmp(op, p, q), f: Cmp(¬op, p,
+  q), arms p/q }` with `op` one of `< <= > >=` (ties pick equal values, so all four are exact
+  over all i32). That covers `min`/`max`, `if xs[j] > xs[j+1]: swap` and `lo = a if a <= b
+  else b`. A tree of them over ≤ 16 leaves (any other nodes, constants included) is
+  evaluated on all 2^n 0/1 inputs at once (bit-parallel truth tables, AND/OR); if that is
+  "at least m ones", the node is the (n−m)-th smallest leaf (0-1 principle: min/max
+  functions commute with monotone maps), ties included.
+- Built as: leaves on distinct signals (`BGet`s of one bundle: that bundle filtered to the
+  listed signals by a `DFilter` against a constant mask, since a state array's register has
+  no known signal set; else one internal-pool signal per leaf, as argmax does). A selector
+  skips zero leaves, and zeros sit between negatives and positives, so the k-th smallest is
+  `rank k from the smallest` if negative, else `rank n−1−k from the largest` if positive,
+  else 0: two selectors, two `each < 0` / `each > 0` filters, one total. If every leaf's
+  interval is ≥ 0 (or ≤ 0) one selector and the total. Not using `sorted()`'s `2x+1` keys:
+  they need |x| < 2^30.
+- Choice (`Fuser::plan_order_stats`, called from program.rs with a block's/program's roots
+  before fusion): candidates are min/max nodes read outside the network (or roots), and
+  under those that aren't order statistics, the largest subtrees that are. Gain = the
+  network's selects and comparisons that nothing else still reads, cost = ranks + gathering;
+  all candidates together, else one by one, and only if it saves 3 combinators more than
+  the estimate's cost (small trees like `min(x, y, 7)` in math are close calls). Weights tuned
+  on 180 random networks (selects 2 / 3.5 pipelined, comparisons 1, rank 5): 23922 → 18203
+  combinators, none larger; a fresh set of 150: 81 smaller, none larger.
+  `TICKY_DUMP_SORTNET=1` prints the choices.
+- Bench (on main 7f841f5): stats 173 → 53 (its 28-swap bubble sort's median: two ranks;
+  `sorted()` instead gave 68 on an older main); others unchanged (1957 → 1837).
+- `tools/fuzz_sortnets.py`: bubble sorts, random compare-and-swap networks in four
+  spellings, min/max trees (mostly not order statistics), median-of-3 formulas; leaves from
+  inputs, computed, constants, a state array's slots, or all `& 1023` (one-sided);
+  `every tick:`, `every 120 ticks:` and small networks in the main program; 10 vectors each
+  with duplicates, zeros, ±1, INT_MIN/INT_MAX. 5,000+ programs clean; a few too big for the
+  signal allocator are skipped (same on the base binary). Test `sorting_networks_become_ranks`.
+- In-game: difftest-examples 36/36 MATCH (on 7edb202); after rebasing onto 7f841f5, stats
+  (1499 ticks) and a probe (the test's program plus a pipelined median of 5; zeros,
+  duplicates, INT_MIN/INT_MAX, all-zero inputs; 399 ticks) MATCH. `FUZZ_N=100
+  tools/verify.sh` clean on 7f841f5.
+- Found, not fixed (expand.rs, reported): a tuple swap of array elements inside a `for`
+  loop, `xs[j], xs[j + 1] = xs[j + 1], xs[j]`, assigns the second target the updated value
+  (`[5, -3]` → `[-3, -3]`); with `t = xs[j]` swaps, or outside loops, it's right.

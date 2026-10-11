@@ -10,7 +10,8 @@
 //! Layout: this file has the plan types, DNF helpers and the core of [`Fuser`] (`dnf`,
 //! `rebuild`, conditions). `plans.rs` splits register updates into guarded loads. Pattern
 //! rewrites live one per file: `lookups.rs` (table lookups), `counts.rs` (counting matches),
-//! `argmax.rs` (running maximum), `writes.rs` (combined bundle writes). Add new pattern
+//! `argmax.rs` (running maximum), `writes.rs` (combined bundle writes), `sortnet.rs`
+//! (sorting networks, order statistics). Add new pattern
 //! rewrites as their own file here, as an `impl Fuser<'_>` block, hooked in from
 //! [`Fuser::rebuild`] (or `Fuser::split` for register loads).
 
@@ -18,6 +19,7 @@ mod argmax;
 mod counts;
 mod lookups;
 mod plans;
+mod sortnet;
 mod writes;
 
 use std::collections::HashMap;
@@ -166,11 +168,13 @@ pub struct Fuser<'g> {
     pub g: &'g mut Graph,
     memo: HashMap<V, V>,
     dnf_memo: HashMap<(V, bool), Option<Dnf>>,
+    /// Min/max nodes to build as order statistics: their leaves and rank (`sortnet.rs`).
+    order_stats: HashMap<V, (Vec<V>, usize)>,
 }
 
 impl<'g> Fuser<'g> {
     pub fn new(g: &'g mut Graph) -> Self {
-        Fuser { g, memo: HashMap::new(), dnf_memo: HashMap::new() }
+        Fuser { g, memo: HashMap::new(), dnf_memo: HashMap::new(), order_stats: HashMap::new() }
     }
 
     /// A single literal, folding constants.
@@ -249,6 +253,11 @@ impl<'g> Fuser<'g> {
     /// The node `v` with boolean subexpressions fused into deciders.
     pub fn rebuild(&mut self, v: V) -> V {
         if let Some(&r) = self.memo.get(&v) {
+            return r;
+        }
+        // A tree of min/max that is an order statistic: selector combinators.
+        if let Some(r) = self.order_stat(v) {
+            self.memo.insert(v, r);
             return r;
         }
         let hint = self.g.iv(v);
