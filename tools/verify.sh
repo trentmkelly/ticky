@@ -34,8 +34,8 @@ for f in tools/fuzz_*.py; do
   tail -n 3 "$DIR/fuzz.log"
   if [ $rc -ne 0 ]; then
     fail+=("$f")
-    cp "$DIR/fuzz.log" "/tmp/ticky-verify-$(basename "$f" .py).log"
-    echo "   (full log: /tmp/ticky-verify-$(basename "$f" .py).log)"
+    cp "$DIR/fuzz.log" "/tmp/ticky-verify-$$-$(basename "$f" .py).log"
+    echo "   (full log: /tmp/ticky-verify-$$-$(basename "$f" .py).log)"
   fi
 done
 
