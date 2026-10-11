@@ -54,7 +54,7 @@ pub fn exact(name: &str, kind: Option<SignalKind>, span: Span) -> Sig {
     let t = SignalTable::base();
     let s = match kind {
         Some(k) => t.intern(k, name),
-        None => t.lookup(name).unwrap_or_else(|| t.intern(SignalKind::Item, name)),
+        None => t.lookup_untyped(name),
     };
     unknown(s, span)
 }

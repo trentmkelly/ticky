@@ -495,3 +495,32 @@ test "signals":
     let c = compile(&src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
     assert!(c.cg.netlist.entities.len() < 400, "{} entities", c.cg.netlist.entities.len());
 }
+
+#[test]
+fn modded_item_and_recipe_share_a_name() {
+    // `S("x", type="recipe")` first used to make every later plain `"x"` the recipe too, so
+    // `stock["x"]` read the recipe signal (always 0 on a chest's wire).
+    let src = r#"
+input  stock: Bundle
+output o: int @ O
+output r: Signal
+R = S("ticky-test-goo", type="recipe")
+every tick:
+    o = stock["ticky-test-goo"]
+    r = R if stock["ticky-test-goo"] > 5 else Bundle().argmax()
+
+test "the item, not the recipe":
+    set stock = {"ticky-test-goo": 9}
+    run 10 ticks
+    assert o == 9 and r == R
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let json = c.blueprint_json().to_string();
+    assert!(json.contains(r#""name":"ticky-test-goo","type":"recipe""#) || json.contains(r#""type":"recipe","name":"ticky-test-goo""#));
+    let t = ticky_factorio::SignalTable::base();
+    let item = t.lookup_kind(ticky_factorio::SignalKind::Item, "ticky-test-goo").expect("the item was added");
+    assert_eq!(t.lookup("ticky-test-goo"), Some(item));
+}

@@ -715,3 +715,21 @@ In-game difftest MATCH with Cubium loaded
   COPPER_FLOOR (and interrupted below half of it); jelly rows stop at JELLY_GOAL or when they'd
   dip into CUBE_RESERVE (allowed only while there's < 50 jelly). Turn period 30 → 40 ticks
   (depth 32). 261 combinators, 10 tests, in-game MATCH 1599 ticks incl. the stall state.
+- Still "only recharge and jelly" in game. Loaded the user's autosave headless (copy, symlinked
+  mods, /silent-command over the server's stdin FIFO) and traced the controller's port wires:
+  it kept choosing plain cube-jelly with 1000-2000 jelly on the warehouse wire. **Compiler
+  bug:** `S("cube-jelly", type="recipe")` registered the modded name first, and the signal
+  table's by-name index is first-wins, so every later plain `"cube-jelly"` (`warehouse[...]`,
+  test inputs, `--set`) meant the *recipe*: the controller read jelly as 0 forever. Tests and
+  the difftest passed because their inputs went through the same lookup. Fix: plain names go
+  through `SignalTable::lookup_plain`/`lookup_untyped` (a modded non-item/fluid/virtual signal
+  is only found with its type; else the item is interned), and a later item/fluid/virtual
+  takes over the by-name entry. Test `modded_item_and_recipe_share_a_name` (fails before).
+  Bench identical.
+- Probe `recipeprobe`: "Set recipe" takes the recipe signal even at 1 against item signals at
+  50 and against the machine's own "read ingredients" on the same wire (so that's no hazard).
+- The user's real setup: rows of 6 `advanced-assembling-machine-returns` (working count on
+  signal-A..D), an aai-warehouse. At the autosave everything was dormant with 0 copper.
+- **Caution:** the user's running game got SIGTERM ~1 min after the headless server with
+  their full mod set (SteamAppId=427520) started; cause unproven. Don't run their save
+  headless while their game is up without asking.

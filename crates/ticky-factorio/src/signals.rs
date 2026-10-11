@@ -124,7 +124,18 @@ impl SignalTable {
         let sig = Sig(g.sigs.len() as u16);
         g.by_key.insert((info.kind, info.name.clone(), info.quality), sig);
         if info.quality == 0 {
-            g.by_name.entry(info.name.clone()).or_insert(sig);
+            // A plain name means the item (or fluid, or virtual signal) even when a modded
+            // recipe of the same name was added first, e.g. by `S("x", type="recipe")`.
+            let plain = |k: SignalKind| matches!(k, SignalKind::Item | SignalKind::Fluid | SignalKind::Virtual);
+            match g.by_name.get(&info.name).copied() {
+                None => {
+                    g.by_name.insert(info.name.clone(), sig);
+                }
+                Some(old) if plain(info.kind) && !plain(g.sigs[old.0 as usize].kind) => {
+                    g.by_name.insert(info.name.clone(), sig);
+                }
+                Some(_) => {}
+            }
         }
         g.sigs.push(Box::leak(Box::new(info)));
         sig
@@ -178,10 +189,10 @@ impl SignalTable {
     /// A signal written as `name` or `name@quality`.
     pub fn lookup_display(&self, text: &str) -> Option<Sig> {
         match text.split_once('@') {
-            None => self.lookup(text),
+            None => self.lookup_plain(text),
             Some((n, q)) => {
                 let q = QUALITIES.iter().position(|x| *x == q)? as u8;
-                Some(self.with_quality(self.lookup(n)?, q))
+                Some(self.with_quality(self.lookup_plain(n)?, q))
             }
         }
     }
@@ -204,6 +215,19 @@ impl SignalTable {
         self.info(s).usable.then_some(s)
     }
 
+    /// A signal written without a type: [`lookup`](Self::lookup), except that a modded
+    /// (unknown) signal of another type, such as a recipe from `S("x", type="recipe")`,
+    /// doesn't count, and an unknown name is added as an item.
+    pub fn lookup_untyped(&self, exact: &str) -> Sig {
+        self.lookup_plain(exact).unwrap_or_else(|| self.intern(SignalKind::Item, exact))
+    }
+
+    /// [`lookup`](Self::lookup) for a name written without a type: a modded signal of a type
+    /// other than item, fluid or virtual is only found with its type.
+    pub fn lookup_plain(&self, exact: &str) -> Option<Sig> {
+        self.lookup(exact).filter(|s| self.info(*s).known || matches!(self.info(*s).kind, SignalKind::Item | SignalKind::Fluid | SignalKind::Virtual))
+    }
+
     /// A signal by type and exact name, whether or not it's usable.
     pub fn lookup_kind(&self, kind: SignalKind, exact: &str) -> Option<Sig> {
         self.inner.read().unwrap().by_key.get(&(kind, exact.to_string(), 0)).copied()
@@ -222,7 +246,7 @@ impl SignalTable {
     /// `A` → `signal-A`, `red` → `signal-red`.
     pub fn resolve_ident(&self, ident: &str) -> Option<Sig> {
         let dashed = ident.replace('_', "-");
-        self.lookup(&dashed).or_else(|| self.lookup(&format!("signal-{dashed}")))
+        self.lookup_plain(&dashed).or_else(|| self.lookup_plain(&format!("signal-{dashed}")))
     }
 
     /// A wildcard virtual signal: `signal-each`, `signal-everything` or `signal-anything`.
