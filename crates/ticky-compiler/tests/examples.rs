@@ -738,3 +738,49 @@ test "shared registers":
     let e = error_of("input  a: int @ A\noutput o: int @ O\nwait 1\nx = a\no = x\nwait 1\no = y + 1\ny = a + 2\nwait 1\no = y\n");
     assert!(e.contains("`y` might be used before it's assigned"), "{e}");
 }
+
+#[test]
+fn select_stages() {
+    // Selects as stages of deciders: values passed through private wires (`max` 2 deciders,
+    // a clamp 3, a positive part 1), both arms computed (two wires), a nested select
+    // flattened (3 deciders). 58 combinators before these.
+    let src = r#"input  x: int @ X
+input  y: int @ Y
+output a: int @ A
+output b: int @ B
+output c: int @ C
+output d: int @ D
+output e: int @ E
+
+every 10 ticks:
+    a = max(x * 3 - y, 7) + 1
+    b = min(max(x + y, -5), 20) * 2
+    c = ((x - 4) if x - 4 > 0 else 0) + y
+    d = ((x * 5) if y > 2 else (y - x)) - 1
+    e = (100 if x > 10 else (x * 2 if y < 0 else -3)) + x
+
+test "arms":
+    set x = 6
+    set y = -3
+    run 30 ticks
+    assert a == 22 and b == 6 and c == -1 and d == -10 and e == 18
+    set x = 1
+    set y = 4
+    run 30 ticks
+    assert a == 8 and b == 10 and c == 4 and d == 4 and e == -2
+    set x = 30
+    set y = -40
+    run 30 ticks
+    assert a == 131 and b == -10 and c == -14 and d == -71 and e == 130
+    set x = 2
+    set y = 30
+    run 30 ticks
+    assert b == 40 and c == 30 and d == 9 and e == -1
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 50, "{combinators} combinators (50 when written, ports included)");
+}

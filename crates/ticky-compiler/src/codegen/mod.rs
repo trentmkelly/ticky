@@ -29,6 +29,7 @@ mod pipelined;
 mod ports;
 mod procs;
 mod registers;
+mod selects;
 
 use std::collections::{HashMap, VecDeque};
 

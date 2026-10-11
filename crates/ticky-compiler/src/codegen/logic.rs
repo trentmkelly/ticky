@@ -9,6 +9,7 @@ use ticky_factorio::*;
 use ticky_syntax::{Diag, Span};
 
 use super::*;
+use super::selects::{self, Opd, Out};
 use crate::ir::{BTerm, Graph, Op, V};
 
 impl Cg {
@@ -28,82 +29,60 @@ impl Cg {
         let producers: Vec<V> = live.iter().copied().filter(|v| is_scalar_op(*v) || is_read(*v) || is_bun_op(*v)).collect();
         let is_root: std::collections::HashSet<V> = roots.iter().copied().collect();
 
-        // A comparison (or one-term condition) used only to choose constant arms of selects
-        // isn't built: each arm's decider tests it itself (`K if x > 5 else …` is one decider
-        // `x > 5 → K`, not a comparison plus a gate).
+        // Selects become stages of deciders (see `selects.rs`): conditions inlined, arm
+        // values passed through private wires, nested selects flattened.
         let mut pre: HashMap<V, Vec<V>> = HashMap::new();
         for &v in &producers {
             for o in g.operands(v) {
                 pre.entry(o).or_default().push(v);
             }
         }
-        let boolean = |c: V| match g.op(c) {
-            Op::Cmp(_, a, _) => g.as_const(*a).is_none(),
-            Op::Dec(arms) => arms.len() == 1 && arms[0].1 == 1,
-            _ => false,
-        };
-        // Gated selects: in `x if c else …` with `x` computed only for it, `x` is computed
-        // straight onto the select's own signal on the cluster's private wire, and a decider
-        // testing `c` passes it through to the bus (one decider, instead of a comparison and
-        // a multiplier). One such arm per select; the select then lives on the bus.
-        let mut gate: HashMap<V, (V, V)> = HashMap::new();
-        for &m in &producers {
-            let arms: Vec<(V, V)> = match g.op(m) {
-                Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
-                Op::Sel(arms) => arms.clone(),
-                _ => continue,
-            };
-            let pick = arms.into_iter().find(|&(c, x)| {
-                g.as_const(x).is_none()
-                    && x != c
-                    && is_scalar_op(x)
-                    && !gate.contains_key(&x)
-                    && !is_root.contains(&x)
-                    && pre.get(&x).is_some_and(|cs| cs.as_slice() == [m])
-                    && boolean(c)
-            });
-            if let Some(arm) = pick {
-                gate.insert(m, arm);
+        let plan = selects::plan(g, &producers, &is_root, &pre);
+        let inline_cond = &plan.inline_cond;
+        // Each stage's passes, by value: (select, wire index — 0 for the cluster's own).
+        let mut pass_of: HashMap<V, (V, usize)> = HashMap::new();
+        for (&m, st) in &plan.stages {
+            for (i, &x) in st.passes.iter().enumerate() {
+                pass_of.insert(x, (m, i));
             }
         }
-        let inline_cond: std::collections::HashSet<V> = {
-            producers
-                .iter()
-                .copied()
-                .filter(|&c| {
-                    boolean(c)
-                        && !is_root.contains(&c)
-                        && pre.get(&c).is_some_and(|cs| {
-                            cs.iter().all(|&m| {
-                                let arms: Vec<(V, V)> = match g.op(m) {
-                                    Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
-                                    Op::Sel(arms) => arms.clone(),
-                                    _ => return false,
-                                };
-                                arms.iter().all(|&(cv, x)| match g.as_const(x) {
-                                    Some(0) => true,
-                                    _ if x == c => false,
-                                    Some(_) => true,
-                                    None => cv != c || gate.get(&m) == Some(&(cv, x)),
-                                })
-                            })
-                        })
-                })
-                .collect()
-        };
-        // Operands as wired: an inlined condition's own operands instead of it.
+        // Operands as wired: a stage's reads; an inlined condition's own operands instead of it.
         let eff_operands = |v: V| -> Vec<V> {
+            if let Some(st) = plan.stages.get(&v) {
+                return st.all_reads();
+            }
             g.operands(v).into_iter().flat_map(|o| if inline_cond.contains(&o) { g.operands(o) } else { vec![o] }).collect()
         };
-        let producers: Vec<V> = producers.into_iter().filter(|v| !inline_cond.contains(v)).collect();
+        // Only what's still read: flattening and inlining leave some values unused.
+        let producers: Vec<V> = {
+            let set: std::collections::HashSet<V> = producers.iter().copied().filter(|v| !inline_cond.contains(v) && !plan.absorbed.contains(v)).collect();
+            let mut needed: std::collections::HashSet<V> = Default::default();
+            let mut stack: Vec<V> = roots.iter().copied().filter(|v| set.contains(v)).collect();
+            while let Some(v) = stack.pop() {
+                if needed.insert(v) {
+                    stack.extend(eff_operands(v).into_iter().filter(|o| set.contains(o)));
+                }
+            }
+            producers.into_iter().filter(|v| needed.contains(v)).collect()
+        };
+        if std::env::var_os("TICKY_DUMP_IR").is_some() {
+            for &v in &producers {
+                if let Some(st) = plan.stages.get(&v) {
+                    eprintln!("  stage %{v}: passes {:?}", st.passes);
+                    for (d, o) in &st.deciders {
+                        eprintln!("    {o:?} if {d:?}");
+                    }
+                }
+            }
+        }
 
         // Split the logic into clusters of consecutive combinators. A value whose consumers
         // are all in its own cluster lives on that cluster's private red wire, where signal
         // names can be reused; everything else goes on the shared green bus. Values that
         // bundle combinators read must be on the bus (their red input carries the bundle).
         let mut cluster: HashMap<V, usize> = producers.iter().enumerate().map(|(i, v)| (*v, i / CLUSTER)).collect();
-        // A gated value sits on its select's private wire.
-        for (m, (_, x)) in &gate {
+        // A passed value sits on its select's private wire.
+        for (x, (m, _)) in &pass_of {
             let k = cluster[m];
             cluster.insert(*x, k);
         }
@@ -114,10 +93,12 @@ impl Cg {
             }
         }
         let local = |v: V| -> bool {
-            is_scalar_op(v)
-                && !is_root.contains(&v)
-                && !gate.contains_key(&v)
-                && consumers.get(&v).is_some_and(|cs| cs.iter().all(|c| is_scalar_op(*c) && cluster[c] == cluster[&v]))
+            pass_of.contains_key(&v)
+                || is_scalar_op(v)
+                    && !is_root.contains(&v)
+                    && !plan.has_pass(v)
+                    && !plan.force_bus.contains(&v)
+                    && consumers.get(&v).is_some_and(|cs| cs.iter().all(|c| is_scalar_op(*c) && cluster[c] == cluster[&v]))
         };
         // A value computed only to be one signal of a bundle (`{s: x, …}`) is written onto
         // the bundle's wire as that signal by the combinators computing it (no copy).
@@ -180,7 +161,7 @@ impl Cg {
         // `* k` pushed into its operand) emits nothing itself.
         let mut fold: HashMap<V, (V, i64)> = HashMap::new();
         // Gated selects pass a signal through under its own name, so can't write a sum's.
-        let sum_op = |v: V| is_scalar_op(v) && !gate.contains_key(&v);
+        let sum_op = |v: V| is_scalar_op(v) && !plan.has_pass(v);
         let mut transparent: std::collections::HashSet<V> = Default::default();
         {
             // Reads write the bus or a cluster wire, not a bundle's.
@@ -238,19 +219,27 @@ impl Cg {
         let mut node_ref: HashMap<V, Ref> = HashMap::new();
         let mut local_sig: HashMap<V, Sig> = HashMap::new();
         let mut local_pools: HashMap<usize, VecDeque<Sig>> = HashMap::new();
-        // A gated select's bus signal is also its value's name on the private wire, so no
-        // other value of that cluster may use it there.
+        // A select's bus signal is also its passed values' name on the private wires, so no
+        // other value of that cluster may use it there. Further passes get wires of their own.
         let mut reserved: HashMap<usize, Vec<Sig>> = HashMap::new();
+        let mut own_wire: HashMap<V, usize> = HashMap::new();
         for &m in &producers {
-            if let Some((_, x)) = gate.get(&m) {
-                let s = match bundle_writes.get(&m) {
-                    Some((_, s)) => *s,
-                    None => self.alloc()?,
-                };
-                node_ref.insert(m, Ref::Op(Operand::Sig(s)));
-                local_sig.insert(*x, s);
-                reserved.entry(cluster[&m]).or_default().push(s);
+            if !plan.has_pass(m) {
+                continue;
             }
+            let s = match bundle_writes.get(&m) {
+                Some((_, s)) => *s,
+                None => self.alloc()?,
+            };
+            node_ref.insert(m, Ref::Op(Operand::Sig(s)));
+            for (i, &x) in plan.stages[&m].passes.iter().enumerate() {
+                local_sig.insert(x, s);
+                if i > 0 {
+                    self.nets.push(NetSpec { red: true, members: Vec::new() });
+                    own_wire.insert(x, self.nets.len() - 1);
+                }
+            }
+            reserved.entry(cluster[&m]).or_default().push(s);
         }
         for &v in &producers {
             if fold.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || direct_reads.contains_key(&v) {
@@ -295,11 +284,10 @@ impl Cg {
                 let (t, m) = fold.get(&v).copied().unwrap_or((v, 1));
                 let (out, net) = match local_sig.get(&t) {
                     Some(s) => {
-                        let k = cluster[&t];
-                        let ni = *cluster_net.entry(k).or_insert_with(|| {
-                            self.nets.push(NetSpec { red: true, members: Vec::new() });
-                            self.nets.len() - 1
-                        });
+                        let ni = match own_wire.get(&t) {
+                            Some(&n) => n,
+                            None => self.cluster_net(&mut cluster_net, cluster[&t]),
+                        };
                         (*s, Some(ni))
                     }
                     None => (node_ref[&t].sig(), None),
@@ -316,10 +304,83 @@ impl Cg {
                 Some(s) => *s,
                 None => node_ref[&target].sig(),
             };
-            let ops = eff_operands(v);
-            let reads_local = ops.iter().any(|o| local(*o));
             let out_local = local(target);
             let out_bundle = bundle_writes.get(&target).map(|(bun, _)| node_ref[bun].bun());
+            // Where a combinator's output goes: a bundle's wire, the bus, or (for a value that
+            // lives on a private wire) that wire.
+            let wire_out = |cg: &mut Cg, cluster_net: &mut HashMap<usize, usize>, id: EntId| {
+                match out_bundle {
+                    Some(b) => cg.bprod(b, id),
+                    None if !out_local => cg.nets[0].members.push((id, Conn::OutGreen)),
+                    None => {
+                        let ni = match own_wire.get(&target) {
+                            Some(&n) => n,
+                            None => cg.cluster_net(cluster_net, cluster[&v]),
+                        };
+                        cg.nets[ni].members.push((id, Conn::OutRed));
+                    }
+                }
+            };
+            if let Some(st) = plan.stages.get(&v) {
+                for (d, o) in &st.deciders {
+                    let reads = selects::Stage::reads(d, o);
+                    // The red wire it reads: a further pass's own, else the cluster's (a
+                    // decider has one red input; the plan moved everything else to the bus).
+                    let red = match reads.iter().find_map(|u| own_wire.get(u)) {
+                        Some(&n) => Some(n),
+                        None if reads.iter().any(|&u| local(u)) => Some(self.cluster_net(&mut cluster_net, cluster[&v])),
+                        None => None,
+                    };
+                    let bus = if red.is_some() { Nets::GREEN } else { Nets::BOTH };
+                    let pick = |u: V| -> (Operand, Nets) {
+                        match *g.op(u) {
+                            Op::Const(k) => (Operand::Const(k), Nets::BOTH),
+                            Op::Src(s) => (src(s).op(), bus),
+                            _ if local(u) => (Operand::Sig(local_sig[&u]), Nets::RED),
+                            _ => (node_ref[&u].op(), bus),
+                        }
+                    };
+                    let opnd = |o: Opd| match o {
+                        Opd::K(k) => (Operand::Const(k), Nets::BOTH),
+                        Opd::V(u) => pick(u),
+                    };
+                    let mut terms: CDnf = Vec::new();
+                    'terms: for t in d {
+                        let mut conds = Vec::new();
+                        for l in t {
+                            let (x, y) = (opnd(l.a), opnd(l.b));
+                            let (cmp, (first, first_nets), (second, second_nets)) = match (x.0, y.0) {
+                                (Operand::Sig(s), _) => (l.op, (s, x.1), y),
+                                (Operand::Const(_), Operand::Sig(s)) => (l.op.flip(), (s, y.1), x),
+                                (Operand::Const(p), Operand::Const(q)) if l.op.apply(p, q) => continue,
+                                (Operand::Const(_), Operand::Const(_)) => continue 'terms,
+                            };
+                            conds.push(Cond { first, first_nets, second, second_nets, cmp, and: true });
+                        }
+                        assert!(!conds.is_empty(), "a select arm that always holds");
+                        terms.push(conds);
+                    }
+                    let kind = match *o {
+                        _ if terms.is_empty() && !matches!(o, Out::Mul(..)) => continue,
+                        Out::K(k) => dec_const(distribute(&[], &terms), out, k * sign),
+                        Out::Pass(_) => dec(distribute(&[], &terms), vec![DOut { sig: out, copy: true, constant: 0, nets: Nets::RED }]),
+                        Out::Mul(x, c) => {
+                            let ((first, first_nets), (second, second_nets)) = (pick(x), pick(c));
+                            Kind::Arith(Arith { first, first_nets, second, second_nets, op: ArOp::Mul, out })
+                        }
+                    };
+                    let id = self.net.add(kind, Role::Core);
+                    self.net.entities[id].description = Some(format!("{what}: select"));
+                    self.nets[0].members.push((id, Conn::InGreen));
+                    if let Some(n) = red {
+                        self.nets[n].members.push((id, Conn::InRed));
+                    }
+                    wire_out(self, &mut cluster_net, id);
+                }
+                continue;
+            }
+            let ops = eff_operands(v);
+            let reads_local = ops.iter().any(|o| local(*o));
             // With a red input, every operand must say which wire it comes from.
             let pick = |u: V| -> (Operand, Nets) {
                 match *g.op(u) {
@@ -364,52 +425,6 @@ impl Cg {
                 }
                 Op::Ar(op, a, b) => kinds.push((ar(a, op, b), "arithmetic")),
                 Op::Cmp(op, a, b) => kinds.push((dec_const(vec![cond(a, op, b)], out, sign), "comparison")),
-                Op::Mux { .. } | Op::Sel(_) => {
-                    let arms: Vec<(V, V)> = match g.op(v) {
-                        Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
-                        Op::Sel(arms) => arms.clone(),
-                        _ => unreachable!(),
-                    };
-                    for (cv, val) in arms {
-                        if gate.get(&v) == Some(&(cv, val)) {
-                            // The value is on the private wire under this select's signal.
-                            let conds = match g.op(cv) {
-                                Op::Cmp(op, a, b) if inline_cond.contains(&cv) => vec![cond(*a, *op, *b)],
-                                Op::Dec(arms) if inline_cond.contains(&cv) => {
-                                    let terms: CDnf = arms[0].0.iter().map(|t| t.iter().map(|l| cond(l.a, l.op, l.b)).collect()).collect();
-                                    distribute(&[], &terms)
-                                }
-                                _ => {
-                                    let (cs, cn) = sig(cv);
-                                    vec![Cond { first: cs, first_nets: cn, ..c(cs, CmpOp::Ne, 0) }]
-                                }
-                            };
-                            let pass = DOut { sig: out, copy: true, constant: 0, nets: Nets::RED };
-                            kinds.push((dec(conds, vec![pass]), "select"));
-                            continue;
-                        }
-                        match pick(val).0 {
-                            Operand::Const(0) => {}
-                            Operand::Const(k) if inline_cond.contains(&cv) => {
-                                let conds = match g.op(cv) {
-                                    Op::Cmp(op, a, b) => vec![cond(*a, *op, *b)],
-                                    Op::Dec(arms) => {
-                                        let terms: CDnf = arms[0].0.iter().map(|t| t.iter().map(|l| cond(l.a, l.op, l.b)).collect()).collect();
-                                        distribute(&[], &terms)
-                                    }
-                                    _ => unreachable!("inlined condition"),
-                                };
-                                kinds.push((dec_const(conds, out, k * sign), "select"));
-                            }
-                            Operand::Const(k) => {
-                                let (cs, cn) = sig(cv);
-                                let cnd = Cond { first: cs, first_nets: cn, ..c(cs, CmpOp::Ne, 0) };
-                                kinds.push((dec_const(vec![cnd], out, k * sign), "select"));
-                            }
-                            Operand::Sig(_) => kinds.push((ar(val, ArOp::Mul, cv), "select")),
-                        }
-                    }
-                }
                 Op::Dec(ref arms) => {
                     for (d, k) in arms {
                         let terms: CDnf = d.iter().map(|t| t.iter().map(|l| cond(l.a, l.op, l.b)).collect()).collect();
@@ -422,28 +437,23 @@ impl Cg {
                 let id = self.net.add(kind, Role::Core);
                 self.net.entities[id].description = Some(format!("{what}: {label}"));
                 self.nets[0].members.push((id, Conn::InGreen));
-                match out_bundle {
-                    Some(b) => self.bprod(b, id),
-                    None if !out_local => self.nets[0].members.push((id, Conn::OutGreen)),
-                    None => {}
+                if reads_local {
+                    // Inputs from this node's cluster.
+                    let ni = self.cluster_net(&mut cluster_net, cluster[&v]);
+                    self.nets[ni].members.push((id, Conn::InRed));
                 }
-                if reads_local || out_local {
-                    // Inputs from this node's cluster; output to its sum's (the same cluster
-                    // whenever that is local).
-                    let k = cluster[&v];
-                    let ni = *cluster_net.entry(k).or_insert_with(|| {
-                        self.nets.push(NetSpec { red: true, members: Vec::new() });
-                        self.nets.len() - 1
-                    });
-                    if reads_local {
-                        self.nets[ni].members.push((id, Conn::InRed));
-                    }
-                    if out_local {
-                        self.nets[ni].members.push((id, Conn::OutRed));
-                    }
-                }
+                // Output to its sum's wire (the same cluster whenever that is local).
+                wire_out(self, &mut cluster_net, id);
             }
         }
         Ok(node_ref)
+    }
+
+    /// The red wire of logic cluster `k`, made when first needed.
+    fn cluster_net(&mut self, nets: &mut HashMap<usize, usize>, k: usize) -> usize {
+        *nets.entry(k).or_insert_with(|| {
+            self.nets.push(NetSpec { red: true, members: Vec::new() });
+            self.nets.len() - 1
+        })
     }
 }

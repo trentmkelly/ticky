@@ -880,6 +880,10 @@ where operands must stay in step):
   factor (a comparison outputs `-1` or `k` instead of 1; `x * k` scales; `x - y` swaps).
 - **Selects.** `K if c else …` is one decider testing `c` itself; `x if c else 0` with `x`
   computed only for it is one decider passing `x` through; an arm worth 0 costs nothing.
+  `x` may also be tested by the select's own conditions: `max(x, K)` is two deciders,
+  `x if x > 0 else 0` one. Both arms can be computed values passed through.
+- **Nested selects** used only by the outer one become one stage, one decider per distinct
+  result: `min(max(x, lo), hi)` is three deciders, `A if c else (B if d else x)` three.
 - **Lookups.** `A if x == 1 else B if x == 2 else …` choosing signals is a constant table and
   one decider. A count like `(xs[0] == k) + (xs[1] == k) + …` is one filter and one total.
 - **Running maximum.** `best, top = B, T` followed by `if s_i > top: best, top = K_i, s_i` for

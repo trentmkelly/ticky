@@ -890,3 +890,36 @@ unchanged (2254 → 2240, −14).
   the merges. About half the programs of fuzz_programs/fuzz_procs/fuzz_level2 share
   registers; fuzzers clean (level2 compile failures: the same layout/signals/branching ones as
   before). In-game difftest MATCH: calculator, primes, ranking, functions.
+## 2026-10-11: select stages (codegen/selects.rs): passes, flattening, several private wires
+
+Replaces the "gated selects" and `inline_cond` of `logic()` with a planner
+(`selects::plan`). Every select not flattened into another is a **stage**: one combinator per
+distinct output, each testing its whole condition (merged arms are OR'd, arms being mutually
+exclusive). Outputs: a constant, `Pass(x)` (x computed onto the select's own signal on a red
+wire, copied by `DOut copy, nets RED`) or `Mul(x, c)` (the old `x * c`, for an arm value used
+elsewhere).
+- **Passes** may also be read by the stage's own (inlined) conditions: `max(x, K)` = 2
+  deciders (`x ≥ K → copy`, `x ≤ K-1 → K`), `x if x > 0 else 0` = 1. Reads (`BGet`, totals,
+  counts) can be passes too.
+- **Flattening**: a select used only inside the stage (as an arm, or read by its conditions)
+  is absorbed. Arms nest (`c ∧ d → …`); a condition reading an absorbed `Mux` is split by the
+  `Mux`'s arms with the value substituted (zero arm: the negated other guard), so a clamp
+  `min(max(x, lo), hi)` is 3 deciders: `x ≥ hi+1 → hi`, `x ≤ lo-1 → lo`, `lo ≤ x ≤ hi → copy`.
+  Term simplification folds constant literals and tightens each value's comparisons against
+  its interval (`g.iv`), dropping false terms and implied literals (a term never becomes
+  empty: it keeps one of its own literals, since a decider needs a condition).
+- **Several passes per stage** (`x*5 if c else y - x`): the first shares the cluster's wire;
+  every other gets a red wire of its own (`own_wire`), and every other value its deciders read
+  moves to the bus (`force_bus`). A decider has one red input, so a decider reading two passes
+  is a conflict; the planner chooses which pass gets the cluster wire, else drops the pass
+  most read by other deciders.
+- Planning bans (absorb / pass / inline) and replans until consistent; caps: 64 arms, 48
+  literals per decider while flattening. After planning, `logic()` keeps only producers still
+  reachable through the wired operands (flattening leaves some values unread).
+- A select can be another stage's pass if it passes nothing itself.
+- Results: cubium-generator 155 → 141, dashboard −1, bundles −1, histogram −1, nothing grew.
+  The random-expression fuzzer only uses `every tick:` (pipelined, not this code); a variant
+  with `every 30 ticks:` and clamp/nested-select/shared-operand shapes (2300 expressions) was
+  clean, and 48 random 20-output blocks compiled smaller or equal output by output.
+- In-game: a probe (max of a computed value, clamp, positive part, two passes on two wires,
+  nested select; INT_MIN included) MATCH 259 ticks. Test `select_stages`.
