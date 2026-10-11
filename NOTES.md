@@ -1025,4 +1025,5 @@ Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to 
   (logic.rs, another agent's file) to write chosen roots under a given signal onto a given
   wire; est. −24 (sorting −13). Bundle loads as deciders testing the clock phase (dropping
   EI/ES): few blocks qualify.
-- Test `registers_share_and_increment`. Verification: below.
+- Test `registers_share_and_increment`. Verification: no example grew; `FUZZ_N=100
+  tools/verify.sh` passed; in-game difftest 36/36 MATCH (frozen release copy).
