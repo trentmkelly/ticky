@@ -354,6 +354,23 @@ pub fn comprehension(
     conds: &[Expr],
     span: Span,
 ) -> Result<V, Diag> {
+    let (conv, x) = comprehension_parts(g, names, key, value, target, iter, conds, span)?;
+    conv.finish(g, x)
+}
+
+/// A comprehension lowered up to its value: the domain (as a [`Conv`]) and the value as a
+/// scalar expression of the placeholder.
+#[allow(clippy::too_many_arguments)]
+fn comprehension_parts(
+    g: &mut Graph,
+    names: &mut dyn Names,
+    key: &Expr,
+    value: &Expr,
+    target: &Expr,
+    iter: &Expr,
+    conds: &[Expr],
+    span: Span,
+) -> Result<(Conv, V), Diag> {
     let shape_help = "write it as `{s: v for s, v in b.items() if …}`";
     let ExprKind::Tuple(t) = &target.kind else {
         return Err(Diag::error(target.span, "a bundle comprehension needs two names: `for s, v in b.items()`").with_help(shape_help));
@@ -376,7 +393,14 @@ pub fn comprehension(
     }
     let b = lower::expr(g, names, base)?;
     let b = bundle(g, b, base.span)?;
-    let each = g.each();
+    // `v` takes the values of the input's signals (filters only drop some), never 0.
+    let mut vi = g.iv(b);
+    if vi.lo == 0 && vi.hi > 0 {
+        vi.lo = 1;
+    } else if vi.hi == 0 && vi.lo < 0 {
+        vi.hi = -1;
+    }
+    let each = g.each(vi);
     // The domain: the input's signals that pass every condition.
     let mut dom = b;
     // `s.quality OP q` (also as a part of `and`): a quality filter on the input.
@@ -407,7 +431,72 @@ pub fn comprehension(
     let x = lower::expr(g, &mut cn, value)?;
     let x = int(g, x, value.span)?;
     let _ = span;
-    Conv { dom, each, span: value.span }.bundle(g, x)
+    Ok((Conv { dom, each, span: value.span }, x))
+}
+
+/// `[f(x) for x in arr]` on one bank of a signal array (`#amap(comprehension, bank, f(0), n)`
+/// from expand.rs): the comprehension over the bank's nonzero elements, plus `f(0)` on the
+/// slots holding 0. When the value is `h(v) + c` with `c = f(0)`, it is also built as `h`
+/// over the nonzero elements plus the constant `c` on every slot, which needs no combinator
+/// for the zeros: `min(t + 40, 600)` is `min(t, 560)` (two filters) plus 40. Exact whatever
+/// `h(0)` is (zero slots aren't in the comprehension's domain), wrapping included. Keeps
+/// whichever adds fewer operations.
+pub fn array_map(g: &mut Graph, names: &mut dyn Names, comp: &Expr, bank: V, at_zero: V, n: usize) -> Result<V, Diag> {
+    let ExprKind::DictComp { key, value, target, iter, conds } = &comp.kind else {
+        unreachable!("#amap takes a comprehension")
+    };
+    let (conv, x) = comprehension_parts(g, names, key, value, target, iter, conds, comp.span)?;
+    let n0 = g.nodes.len();
+    let at_zero = int(g, at_zero, comp.span)?;
+    let mapped = conv.finish(g, x)?;
+    let zeros = g.azeros(bank, at_zero, n);
+    let plain = merge(g, mapped, zeros);
+    let split = match g.as_const(at_zero) {
+        Some(c) if c != 0 => match less_const(g, x, c) {
+            Some(h) => {
+                let mapped = conv.finish(g, h).ok();
+                mapped.map(|m| {
+                    let ks = g.bconst((0..n).map(|k| (Graph::slot(k), c)));
+                    merge(g, m, ks)
+                })
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    let r = match split {
+        Some(r) if new_ops(g, r, n0) < new_ops(g, plain, n0) => r,
+        _ => plain,
+    };
+    // The nonzero elements and the zeros are on different slots.
+    let elems = g.iv(x).join(g.iv(at_zero));
+    g.narrow(r, elems);
+    Ok(r)
+}
+
+/// Roughly the combinators `v` needs among the nodes made since `from` (see
+/// [`lower::op_cost`]); nodes made earlier are there anyway.
+fn new_ops(g: &Graph, v: V, from: usize) -> usize {
+    g.reachable(&[v]).into_iter().filter(|&u| u as usize >= from).map(|u| lower::op_cost(g.op(u))).sum()
+}
+
+/// `x - c` without a new operation, if `x` is `y + k` (or a constant, or a select of such):
+/// the constant parts change, nothing else.
+fn less_const(g: &mut Graph, x: V, c: i32) -> Option<V> {
+    match g.op(x).clone() {
+        Op::Const(k) => Some(g.konst(k.wrapping_sub(c))),
+        Op::Ar(op @ (ArOp::Add | ArOp::Sub), y, kv) => {
+            let k = g.as_const(kv)?;
+            let k = if op == ArOp::Add { k } else { k.wrapping_neg() };
+            let d = g.konst(k.wrapping_sub(c));
+            Some(g.ar(ArOp::Add, y, d))
+        }
+        Op::Mux { t, f, a, b } => {
+            let (a, b) = (less_const(g, a, c)?, less_const(g, b, c)?);
+            Some(g.mux_tf(t, f, a, b))
+        }
+        _ => None,
+    }
 }
 
 fn uses_each(g: &Graph, v: V) -> bool {
@@ -454,15 +543,15 @@ fn each_dnf(g: &mut Graph, c: V, span: Span) -> Result<BDnf, Diag> {
         let z = g.konst(0);
         return Ok(vec![vec![BLit { op: CmpOp::Ne, a: BOp::Val(c), b: BOp::Val(z) }]]);
     }
-    let each = g.each();
+    let is_each = |g: &Graph, v: V| matches!(g.op(v), Op::Each(_));
     match g.op(c).clone() {
         // `not x` on a compound condition.
-        Op::Cmp(CmpOp::Eq, x, z) if g.as_const(z) == Some(0) && g.is_bool(x) && !matches!(g.op(x), Op::Each) => {
+        Op::Cmp(CmpOp::Eq, x, z) if g.as_const(z) == Some(0) && g.is_bool(x) && !matches!(g.op(x), Op::Each(_)) => {
             let d = each_dnf(g, x, span)?;
             negate(&d).ok_or_else(|| too_big(span))
         }
         Op::Cmp(op, a, b) => {
-            let lit = match (a == each, b == each) {
+            let lit = match (is_each(g, a), is_each(g, b)) {
                 (true, false) if !uses_each(g, b) => BLit { op, a: BOp::Each, b: BOp::Val(b) },
                 (false, true) if !uses_each(g, a) => BLit { op: op.flip(), a: BOp::Each, b: BOp::Val(a) },
                 _ => {
@@ -516,6 +605,14 @@ impl Conv {
                 g.bun(vec![BTerm::Map(ArOp::Mul, ones, k)])
             }
         }
+    }
+
+    /// `x` over the domain, with its element interval: the values `x` takes.
+    fn finish(&self, g: &mut Graph, x: V) -> Result<V, Diag> {
+        let r = self.bundle(g, x)?;
+        let iv = g.iv(x);
+        g.narrow(r, iv);
+        Ok(r)
     }
 
     fn with(&self, dom: V) -> Conv {

@@ -1297,7 +1297,7 @@ impl<'a> Expander<'a> {
     }
 
     /// `[f(x) for x in arr]` on a signal array: a bundle comprehension per bank over the
-    /// elements that aren't 0, plus `f(0)` on those that are.
+    /// elements that aren't 0, plus `f(0)` on those that are (`#amap`, lower.rs).
     fn mem_map(&mut self, banks: &[Expr], n: usize, var: &str, elt: &Expr, out: &mut Vec<Stmt>) -> Result<Val, Diag> {
         let span = elt.span;
         let mut res = Vec::new();
@@ -1323,7 +1323,7 @@ impl<'a> Expander<'a> {
             };
             res.push(match self.fold(&at_zero) {
                 Some(0) => comp,
-                _ => bin(BinOp::Add, comp, call("#azeros", vec![b.clone(), at_zero, int(nb as i64, span)], span), span),
+                _ => call("#amap", vec![comp, b.clone(), at_zero, int(nb as i64, span)], span),
             });
         }
         Ok(Val::Mem(res, n))

@@ -916,6 +916,13 @@ where operands must stay in step, with the restrictions noted):
   can't wrap (and `(x * 6) // 3` is `x * 2`); `x // 4 // 4` is one shift.
 - **Comparisons of clamps.** `max(x, lo) > hi` with `lo < hi` is `x > hi` (likewise for `min`
   and other selects with a constant arm), so `clamp(x, lo, hi)`'s second test reads `x`.
+- **Value ranges of state.** The compiler bounds every variable from its initial value and
+  what the program writes to it, arrays and bundles element by element:
+  `since = [min(t + 40, 600) for t in since]` keeps `since` in 40..600, so the map is two
+  filters (`t ≤ 560` copied, `t > 560` → 560) plus a constant 40 on every element, and
+  `turn = (turn + 1) % 6` is known to stay in 0..5 (no correction for negative numbers).
+- **Nested `if`s writing a bundle or array** under a long condition are one select stage:
+  one decider per distinct result (written, unchanged).
 - **Loop counters.** `for k in range(…)` keeps a copy of its counter in `k` (Python leaves `k`
   at its last value); when nothing reads `k` after the loop and the body doesn't assign it,
   `k` is the counter itself. `for _ in range(n)` with an unused variable counts down from `n`,

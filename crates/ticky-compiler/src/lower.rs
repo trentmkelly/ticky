@@ -5,7 +5,7 @@ use ticky_syntax::ast::{self, BinOp, BoolOp, Expr, ExprKind, UnOp};
 use ticky_syntax::{Diag, Span};
 
 use crate::bundle::{self, Kind};
-use crate::ir::{BTerm, Graph, Op, V};
+use crate::ir::{BTerm, Graph, Iv, Op, V};
 
 /// Resolves names to values; implemented differently for constants, blocks and tests.
 pub trait Names {
@@ -277,6 +277,8 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                             },
                         }
                     }
+                    // Elements are on different slots: the bank holds their values.
+                    let elems = konst.iter().map(|&(_, c)| Iv::k(c)).chain(groups.iter().map(|(x, _)| g.iv(*x))).reduce(Iv::join);
                     let mut terms = vec![BTerm::K(crate::ir::normalize(konst))];
                     for (x, ks) in groups {
                         if let [k] = ks[..] {
@@ -286,11 +288,29 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                             terms.push(BTerm::Map(ArOp::Mul, ones, x));
                         }
                     }
-                    return Ok(g.bun(terms));
+                    let r = g.bun(terms);
+                    if let Some(iv) = elems {
+                        g.narrow(r, iv);
+                    }
+                    return Ok(r);
                 }
                 // Internal: `#vec(bundle version, unrolled)`, two forms of a bank of a range
                 // comprehension (expand/vectorize.rs): whichever adds fewer operations.
                 "#vec" => return vec_or_unrolled(g, names, &args[0], &args[1]),
+                // Internal: `#amap(comprehension, bank, f(0), n)`, `[f(x) for x in arr]` on one
+                // bank of a signal array (expand.rs `mem_map`).
+                "#amap" => {
+                    let n = match args[3].kind {
+                        ExprKind::Int(n) => n as usize,
+                        _ => unreachable!("#amap ends with the length"),
+                    };
+                    let b = expr(g, names, &args[1])?;
+                    let z = expr(g, names, &args[2])?;
+                    g.in_comp += 1;
+                    let r = bundle::array_map(g, names, &args[0], b, z, n);
+                    g.in_comp -= 1;
+                    return r;
+                }
                 "#aget" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#amax" | "#amin" | "#aidx" => {
                     let n = match args.last().map(|a| &a.kind) {
                         Some(ExprKind::Int(n)) => *n as usize,
@@ -492,14 +512,16 @@ fn vec_or_unrolled(g: &mut Graph, names: &mut dyn Names, vector: &Expr, unrolled
 /// of a bundle except constants and single values copied onto a signal (usually computed
 /// there directly).
 fn added_ops(g: &Graph, from: usize, to: usize) -> usize {
-    g.nodes[from..to]
-        .iter()
-        .map(|op| match op {
-            Op::Const(_) | Op::BConst(_) | Op::Each | Op::Src(_) => 0,
-            Op::Bun(terms) => terms.iter().filter(|t| !matches!(t, BTerm::K(_) | BTerm::One(..))).count(),
-            _ => 1,
-        })
-        .sum()
+    g.nodes[from..to].iter().map(op_cost).sum()
+}
+
+/// Roughly the combinators one node needs (see [`added_ops`]).
+pub fn op_cost(op: &Op) -> usize {
+    match op {
+        Op::Const(_) | Op::BConst(_) | Op::Each(_) | Op::Src(_) => 0,
+        Op::Bun(terms) => terms.iter().filter(|t| !matches!(t, BTerm::K(_) | BTerm::One(..))).count(),
+        _ => 1,
+    }
 }
 
 /// With `--checks`: division (or remainder) by `y` fails when `y` is 0.

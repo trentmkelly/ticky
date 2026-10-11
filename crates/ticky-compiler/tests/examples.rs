@@ -1560,3 +1560,101 @@ fn hold_of_many_writers_with_direct_loads() {
         assert!(r.failure.is_none(), "{:?}", r.failure.map(|d| d.render("t", &src)));
     }
 }
+
+#[test]
+fn element_ranges_and_nested_bundle_selects() {
+    // Arrays' elements get intervals from the same fixpoint as numbers: `since` stays in
+    // 40..600, so `min(t + 40, 600)` is `min(t, 560)` (two filters) plus a constant 40 on every
+    // slot (the zeros included); `timers` stays ≥ 0, so `max(t - 1, 0)` is one `each - 1`.
+    // Narrowing after widening keeps `k` in 0..2 (no sign correction for `% 3`).
+    let src = r#"input  go: int @ G
+input  a: int @ A
+input  b: int @ B
+output s: int @ S
+output m: int @ M
+output o: int @ O
+output w: int @ W
+since = [600] * 4
+timers = [0] * 3
+turn = 0
+k = 0
+
+every 40 ticks:
+    if (go > 0 and a > 3) or (b < -2 and a != 7) or (a == 1 and b == 1):
+        if since[turn] >= 600:
+            since[turn] = 0
+            timers[k] = 5
+    since = [min(t + 40, 600) for t in since]
+    timers = [max(t - 1, 0) for t in timers]
+    turn = (turn + 1) % 4
+    k = (k + 1) % 3
+    s = since[0] + since[1] + since[2] + since[3]
+    m = timers[0] * 100 + timers[1] * 10 + timers[2]
+    o = turn
+    w = k
+
+test "behaviour":
+    run 200 ticks
+    assert s == 2400 and m == 0
+    set go = 1
+    set a = 5
+    run 40 ticks
+    set go = 0
+    run 80 ticks
+    assert s < 2400 and m > 0
+    run 1200 ticks
+    assert s == 2400 and m == 0 and w < 3
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let ents = &c.cg.netlist.entities;
+    let made = |what: &str| ents.iter().filter(|e| e.description.as_deref().is_some_and(|d| d.ends_with(what))).count();
+    assert_eq!(made("block 1: each with a number"), 1, "only `timers`' `each - 1`");
+    assert_eq!(made("block 1: filter"), 4, "two for `since`, two for the writes");
+    let combinators = ents.iter().filter(|e| e.kind.is_combinator()).count();
+    assert!(combinators <= 53, "{combinators} combinators (53 when written, 61 before element ranges)");
+
+    // A bundle write under an `if` inside an `if` whose condition is too big to AND into one
+    // decider with the inner one: the outer condition is tested as one node, so the selects
+    // are one stage of two arms (written, unchanged) instead of two stages of two.
+    let src = r#"input  a: int @ A
+input  b: int @ B
+input  c: int @ C
+output s: int @ S
+xs = [0] * 4
+turn = 0
+
+every 40 ticks:
+    big = (a == 1 and b > 2 and c < 3) or (a == 2 and b > 3 and c < 4) or (a == 3 and b > 4 and c < 5) \
+        or (a == 4 and b > 5 and c < 6) or (a == 5 and b > 6 and c < 7) or (a == 6 and b > 7 and c < 8) \
+        or (a == 7 and b > 8 and c < 9) or (a == 8 and b > 9 and c < 10) or (a == 9 and b > 10 and c < 11)
+    if big:
+        if xs[turn] != c:
+            xs[turn] = c
+    turn = (turn + 1) % 4
+    s = xs[0] * 1000 + xs[1] * 100 + xs[2] * 10 + xs[3]
+
+test "behaviour":
+    set a = 1
+    set b = 5
+    set c = 2
+    run 200 ticks
+    assert s == 2222
+    set a = 9
+    set b = 20
+    set c = 7
+    run 80 ticks
+    set a = 0
+    run 200 ticks
+    assert s == 2772
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let ents = &c.cg.netlist.entities;
+    let made = |what: &str| ents.iter().filter(|e| e.description.as_deref().is_some_and(|d| d.ends_with(what))).count();
+    assert_eq!(made("block 1: select"), 2, "one stage: written, unchanged");
+}

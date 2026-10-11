@@ -266,7 +266,7 @@ impl<'g> Fuser<'g> {
         }
         let hint = self.g.iv(v);
         let r = match self.g.op(v).clone() {
-            Op::Const(_) | Op::Src(_) | Op::Dec(_) | Op::BConst(_) | Op::Each | Op::SigK(_) => v,
+            Op::Const(_) | Op::Src(_) | Op::Dec(_) | Op::BConst(_) | Op::Each(_) | Op::SigK(_) => v,
             Op::Bun(terms) => {
                 let terms = terms.into_iter().map(|t| self.rebuild_term(t)).collect();
                 let terms = self.combine_writes(terms);
@@ -276,7 +276,7 @@ impl<'g> Fuser<'g> {
             Op::BMux { .. } => {
                 let mut arms = Vec::new();
                 self.barms(v, vec![vec![]], &mut arms);
-                self.g.bdec(arms)
+                self.g.bdec(merge_arms(arms))
             }
             Op::BDec(arms) => {
                 let arms = arms.into_iter().map(|(d, x)| (self.rebuild_dnf(&d), self.rebuild(x))).collect();
@@ -371,6 +371,10 @@ impl<'g> Fuser<'g> {
                 }
             }
         };
+        // A rebuilt bundle keeps the elements' bounds the original had (array maps, writes).
+        if self.g.is_bundle(r) {
+            self.g.narrow(r, hint);
+        }
         self.memo.insert(v, r);
         r
     }
@@ -416,22 +420,45 @@ impl<'g> Fuser<'g> {
     }
 
     /// The arms of a tree of bundle selects under `guard`: nested selects become arms whose
-    /// guards are the conditions along their path (a priority mux, one stage deep).
-    fn barms(&mut self, v: V, guard: Dnf, arms: &mut Vec<(Dnf, V)>) {
+    /// guards are the conditions along their path (a priority mux, one stage deep). Returns
+    /// whether every select below became arms (none left as a stage of its own).
+    fn barms(&mut self, v: V, guard: Dnf, arms: &mut Vec<(Dnf, V)>) -> bool {
         if let Op::BMux { t, f, a, b } = *self.g.op(v) {
             let dt = self.dnf(t, false).unwrap_or_else(|| self.node_lit(t));
             let df = self.dnf(f, false).unwrap_or_else(|| self.node_lit(f));
             // Deeper selects only while the guards stay small enough for one decider.
             if arms.len() < MAX_ARMS {
                 if let (Some(gt), Some(gf)) = (and(&guard, &dt), and(&guard, &df)) {
-                    self.barms(a, gt, arms);
-                    self.barms(b, gf, arms);
-                    return;
+                    let n = arms.len();
+                    if self.barms(a, gt, arms) & self.barms(b, gf, arms) {
+                        return true;
+                    }
+                    // A select below didn't fit under these guards: test this condition as
+                    // one node instead (`c != 0`, its complement `c == 0`), so `if big: (if
+                    // q: xs[i] = k)` is arms of one stage (merged by value), not two stages.
+                    let c = self.cond_node(t);
+                    let z = self.g.konst(0);
+                    let (nt, nf) = (self.lit(CmpOp::Ne, c, z), self.lit(CmpOp::Eq, c, z));
+                    if nt == dt && nf == df {
+                        return false;
+                    }
+                    let mut alt = arms[..n].to_vec();
+                    if let (Some(gt), Some(gf)) = (and(&guard, &nt), and(&guard, &nf)) {
+                        if self.barms(a, gt, &mut alt) & self.barms(b, gf, &mut alt) {
+                            *arms = alt;
+                            return true;
+                        }
+                    }
+                    return false;
                 }
             }
+            let x = self.rebuild(v);
+            arms.push((guard, x));
+            return false;
         }
         let x = self.rebuild(v);
         arms.push((guard, x));
+        true
     }
 
     /// `v != 0` as a condition list, with `v` as a single decider where possible.
@@ -459,6 +486,20 @@ impl<'g> Fuser<'g> {
         let node = self.cond_node(v);
         CondPlan { node, pos, neg }
     }
+}
+
+/// Arms of a bundle select with the same bundle become one (guards OR'd; they never hold
+/// together): one decider instead of several, e.g. the "unchanged" arms of nested `if`s.
+fn merge_arms(arms: Vec<(Dnf, V)>) -> Vec<(Dnf, V)> {
+    let mut out: Vec<(Dnf, V)> = Vec::new();
+    for (d, x) in arms {
+        let same = out.iter().position(|(_, y)| *y == x);
+        match same.and_then(|i| or(out[i].0.clone(), d.clone()).map(|m| (i, m))) {
+            Some((i, m)) => out[i].0 = m,
+            None => out.push((d, x)),
+        }
+    }
+    out
 }
 
 /// Nodes a set of loads needs computed: load values and condition operands.

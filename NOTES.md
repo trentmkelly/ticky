@@ -1303,3 +1303,41 @@ binaries — build each tree with its own target dir. Bench unchanged.
   the other fuzzers at 150–200 on seeds 2–5 clean but for the hold above; after the fixes
   fuzz_procs seeds 4, 6–9 and fuzz_programs 2–4 (300) clean. Bench unchanged (1696).
   `FUZZ_N=200 tools/verify.sh` all passed; in-game 36/36 examples and cubium MATCH.
+
+
+## 2026-10-11: element ranges of arrays and bundles, narrowing, nested bundle selects
+
+Branch `opt/elemranges`. Bench: cubium-generator 121 → 111, screen 53 → 51; nothing else
+changes (1696 → 1684).
+- **Element intervals** (ir.rs `interval`/`bun_interval`/`ar_interval`): a bundle node's
+  interval is now its *element interval* (every nonzero value lies in it; a read joins 0).
+  BConst, selects of bundles, maps/zips/filters/shifts/one-hots get theirs from their
+  operands; a sum of terms on distinct single signals is their join, other sums are bounded by
+  the summed parts. Known-disjoint sums are narrowed where they're built (`Graph::narrow`:
+  `#arr`, `bset`, `aset`, `asorted`, comprehensions, array maps; fusion's `rebuild` keeps a
+  bundle's bound). `intern_hint` no longer pins bundles (or the placeholder) to constants.
+- **State**: `initial_ivs` gives a Bundle state (arrays included) its initial elements'
+  interval and `src_for` uses the fixpoint's, like numbers'. Other processes' bundles, inputs
+  and Signal state stay FULL.
+- **Comprehensions**: the placeholder is `Op::Each(iv)` (the input's element interval, 0
+  excluded at the ends: `each` never sees 0), so `t + 40 <= 600` folds to `t <= 560` through
+  the existing `x + k op c` rewrite and `max(t - 1, 0)` on a ≥ 0 array is one `each - 1`.
+- **Array maps** (`[f(t) for t in xs]`, expand.rs `mem_map` → `#amap`, bundle.rs
+  `array_map`): besides comprehension + `f(0)` on zero slots, `f = h + c` with `c = f(0)`
+  (constant parts of sums and select arms: `less_const`) is built as `h` over the nonzero
+  elements plus a constant `c` on every slot; exact whatever `h(0)` (zero slots aren't in the
+  domain), wrapping included. Keeps the one with fewer new operations (`new_ops`, reachable
+  nodes made since). cubium's `since = [min(t + 40, 600) for t in since]`: 8 → 2 combinators.
+- **Narrowing** (program.rs `Fixpoint`, both `lower_block` and `lower_main`): after the
+  widened fixpoint, assume what one round writes (with the initial values) and keep it while
+  the round after stays inside it (≤ 3 times, else back to the last consistent one). `turn =
+  (turn + 1) % 6` widened to 0..2^31-1 (so `% 6` kept its sign correction); now 0..5.
+- **Nested bundle selects** (fuse/mod.rs `barms`, `merge_arms`): when a select below can't be
+  flattened because ANDing its condition into the guard is too big for a decider, the outer
+  condition is tested as one node (`c != 0` / `c == 0`), and arms with the same bundle merge
+  (OR'd guards). cubium's `if cur == IDLE or not busy or stop: … if best != cur: rows[turn] =
+  …` (rows and since): 4 select deciders → 2 each.
+- `tools/fuzz_elemranges.py`: state arrays (and a bundle) over 1–6 rounds of range-shaped maps
+  (min/max/clamps/offsets/`//`/`%`/selects/random), element writes by constant and runtime
+  index (zeros), dict comprehensions, `every` blocks and main-program loops, vs Python. A build
+  that skips the fixpoint fails 37/60. Test `element_ranges_and_nested_bundle_selects`.

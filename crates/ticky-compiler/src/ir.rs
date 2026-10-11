@@ -158,8 +158,9 @@ pub enum Op {
     /// Scalar: the value in bundle `b` (first) of the signal whose value in `ix` equals the
     /// index signal's (array reads: `ix` is a position table plus the index).
     AGet(V, V),
-    /// Placeholder for the value variable while lowering a bundle comprehension.
-    Each,
+    /// Placeholder for the value variable while lowering a bundle comprehension, with the
+    /// interval of the values it stands for (the input bundle's element interval).
+    Each(Iv),
     /// A signal constant (`S("iron-plate")`): used as a bundle key, never computed.
     SigK(Sig),
     /// A runtime `Signal` value: the one-hot bundle `x` (that signal with value 1, or no
@@ -223,7 +224,11 @@ pub fn dnf_operands(d: &Dnf) -> impl Iterator<Item = V> + '_ {
 }
 
 /// Inclusive integer interval within the i32 range.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+///
+/// A bundle node's interval is its *element interval*: every signal it has (every nonzero
+/// value) lies within it. Missing signals read 0, so a read of one signal is the interval
+/// joined with 0. An empty bundle's interval may be anything (`[0, 0]` for a constant).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Iv {
     pub lo: i64,
     pub hi: i64,
@@ -300,13 +305,22 @@ fn bits_mask(hi: i64) -> i64 {
 }
 
 fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src_iv: &[Iv]) -> Iv {
+    // A bundle's value at one of its signals, or 0 where it has none.
+    let read = |b: V| iv(b).join(Iv::k(0));
     match *op {
         Op::Const(k) => Iv::k(k),
         Op::Src(s) => src_iv[s as usize],
+        Op::Each(i) => i,
         Op::Cmp(..) => Iv::BOOL,
         Op::Mux { a, b, .. } => iv(a).join(iv(b)),
-        Op::BConst(_) | Op::Bun(_) | Op::BMux { .. } | Op::BSelect(..) | Op::BGet(..) | Op::BTotal(_) | Op::AGet(..) | Op::Each | Op::SigK(_) => Iv::FULL,
-        Op::SigOf(_) | Op::BSelectAt(..) | Op::BDot(..) | Op::BDec(_) | Op::BSel(..) => Iv::FULL,
+        Op::BConst(ref vals) => vals.iter().fold(None, |acc: Option<Iv>, (_, v)| Some(acc.map_or(Iv::k(*v), |a| a.join(Iv::k(*v))))).unwrap_or(Iv::k(0)),
+        Op::Bun(ref terms) => bun_interval(terms, &iv, &konst),
+        Op::BMux { a, b, .. } => iv(a).join(iv(b)),
+        Op::BDec(ref arms) => arms.iter().map(|(_, x)| iv(*x)).reduce(Iv::join).unwrap_or(Iv::k(0)),
+        Op::BSelect(b, ..) | Op::BSelectAt(b, ..) => iv(b),
+        // One element of an array (positions are distinct, so at most one slot matches).
+        Op::BGet(b, _) | Op::AGet(b, _) => read(b),
+        Op::BTotal(_) | Op::SigK(_) | Op::SigOf(_) | Op::BDot(..) | Op::BSel(..) => Iv::FULL,
         Op::BCount(_) => Iv { lo: 0, hi: MAX },
         Op::Sel(ref arms) => arms.iter().fold(Iv::k(0), |acc, (_, v)| acc.join(iv(*v))),
         Op::Dec(ref arms) => {
@@ -315,70 +329,121 @@ fn interval(op: &Op, iv: impl Fn(V) -> Iv, konst: impl Fn(V) -> Option<i32>, src
             let hi: i64 = arms.iter().map(|(_, k)| (*k as i64).max(0)).sum();
             Iv::checked(lo, hi)
         }
-        Op::Ar(op, a, b) => {
-            let (x, y) = (iv(a), iv(b));
-            match op {
-                ArOp::Add => Iv::checked(x.lo + y.lo, x.hi + y.hi),
-                ArOp::Sub => Iv::checked(x.lo - y.hi, x.hi - y.lo),
-                ArOp::Mul => {
-                    let p = [x.lo * y.lo, x.lo * y.hi, x.hi * y.lo, x.hi * y.hi];
-                    let (lo, hi) = (*p.iter().min().unwrap(), *p.iter().max().unwrap());
-                    // Products of i32 bounds fit in i64.
-                    Iv::checked(lo, hi)
-                }
-                ArOp::Div => match konst(b) {
-                    Some(0) => Iv::k(0),
-                    Some(-1) if x.lo == MIN => Iv::FULL,
-                    Some(k) => {
-                        let (p, q) = (x.lo / k as i64, x.hi / k as i64);
-                        Iv { lo: p.min(q), hi: p.max(q) }
-                    }
-                    None if x.nonneg() && y.nonneg() => Iv { lo: 0, hi: x.hi },
-                    None => {
-                        let m = x.max_abs().min(MAX);
-                        Iv { lo: -m, hi: m }
-                    }
-                },
-                ArOp::Mod => {
-                    let m = match konst(b) {
-                        Some(0) => return Iv::k(0),
-                        Some(k) => (k as i64).abs() - 1,
-                        None => (y.max_abs() - 1).max(0),
-                    };
-                    let m = m.min(x.max_abs());
-                    if x.nonneg() {
-                        Iv { lo: 0, hi: m }
-                    } else if x.hi <= 0 {
-                        Iv { lo: -m, hi: 0 }
-                    } else {
-                        Iv { lo: -m, hi: m }
-                    }
-                }
-                ArOp::Shr => match konst(b) {
-                    Some(k) => {
-                        let k = (k as u32 & 31) as i64;
-                        Iv { lo: x.lo >> k, hi: x.hi >> k }
-                    }
-                    None if x.nonneg() => Iv { lo: 0, hi: x.hi },
-                    None => Iv { lo: x.lo.min(-1), hi: x.hi.max(0) },
-                },
-                ArOp::Shl => match konst(b) {
-                    Some(k) => {
-                        let k = (k as u32 & 31) as i64;
-                        Iv::checked(x.lo << k, x.hi << k)
-                    }
-                    None => Iv::FULL,
-                },
-                ArOp::And => match (x.nonneg(), y.nonneg()) {
-                    (true, true) => Iv { lo: 0, hi: x.hi.min(y.hi) },
-                    (true, false) => Iv { lo: 0, hi: x.hi },
-                    (false, true) => Iv { lo: 0, hi: y.hi },
-                    _ => Iv::FULL,
-                },
-                ArOp::Or | ArOp::Xor if x.nonneg() && y.nonneg() => Iv { lo: 0, hi: bits_mask(x.hi.max(y.hi)) },
-                ArOp::Or | ArOp::Xor | ArOp::Pow => Iv::FULL,
+        Op::Ar(op, a, b) => ar_interval(op, iv(a), iv(b), konst(b)),
+    }
+}
+
+/// The element interval of a bundle made of `terms`. Terms that each write one known signal
+/// (all different) don't overlap, so it's their join; otherwise a signal may get a value
+/// from several terms, and it's bounded by their sum.
+fn bun_interval(terms: &[BTerm], iv: &impl Fn(V) -> Iv, konst: &impl Fn(V) -> Option<i32>) -> Iv {
+    let read = |b: V| iv(b).join(Iv::k(0));
+    let term = |t: &BTerm| -> Iv {
+        match *t {
+            // `each` skips missing signals, so a map sees the bundle's own values only.
+            BTerm::Map(op, b, k) => ar_interval(op, iv(b), iv(k), konst(k)),
+            BTerm::RMap(op, k, b) => ar_interval(op, iv(k), iv(b), None),
+            BTerm::Zip(op, a, b) => ar_interval(op, read(a), read(b), None),
+            BTerm::One(_, x) => iv(x),
+            BTerm::Set(b, _, x) => ar_interval(ArOp::Sub, iv(x), read(b), None),
+            BTerm::Filter(b, _, FOut::Copy) | BTerm::DFilter(b, _, _, FOut::Copy) => iv(b),
+            BTerm::Filter(_, _, FOut::Const(c)) | BTerm::DFilter(_, _, _, FOut::Const(c)) => Iv::k(c),
+            BTerm::K(ref vals) => vals.iter().map(|(_, v)| Iv::k(*v)).reduce(Iv::join).unwrap_or(Iv::k(0)),
+            BTerm::Shift(_, x, c) => ar_interval(ArOp::Add, iv(x), Iv::k(c), Some(c)),
+            BTerm::Hot(_, _, c) | BTerm::HotEq(_, _, c) => Iv::k(c),
+            BTerm::Ar(op, a, b, _) => ar_interval(op, iv(a), iv(b), konst(b)),
+            BTerm::Fold(..) | BTerm::Dec(_) => Iv::FULL,
+        }
+    };
+    let single = |t: &BTerm| -> Option<Vec<Sig>> {
+        match t {
+            BTerm::One(s, _) | BTerm::Shift(s, ..) | BTerm::Ar(.., s) => Some(vec![*s]),
+            BTerm::K(vals) => Some(vals.iter().map(|(s, _)| *s).collect()),
+            _ => None,
+        }
+    };
+    if let [t] = terms {
+        return term(t);
+    }
+    let mut sigs: Vec<Sig> = Vec::new();
+    let disjoint = terms.iter().all(|t| single(t).is_some_and(|ss| ss.into_iter().all(|s| !sigs.contains(&s) && {
+        sigs.push(s);
+        true
+    })));
+    if disjoint {
+        return terms.iter().map(term).reduce(Iv::join).unwrap_or(Iv::k(0));
+    }
+    let (mut lo, mut hi) = (0i64, 0i64);
+    for t in terms {
+        let i = term(t);
+        lo += i.lo.min(0);
+        hi += i.hi.max(0);
+    }
+    Iv::checked(lo, hi)
+}
+
+/// The interval of `x op y` (`k`: `y`'s value, if constant).
+fn ar_interval(op: ArOp, x: Iv, y: Iv, k: Option<i32>) -> Iv {
+    match op {
+        ArOp::Add => Iv::checked(x.lo + y.lo, x.hi + y.hi),
+        ArOp::Sub => Iv::checked(x.lo - y.hi, x.hi - y.lo),
+        ArOp::Mul => {
+            let p = [x.lo * y.lo, x.lo * y.hi, x.hi * y.lo, x.hi * y.hi];
+            let (lo, hi) = (*p.iter().min().unwrap(), *p.iter().max().unwrap());
+            // Products of i32 bounds fit in i64.
+            Iv::checked(lo, hi)
+        }
+        ArOp::Div => match k {
+            Some(0) => Iv::k(0),
+            Some(-1) if x.lo == MIN => Iv::FULL,
+            Some(k) => {
+                let (p, q) = (x.lo / k as i64, x.hi / k as i64);
+                Iv { lo: p.min(q), hi: p.max(q) }
+            }
+            None if x.nonneg() && y.nonneg() => Iv { lo: 0, hi: x.hi },
+            None => {
+                let m = x.max_abs().min(MAX);
+                Iv { lo: -m, hi: m }
+            }
+        },
+        ArOp::Mod => {
+            let m = match k {
+                Some(0) => return Iv::k(0),
+                Some(k) => (k as i64).abs() - 1,
+                None => (y.max_abs() - 1).max(0),
+            };
+            let m = m.min(x.max_abs());
+            if x.nonneg() {
+                Iv { lo: 0, hi: m }
+            } else if x.hi <= 0 {
+                Iv { lo: -m, hi: 0 }
+            } else {
+                Iv { lo: -m, hi: m }
             }
         }
+        ArOp::Shr => match k {
+            Some(k) => {
+                let k = (k as u32 & 31) as i64;
+                Iv { lo: x.lo >> k, hi: x.hi >> k }
+            }
+            None if x.nonneg() => Iv { lo: 0, hi: x.hi },
+            None => Iv { lo: x.lo.min(-1), hi: x.hi.max(0) },
+        },
+        ArOp::Shl => match k {
+            Some(k) => {
+                let k = (k as u32 & 31) as i64;
+                Iv::checked(x.lo << k, x.hi << k)
+            }
+            None => Iv::FULL,
+        },
+        ArOp::And => match (x.nonneg(), y.nonneg()) {
+            (true, true) => Iv { lo: 0, hi: x.hi.min(y.hi) },
+            (true, false) => Iv { lo: 0, hi: x.hi },
+            (false, true) => Iv { lo: 0, hi: y.hi },
+            _ => Iv::FULL,
+        },
+        ArOp::Or | ArOp::Xor if x.nonneg() && y.nonneg() => Iv { lo: 0, hi: bits_mask(x.hi.max(y.hi)) },
+        ArOp::Or | ArOp::Xor | ArOp::Pow => Iv::FULL,
     }
 }
 
@@ -586,6 +651,28 @@ impl Graph {
         iv
     }
 
+    /// Narrows `v`'s interval by a bound known from how it was built (a bundle's elements:
+    /// a disjoint sum, an element written). The node is that value wherever it's used, so the
+    /// bound holds for every use.
+    pub fn narrow(&mut self, v: V, iv: Iv) {
+        let cur = self.ivs[v as usize];
+        let n = Iv { lo: cur.lo.max(iv.lo), hi: cur.hi.min(iv.hi) };
+        if n.lo <= n.hi {
+            self.ivs[v as usize] = n;
+        }
+    }
+
+    /// The element interval of bundle `b` with a value `x` added to its signals (an element
+    /// written; 0 removes a signal, so adds nothing).
+    pub fn elems_with(&self, b: V, x: V) -> Iv {
+        let (bi, xi) = (self.iv(b), self.iv(x));
+        if self.as_const(x) == Some(0) {
+            bi
+        } else {
+            bi.join(xi)
+        }
+    }
+
     /// Interns `op` as it is (for rebuilding nodes without simplification).
     pub fn intern_op(&mut self, op: Op) -> V {
         self.intern(op)
@@ -603,15 +690,16 @@ impl Graph {
         }
         let iv = self.op_iv(&op);
         let iv = Iv { lo: iv.lo.max(hint.lo), hi: iv.hi.min(hint.hi) };
-        // An interval that pins a single value is a constant.
-        if iv.lo == iv.hi && !matches!(op, Op::Const(_)) {
+        // An interval that pins a single value is a constant (a scalar's: a bundle's is its
+        // elements', and the comprehension placeholder stays one).
+        if iv.lo == iv.hi && !matches!(op, Op::Const(_) | Op::Each(_)) && !op.is_bundle(&self.src_bun) {
             return self.konst(iv.lo as i32);
         }
         let v = self.nodes.len() as V;
         self.bun.push(op.is_bundle(&self.src_bun));
         self.nodes.push(op.clone());
         self.ivs.push(iv);
-        let dep = matches!(op, Op::Each) || self.operands(v).iter().any(|o| self.each_dep[*o as usize]);
+        let dep = matches!(op, Op::Each(_)) || self.operands(v).iter().any(|o| self.each_dep[*o as usize]);
         self.each_dep.push(dep);
         self.memo.insert(op, v);
         v
@@ -937,8 +1025,9 @@ impl Graph {
         }
     }
 
-    pub fn each(&mut self) -> V {
-        self.intern(Op::Each)
+    /// The comprehension placeholder for values within `iv`.
+    pub fn each(&mut self, iv: Iv) -> V {
+        self.intern(Op::Each(iv))
     }
 
     /// The constant value of a bundle term, when all its operands are constants.
@@ -1410,7 +1499,10 @@ impl Graph {
         let keep = BTerm::DFilter(b, h, vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]], FOut::Copy);
         let mut terms = vec![keep];
         terms.extend(self.ahot_times(i, n, x));
-        self.bun(terms)
+        let elems = self.elems_with(b, x);
+        let r = self.bun(terms);
+        self.narrow(r, elems);
+        r
     }
 
     /// Array bundle `b` with `d` added to element `i`.
@@ -1462,7 +1554,11 @@ impl Graph {
             let r = self.brank(keys, rev, k as u32);
             terms.push(BTerm::Fold(r, ArOp::Shr, 1, Graph::slot(k)));
         }
-        self.bun(terms)
+        // The same elements (zeros among them), reordered.
+        let elems = self.iv(b);
+        let r = self.bun(terms);
+        self.narrow(r, elems);
+        r
     }
 
     /// Bundle select over mutually exclusive guards (see [`Op::BDec`]).
@@ -1538,13 +1634,19 @@ impl Graph {
             if let Some(b0) = base {
                 let sets_on_b0 = |t: &BTerm| matches!(t, BTerm::Set(bb, _, _) if *bb == b0) || matches!(t, BTerm::Map(ArOp::Add, bb, k) if *bb == b0 && *k == z);
                 if terms.iter().all(sets_on_b0) {
+                    let elems = self.elems_with(b, x);
                     let mut new: Vec<BTerm> = terms.into_iter().filter(|t| !matches!(t, BTerm::Set(_, s2, _) if *s2 == s)).collect();
                     new.push(BTerm::Set(b0, s, x));
-                    return self.bun(new);
+                    let r = self.bun(new);
+                    self.narrow(r, elems);
+                    return r;
                 }
             }
         }
-        self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Set(b, s, x)])
+        let elems = self.elems_with(b, x);
+        let r = self.bun(vec![BTerm::Map(ArOp::Add, b, z), BTerm::Set(b, s, x)]);
+        self.narrow(r, elems);
+        r
     }
 
     /// The bundle mux shape `(t, f, a, b)` of a node, scalar or bundle.
@@ -1574,7 +1676,7 @@ impl Graph {
             }
             Op::Dec(ref arms) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
             Op::Sel(ref arms) => arms.iter().filter(|(_, v)| self.as_const(*v) != Some(0)).flat_map(|(c, v)| [*c, *v]).collect(),
-            Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
+            Op::BConst(_) | Op::Each(_) | Op::SigK(_) => vec![],
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],
             Op::BDec(ref arms) => arms.iter().flat_map(|(d, x)| dnf_operands(d).into_iter().chain([*x])).collect(),

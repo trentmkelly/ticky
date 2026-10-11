@@ -447,7 +447,7 @@ fn is_bundle_expr(e: &Expr, bundles: &HashSet<String>) -> bool {
         ExprKind::Dict(_) | ExprKind::DictComp { .. } => true,
         ExprKind::Name(n) => bundles.contains(n),
         ExprKind::Call { func, .. } => matches!(&func.kind, ExprKind::Name(n)
-            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#vec" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx" | "#rank" | "#drawb") || crate::stdlib::returns_bundle(n)),
+            if matches!(n.as_str(), "Bundle" | "#bset" | "#arr" | "#vec" | "#amap" | "#aset" | "#aadd" | "#azeros" | "#asorted" | "#aidx" | "#rank" | "#drawb") || crate::stdlib::returns_bundle(n)),
         ExprKind::Binary(_, a, b) => is_bundle_expr(a, bundles) || is_bundle_expr(b, bundles),
         ExprKind::Unary(_, a) => is_bundle_expr(a, bundles),
         ExprKind::IfExp { then, orelse, .. } => is_bundle_expr(then, bundles) || is_bundle_expr(orelse, bundles),
@@ -1201,6 +1201,8 @@ impl ProcNames<'_> {
                 // Signal state is a one-hot bundle; a Signal input is normalised when read.
                 let sig = matches!(kind, SrcKind::Own(s) | SrcKind::Foreign(s) | SrcKind::LiveForeign(s) if states[s].ty == Ty::Signal);
                 let iv = match kind {
+                    // A bundle's interval is its elements' (see `initial_ivs`).
+                    SrcKind::Own(s) if states[s].ty == Ty::Bundle => self.own_iv[&s],
                     _ if bun => Iv::FULL,
                     SrcKind::Own(s) => self.own_iv[&s],
                     SrcKind::Foreign(s) | SrcKind::LiveForeign(s) if states[s].ty == Ty::Bool => Iv::BOOL,
@@ -1489,13 +1491,17 @@ fn fused_checks(fz: &mut Fuser, raw: Vec<(V, Span, &'static str)>) -> Vec<Check>
     out
 }
 
-/// Initial intervals for a process's own state.
+/// Initial intervals for a process's own state. A bundle's (arrays included) is the interval
+/// of its elements, grown by the fixpoint like a number's from its initial elements: e.g.
+/// `since = [min(t + 40, 600) for t in since]` keeps them in 40..600, so the comprehension
+/// compares `t > 560` instead of computing `t + 40 - 600`.
 fn initial_ivs(ctx: &Ctx) -> HashMap<usize, Iv> {
+    let elems = |s: &State| s.binit.iter().map(|&(_, v)| Iv::k(v)).reduce(Iv::join).unwrap_or(Iv::k(0));
     ctx.states
         .iter()
         .enumerate()
         .filter(|(_, s)| s.owner == Some(ctx.owner))
-        .map(|(si, s)| (si, if s.ty == Ty::Bundle { Iv::FULL } else { Iv::k(s.init) }))
+        .map(|(si, s)| (si, if s.ty == Ty::Bundle { elems(s) } else { Iv::k(s.init) }))
         .collect()
 }
 
@@ -1522,13 +1528,65 @@ fn grow(iv: &mut HashMap<usize, Iv>, next: impl Iterator<Item = (usize, Iv)>, ro
     changed
 }
 
+/// The intervals assumed for a process's own state while lowering it again and again: grown
+/// from the initial values until the values written stay within them (widened after a few
+/// rounds), then narrowed: widening overshoots (a counter `t = (t + 1) % 6` widens to
+/// 0..2^31-1, where `t + 1` could wrap, so `%` keeps its sign correction), so the next
+/// assumption is what one round actually writes (plus the initial values), kept while the
+/// round after stays within it, which makes it as sound as the widened one.
+struct Fixpoint {
+    init: HashMap<usize, Iv>,
+    iv: HashMap<usize, Iv>,
+    /// The last consistent assumption while narrowing (to go back to).
+    good: Option<HashMap<usize, Iv>>,
+    narrowings: usize,
+    done: bool,
+}
+
+impl Fixpoint {
+    fn new(ctx: &Ctx) -> Self {
+        let init = initial_ivs(ctx);
+        Fixpoint { iv: init.clone(), init, good: None, narrowings: 0, done: false }
+    }
+
+    /// Takes the intervals of the values one round (lowered under `self.iv`) wrote; returns
+    /// whether to lower again (under the new `self.iv`).
+    fn again(&mut self, next: Vec<(usize, Iv)>, round: usize) -> bool {
+        if self.done {
+            return false;
+        }
+        if self.good.is_none() {
+            if grow(&mut self.iv, next.iter().copied(), round) {
+                return true;
+            }
+        } else if !next.iter().all(|(si, i)| self.iv[si].contains(*i)) {
+            // Not consistent: back to the last assumption that was.
+            self.iv = self.good.take().unwrap();
+            self.done = true;
+            return true;
+        }
+        let mut tight = self.init.clone();
+        for (si, i) in next {
+            let t = tight.get_mut(&si).unwrap();
+            *t = t.join(i);
+        }
+        if tight == self.iv || self.narrowings == 3 {
+            return false;
+        }
+        self.narrowings += 1;
+        self.good = Some(std::mem::replace(&mut self.iv, tight));
+        true
+    }
+}
+
 /// Lowers an `every` block, iterating to a fixpoint on its state's intervals so that e.g. a
 /// counter `x = (x + 1) % 600` is known to stay in 0..599.
 fn lower_block(ctx: &Ctx, body: &[Stmt]) -> Result<Lowered, Diag> {
-    let mut iv = initial_ivs(ctx);
+    let mut fp = Fixpoint::new(ctx);
     for round in 0.. {
+        let iv = &fp.iv;
         let mut g = Graph::default();
-        let mut n = ProcNames { ctx, env: BTreeMap::new(), srcs: Vec::new(), own_iv: &iv, live: false, defined: None };
+        let mut n = ProcNames { ctx, env: BTreeMap::new(), srcs: Vec::new(), own_iv: iv, live: false, defined: None };
         exec(&mut g, &mut n, body)?;
         let mut next = Vec::new();
         for (si, s) in ctx.states.iter().enumerate() {
@@ -1542,7 +1600,7 @@ fn lower_block(ctx: &Ctx, body: &[Stmt]) -> Result<Lowered, Diag> {
         }
         let srcs = n.srcs;
         let ivs: Vec<(usize, Iv)> = next.iter().map(|(si, v)| (*si, g.iv(*v))).collect();
-        if !grow(&mut iv, ivs.into_iter(), round) {
+        if !fp.again(ivs, round) {
             return Ok((srcs, g, next));
         }
     }
@@ -1674,8 +1732,9 @@ fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: 
 
 fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
     let defined = definite_assignment(c);
-    let mut iv = initial_ivs(ctx);
+    let mut fp = Fixpoint::new(ctx);
     for round in 0.. {
+        let iv = &fp.iv;
         timing(&format!("main round {round} ({} steps)", c.steps.len()), std::time::Instant::now());
         let mut g = Graph::default();
         let mut srcs = Vec::new();
@@ -1685,7 +1744,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                 ctx,
                 env: BTreeMap::new(),
                 srcs: std::mem::take(&mut srcs),
-                own_iv: &iv,
+                own_iv: iv,
                 live: false,
                 defined: Some(&defined[i]),
             };
@@ -1737,7 +1796,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
         }
         let ivs: Vec<(usize, Iv)> =
             steps.iter().flat_map(|s| s.writes.iter().map(|(si, v)| (*si, g.iv(*v))).collect::<Vec<_>>()).collect();
-        if grow(&mut iv, ivs.into_iter(), round) {
+        if fp.again(ivs, round) {
             continue;
         }
         // Fusion: plans for every write, condition lists for branches and waits.
