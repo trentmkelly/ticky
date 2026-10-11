@@ -14,6 +14,7 @@ use crate::ir::{Graph, Lit, Op, V};
 use crate::program::SrcKind;
 
 /// A decider waiting for others with the same conditions.
+#[derive(Clone)]
 pub(super) struct Pending {
     conds: Vec<Cond>,
     outs: Vec<DOut>,
