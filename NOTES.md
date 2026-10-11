@@ -991,7 +991,7 @@ nothing grew.
   order); verify FUZZ_N=100 plus fuzz_pipes 4×300, blocks/level2/exprs 150 on other seeds.
   fuzz_level2 seed 9 has two "no room for a wire relay" layout failures, same on main.
 
-## 2026-10-11: registers, holds and clocks (main 2171 → 2051)
+## 2026-10-11: registers, holds and clocks (examples 2062 → 1957 on top of the others)
 
 Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to mod.rs):
 
@@ -1027,4 +1027,4 @@ Codegen of state (registers.rs, procs.rs, period.rs, ports.rs; small touches to 
   EI/ES): few blocks qualify.
 - Test `registers_share_and_increment`. Verification: no example grew; `FUZZ_N=100
   tools/verify.sh` passed; in-game difftest 36/36 MATCH plus difftest-cubium MATCH (frozen
-  release copy, after rebasing onto register sharing).
+  release copy, re-run after rebasing onto register sharing, select stages and pipe).
