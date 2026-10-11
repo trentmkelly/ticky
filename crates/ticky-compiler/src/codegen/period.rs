@@ -49,10 +49,24 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
     cg.core(dec_const(es_conds, es, 1), format!("{what}: commit pulse"));
 
     // Sources: own state is read directly; everything else is sampled at EI.
+    // Staged inputs share one load (see `ports::staged_inputs`).
+    let mut stage = None;
+    let mut staged = Vec::new();
     let mut src_ref: Vec<Ref> = Vec::new();
     for &kind in &b.srcs {
         let (raw, name) = shared.raw(p, kind);
-        src_ref.push(if let SrcKind::Own(_) = kind { raw } else { cg.sample_ref(raw, ei, &format!("{what}: {name}"))? });
+        src_ref.push(match kind {
+            SrcKind::Own(_) => raw,
+            SrcKind::Input(pi) if shared.staged.contains_key(&pi) => {
+                stage = Some(shared.staged[&pi]);
+                staged.push(raw.sig());
+                raw
+            }
+            _ => cg.sample_ref(raw, ei, &format!("{what}: {name}"))?,
+        });
+    }
+    if let Some(net) = stage {
+        cg.staged_samples(net, &staged, ei, &what);
     }
     // Live states' plans, with increments split out (scalar states only).
     let mut plans: Vec<(usize, WriterPlan)> = b.plans.iter().filter(|(si, _)| live[*si]).cloned().collect();

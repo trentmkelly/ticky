@@ -320,6 +320,8 @@ struct Shared {
     state_sig: HashMap<usize, Sig>,
     state_bun: HashMap<usize, BRef>,
     input_raw: HashMap<usize, Ref>,
+    /// Staged inputs' private wires to their sampler, by port index (`ports::staged_inputs`).
+    staged: HashMap<usize, usize>,
     ticks: Option<Sig>,
 }
 
@@ -478,8 +480,8 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
 
     // Input ports.
     let mut port_ents = vec![usize::MAX; p.ports.len()];
-    let (input_raw, controls) = ports::input_ports(&mut cg, p, &mut port_ents)?;
-    let shared = Shared { state_sig, state_bun, input_raw, ticks };
+    let (input_raw, controls, staged) = ports::input_ports(&mut cg, p, &mut port_ents)?;
+    let shared = Shared { state_sig, state_bun, input_raw, staged, ticks };
     // Where combinational outputs are read from.
     let mut comb_ref: HashMap<usize, Ref> = HashMap::new();
     let mut comb_red: HashMap<usize, usize> = HashMap::new();

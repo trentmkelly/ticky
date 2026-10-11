@@ -32,13 +32,24 @@ pub(super) fn main_proc(
 
     // Sources: own variables directly, inputs and other processes' state sampled at each
     // step start, and live (unsampled) versions for `wait until`.
+    // Staged inputs share one load (see `ports::staged_inputs`).
+    let mut stage = None;
+    let mut staged = Vec::new();
     let mut src_ref: Vec<Ref> = Vec::new();
     for &kind in &m.srcs {
         let (raw, name) = shared.raw(p, kind);
         src_ref.push(match kind {
+            SrcKind::Input(pi) if shared.staged.contains_key(&pi) => {
+                stage = Some(shared.staged[&pi]);
+                staged.push(raw.sig());
+                raw
+            }
             SrcKind::Input(_) | SrcKind::Foreign(_) | SrcKind::Ticks => cg.sample_ref(raw, any, &format!("{}: {name}", m.name))?,
             _ => raw,
         });
+    }
+    if let Some(net) = stage {
+        cg.staged_samples(net, &staged, any, &m.name);
     }
     let src = |s: u32| src_ref[s as usize];
     let mut steps = m.steps.clone();

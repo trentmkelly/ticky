@@ -8,14 +8,65 @@ use ticky_syntax::ast::PortDir;
 use ticky_syntax::Diag;
 
 use super::*;
-use crate::program::Program;
+use crate::program::{Program, SrcKind};
 
-/// Input ports: where each one's raw value is (by port index), and the controls.
+/// What samples an input: an `every` block that isn't pipelined, or a process.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+enum Sampler {
+    Block(usize),
+    Proc(usize),
+}
+
+/// Staged inputs: scalar inputs read by nothing but one sampler, which samples two or more
+/// of them. Their ports write onto a private red wire to the sampler instead of the bus,
+/// and one `each × sample pulse` loads them all, under the ports' own signals (which then
+/// name the samples). Returns the sampler of each staged input, by port index.
+fn staged_inputs(p: &Program) -> HashMap<usize, Sampler> {
+    // Readers of each input: `None` for anything that isn't a sampler.
+    let mut readers: HashMap<usize, Vec<Option<Sampler>>> = HashMap::new();
+    let mut note = |srcs: &[SrcKind], who: Option<Sampler>| {
+        for k in srcs {
+            match *k {
+                SrcKind::Input(pi) => readers.entry(pi).or_default().push(who),
+                SrcKind::LiveInput(pi) => readers.entry(pi).or_default().push(None),
+                _ => {}
+            }
+        }
+    };
+    for (bi, b) in p.blocks.iter().enumerate() {
+        note(&b.srcs, if b.pipe.is_none() { Some(Sampler::Block(bi)) } else { None });
+    }
+    for (mi, m) in p.procs.iter().enumerate() {
+        note(&m.srcs, Some(Sampler::Proc(mi)));
+    }
+    let mut out = HashMap::new();
+    for (pi, rs) in readers {
+        if let ([Some(who)], false) = (rs.as_slice(), p.ports[pi].ty.is_bun()) {
+            out.insert(pi, *who);
+        }
+    }
+    let count = |who: Sampler, out: &HashMap<usize, Sampler>| out.values().filter(|w| **w == who).count();
+    let single: Vec<usize> = out.iter().filter(|(_, w)| count(**w, &out) < 2).map(|(pi, _)| *pi).collect();
+    for pi in single {
+        out.remove(&pi);
+    }
+    out
+}
+
+/// Input ports: where each one's raw value is (by port index), the controls, and for staged
+/// inputs, the private wire (a `nets` index) to their sampler.
 #[allow(clippy::type_complexity)]
-pub(super) fn input_ports(cg: &mut Cg, p: &Program, port_ents: &mut [EntId]) -> Result<(HashMap<usize, Ref>, Vec<(usize, EntId)>), Diag> {
+pub(super) fn input_ports(
+    cg: &mut Cg,
+    p: &Program,
+    port_ents: &mut [EntId],
+) -> Result<(HashMap<usize, Ref>, Vec<(usize, EntId)>, HashMap<usize, usize>), Diag> {
     let t = SignalTable::base();
     let mut controls = Vec::new();
     let mut input_raw: HashMap<usize, Ref> = HashMap::new();
+    let staged = staged_inputs(p);
+    let mut stage_nets: HashMap<Sampler, usize> = HashMap::new();
+    let mut staged_net: HashMap<usize, usize> = HashMap::new();
     for (pi, port) in p.ports.iter().enumerate() {
         if port.dir != PortDir::Input {
             continue;
@@ -39,8 +90,16 @@ pub(super) fn input_ports(cg: &mut Cg, p: &Program, port_ents: &mut [EntId]) -> 
             port.ty.name(),
             port.label.as_ref().map(|l| format!(" \"{l}\"")).unwrap_or_default(),
         ));
-        match raw {
-            Ref::Bun(b) => cg.bprod(b, id),
+        match (raw, staged.get(&pi)) {
+            (Ref::Bun(b), _) => cg.bprod(b, id),
+            (_, Some(who)) => {
+                let n = *stage_nets.entry(*who).or_insert_with(|| {
+                    cg.nets.push(NetSpec { red: true, members: Vec::new() });
+                    cg.nets.len() - 1
+                });
+                cg.nets[n].members.push((id, Conn::OutRed));
+                staged_net.insert(pi, n);
+            }
             _ => cg.nets[0].members.push((id, Conn::OutGreen)),
         }
         port_ents[pi] = id;
@@ -59,7 +118,7 @@ pub(super) fn input_ports(cg: &mut Cg, p: &Program, port_ents: &mut [EntId]) -> 
             controls.push((pi, k));
         }
     }
-    Ok((input_raw, controls))
+    Ok((input_raw, controls, staged_net))
 }
 
 /// Output ports. `comb_ref`: where combinational outputs are read from; `comb_red`: those

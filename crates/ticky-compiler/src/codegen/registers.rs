@@ -167,6 +167,20 @@ impl Cg {
         Ok(smp)
     }
 
+    /// Staged samples: `sigs` arrive on private red wire `net` (instead of the bus) and are
+    /// all loaded by one `each × en` whenever `en` fires, under their own signals.
+    pub(super) fn staged_samples(&mut self, net: usize, sigs: &[Sig], en: Sig, what: &str) {
+        for &s in sigs {
+            self.hold(vec![c(en, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)], s, &format!("sample of {what}"));
+        }
+        let each = self.each;
+        let load = Arith { first: Operand::Sig(each), first_nets: Nets::RED, second: Operand::Sig(en), second_nets: Nets::GREEN, op: ArOp::Mul, out: each };
+        let id = self.loose(Kind::Arith(load), format!("samples of {what}: inputs (load)"));
+        self.nets[net].members.push((id, Conn::InRed));
+        self.on_bus_in(id);
+        self.nets[0].members.push((id, Conn::OutGreen));
+    }
+
     /// A bundle register: like [`Cg::register`], but the value is a whole bundle on its own
     /// wire. The hold decider copies everything from that wire while no load fires; loads
     /// multiply the new bundle by their enable pulse.
