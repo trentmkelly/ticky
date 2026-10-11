@@ -938,6 +938,13 @@ where operands must stay in step, with the restrictions noted):
   from such a comprehension (two or more arithmetic steps per element) is a signal array, as
   is one first assigned another signal array's value (like `sorted(xs)`) and never written
   element by element.
+- **Staged loads.** A value computed only to be loaded into one variable is computed straight
+  under that variable's signal onto a private wire, and the load is one decider copying it on
+  the commit tick: `if c: x = a - b` needs no separate enable decider, and the decider may test
+  the value itself (`x = max(a - b, 0)` is a subtraction and two deciders). Loads committing
+  together (same step or block, same condition) share one decider, as do constant loads and
+  increments under the same condition, and guarded loads under the same condition share one
+  enable decider.
 
 ### 11.3 Cost report
 

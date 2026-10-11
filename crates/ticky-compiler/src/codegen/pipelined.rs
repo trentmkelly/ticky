@@ -354,7 +354,7 @@ fn build(
         let ws: Vec<Writer> = plans
             .iter()
             .filter(|(w, _)| *w == si)
-            .map(|(_, plan)| Writer { en, prefix: en_prefix.clone(), plan, val: &val, lit: &lit, lit_eg: &lit_eg })
+            .map(|(_, plan)| Writer { en, prefix: en_prefix.clone(), plan, val: &val, lit: &lit, lit_eg: &lit_eg, stage: Vec::new() })
             .collect();
         match shared.state(si) {
             Ref::Bun(x) => cg.bregister(x, &s.binit, &ws, &name)?,

@@ -22,6 +22,8 @@ mod plans;
 mod sortnet;
 mod writes;
 
+pub use plans::keep_of;
+
 use std::collections::HashMap;
 
 use ticky_factorio::{ArOp, CmpOp};
@@ -48,7 +50,8 @@ pub enum LoadVal {
 /// unconditional. A `Const(0)` load writes nothing but still stops the register holding.
 ///
 /// A *direct* load is a constant whose guard is checked by the load decider itself, on the
-/// commit tick. Other guarded loads first compute an enable pulse one tick earlier.
+/// commit tick (codegen also makes staged values direct: `registers::stage_loads`). Other
+/// guarded loads first compute an enable pulse one tick earlier.
 #[derive(Clone, Debug)]
 pub struct Load {
     pub guard: Dnf,
@@ -72,6 +75,7 @@ impl WriterPlan {
         for l in &self.loads {
             let rg = ready_depth(depths, dnf_operands(&l.guard));
             let t = match (&l.val, l.direct, is_true(&l.guard)) {
+                (LoadVal::Node(v), true, _) => depths[*v as usize].max(rg),
                 (_, true, _) => rg,
                 (LoadVal::Node(v), _, true) => depths[*v as usize],
                 (LoadVal::Const(_), _, true) => 0,

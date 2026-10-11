@@ -1,7 +1,9 @@
 //! The logic of step and period blocks ([`Cg::logic`]), read only once it has settled:
 //! clusters with private red wires, gated selects, inlined conditions, sums on the wire
-//! (`fold`/`transparent`/`absorbable`), direct bundle reads/writes, and the scalar
-//! combinators themselves. (Every-tick blocks have their own emitter in `pipelined.rs`.)
+//! (`fold`/`transparent`/`absorbable`), direct bundle reads/writes, staged values (written
+//! under a register's signal onto its staging wire, see `registers::Cg::stage_loads`), and
+//! the scalar combinators themselves. (Every-tick blocks have their own emitter in
+//! `pipelined.rs`.)
 
 use std::collections::{HashMap, VecDeque};
 
@@ -15,7 +17,10 @@ use crate::ir::{BTerm, Graph, Op, V};
 impl Cg {
     /// Emits combinators for every non-trivial node reachable from `roots`. `src` locates
     /// each source. Returns where each emitted node's value is.
-    pub(super) fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Ref, what: &str) -> Result<HashMap<V, Ref>, Diag> {
+    ///
+    /// `staged`: roots to write under the given signal onto the given red wire instead (and
+    /// not on the bus: they aren't in the result). Those this can't do are removed.
+    pub(super) fn logic(&mut self, g: &Graph, roots: &[V], src: &dyn Fn(u32) -> Ref, staged: &mut HashMap<V, (Sig, usize)>, what: &str) -> Result<HashMap<V, Ref>, Diag> {
         let live: Vec<V> = g.reachable(roots);
         if std::env::var_os("TICKY_DUMP_IR").is_some() {
             eprintln!("== logic for {what}: {} nodes, roots {roots:?}", live.len());
@@ -92,11 +97,28 @@ impl Cg {
                 consumers.entry(o).or_default().push(v);
             }
         }
+        // Staged values: only roots nothing here reads (else they'd be needed on the bus).
+        // A stage passing values names them on the cluster's wire by its own signal, here
+        // the register's: at most one such stage per signal and cluster.
+        {
+            let mut named: std::collections::HashSet<(usize, Sig)> = Default::default();
+            let mut ok: HashMap<V, (Sig, usize)> = HashMap::new();
+            for &v in &producers {
+                let Some(&(x, n)) = staged.get(&v) else { continue };
+                let kind = is_scalar_op(v) || matches!(g.op(v), Op::BGet(..) | Op::BTotal(_) | Op::BCount(_));
+                if kind && !consumers.contains_key(&v) && !pass_of.contains_key(&v) && (!plan.has_pass(v) || named.insert((cluster[&v], x))) {
+                    ok.insert(v, (x, n));
+                }
+            }
+            *staged = ok;
+        }
+        let staged = &*staged;
         // Floor division and modulo by a constant: the dividend is read from the bus.
         let mut floors = floor_groups(g, &producers, &|v| consumers.get(&v).cloned().unwrap_or_default());
         let floor_bus: std::collections::HashSet<V> = floors.iter().map(|f| f.a).collect();
         let local = |v: V| -> bool {
             pass_of.contains_key(&v)
+                || staged.contains_key(&v)
                 || is_scalar_op(v)
                     && !is_root.contains(&v)
                     && !plan.has_pass(v)
@@ -222,8 +244,9 @@ impl Cg {
         let direct = |x: V| direct_reads.get(&x).copied();
         // A floor group's results, with their multipliers, must be on one private wire (where
         // its decider's corrections go).
-        let wire_key = |t: V| match pass_of.get(&t) {
-            Some(&(_, i)) if i > 0 => (t, usize::MAX),
+        let wire_key = |t: V| match (staged.get(&t), pass_of.get(&t)) {
+            (Some(&(_, n)), _) => (V::MAX - 1, n),
+            (_, Some(&(_, i))) if i > 0 => (t, usize::MAX),
             _ => (V::MAX, cluster[&t]),
         };
         floors.retain_mut(|f| {
@@ -257,13 +280,18 @@ impl Cg {
         // other value of that cluster may use it there. Further passes get wires of their own.
         let mut reserved: HashMap<usize, Vec<Sig>> = HashMap::new();
         let mut own_wire: HashMap<V, usize> = HashMap::new();
+        for (&v, &(x, n)) in staged {
+            local_sig.insert(v, x);
+            own_wire.insert(v, n);
+        }
         for &m in &producers {
             if !plan.has_pass(m) {
                 continue;
             }
-            let s = match bundle_writes.get(&m) {
-                Some((_, s)) => *s,
-                None => self.alloc()?,
+            let s = match (staged.get(&m), bundle_writes.get(&m)) {
+                (Some(&(x, _)), _) => x,
+                (_, Some((_, s))) => *s,
+                _ => self.alloc()?,
             };
             node_ref.insert(m, Ref::Op(Operand::Sig(s)));
             for (i, &x) in plan.stages[&m].passes.iter().enumerate() {
@@ -277,6 +305,11 @@ impl Cg {
         }
         // A floor group's dividend signal carries its correction on the results' wire.
         let mut floor_sig: Vec<Option<Sig>> = Vec::new();
+        // Signals on each staging wire: its staged values', then floor groups' dividends.
+        let mut on_staging: HashMap<usize, Vec<Sig>> = HashMap::new();
+        for &(x, n) in staged.values() {
+            on_staging.entry(n).or_default().push(x);
+        }
         for f in &floors {
             let a = match *g.op(f.a) {
                 Op::Src(i) => src(i).sig(),
@@ -290,7 +323,12 @@ impl Cg {
                 },
             };
             let t = f.div_to.map(|(t, _)| t).or(f.rem_to).unwrap();
-            if own_wire.contains_key(&t) {
+            if let Some(&(_, n)) = staged.get(&t) {
+                // With the loaded values (any of which may be a dividend's signal).
+                let res = on_staging.entry(n).or_default();
+                floor_sig.push((!res.contains(&a)).then_some(a));
+                res.push(a);
+            } else if own_wire.contains_key(&t) {
                 // Alone on the wire with the select's signal.
                 floor_sig.push((local_sig[&t] != a).then_some(a));
             } else {
@@ -516,6 +554,9 @@ impl Cg {
                 // Output to its sum's wire (the same cluster whenever that is local).
                 wire_out(self, &mut cluster_net, id);
             }
+        }
+        for v in staged.keys() {
+            node_ref.remove(v);
         }
         Ok(node_ref)
     }

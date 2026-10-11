@@ -1112,3 +1112,45 @@ after the register changes; 231 → 134 before them).
 - Found, not fixed (expand.rs, reported): a tuple swap of array elements inside a `for`
   loop, `xs[j], xs[j + 1] = xs[j + 1], xs[j]`, assigns the second target the updated value
   (`[5, -3]` → `[-3, -3]`); with `t = xs[j]` swaps, or outside loops, it's right.
+
+## 2026-10-11: staged loads (guarded loads in one decider, merged loads)
+
+registers.rs (`Cg::stage_loads`, `Staging`, `LoadStage`, `guard_conds`), logic.rs (`staged`
+parameter), procs.rs/period.rs (call sites), fuse/plans.rs (`keep_of`). Bench 1957 → 1926:
+sorting −13, functions −4, stats −4, calculator, dice, ranking −2, bestof, fib, handshake,
+primes −1; nothing grew.
+- **Staged values.** Before `logic()`, a load's value qualifies when no graph node, no other
+  root and no other load reads it (`roots` counted; uses inside the same plan's guards are
+  allowed, see below). `logic()` then emits it under the register's signal onto a red staging
+  wire (as `local_sig`/`own_wire`, like a pass: wire sums, stages, floor results and one-signal
+  reads all work; a stage with passes names them by the register's signal on the cluster wire,
+  so one per signal and cluster; AGet/BDot never). It removes what it can't stage and the
+  caller falls back to the old load.
+- **Load deciders** `[en≠0 ∧ guard] → x copy (RED)`, conditions on the bus (green). A guarded
+  load that replaces the value becomes direct (guard read on the commit tick; `plan.keep`
+  recomputed with `keep_of`, must stay small and must not test the staged value, as the hold
+  reads the bus). Increments stay increments (`[en ∧ guard] → x copy` adds to the hold).
+- **Guards testing the value**: the staged load's own guard and direct constant loads /
+  constant increments of the same plan read it as `x` on the wire (RED operand, the rest
+  GREEN; same red input as the copy). `x = max(a - b, 0)`: `a - b → x` onto the wire,
+  `[en ∧ x(red) > 0] → x copy`, `[en ∧ x(red) ≤ 0] → x = 0` (4 → 3 combinators).
+  Each reader tests one staged value (two would both be named `x`).
+- **Merging**: loads of one writer with the same guard go onto one wire and share one decider
+  (`shared_on`: pending deciders now carry an optional red wire; constant outputs join any
+  decider of the same conditions, copies only one on the same wire). A wire carries each
+  register's signal at most once (two loads of `x` from different steps would add up on it);
+  floor groups writing onto a staging wire may not use one of its signals as the dividend.
+  An unconditional load alone stays `value × en` (same cost).
+- Also: constant loads under equal conditions share deciders (`load_decider`), and enable
+  deciders of guarded loads with equal conditions are one (`Cg::egs`, per block/process).
+  Every-tick blocks get only these two (their guards are read through `lit_eg` only, so the
+  commit-tick conditions are built lazily — building them eagerly panicked in `pipelined.rs`).
+- Not done: remaining enable deciders are values also read elsewhere (collatz's `n`, gcd's
+  `y`: the select is shared with a fused step copy) or in every-tick blocks (own emitter); a
+  hold reading a staged value from the wire (no example needs it: no hit when allowed).
+- Test `staged_loads`. Sim traces of every difftest-examples line identical to the base
+  binary. `FUZZ_N=100 tools/verify.sh` passed; fuzz_procs/programs/level2/blocks 400 each
+  (seed 7): one level2 "no room for a wire relay" failure, same on the base binary. In-game
+  (frozen release): 36/36 examples, cubium-generator, and probes (max of a difference, a
+  guarded load, a staged increment, merged loads with a floor `//` and `%`, a clamp select,
+  RUN off/on, INT_MIN) MATCH.

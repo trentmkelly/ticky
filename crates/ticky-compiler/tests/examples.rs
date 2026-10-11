@@ -1073,3 +1073,58 @@ test "order statistics":
     let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
     assert!(combinators <= 100, "{combinators} combinators (100 when written, ports included)");
 }
+
+#[test]
+fn staged_loads() {
+    // Values used only by one load are computed under the register's own signal onto a
+    // staging wire: a guarded one is one decider (`max(a - b, 0)`: its guards test the value
+    // on the wire), loads committing together share one, increments too.
+    let src = r#"input  a: int @ A
+input  b: int @ B
+output m: int @ M
+output y: int @ Y
+output p: int @ P
+output q: int @ Q
+output z: int @ Z
+output c: int @ C
+y = 7
+c = 0
+every 5 ticks:
+    m = max(a - b, 0)
+    if a > 3:
+        y = a * 2 + b
+
+p = 0
+q = 0
+while True:
+    p = a + 1
+    q = b * 3
+    z = a // 4
+    wait 3 ticks
+    c += a * b
+    q = a - b
+
+test "behaviour":
+    set a = 9
+    set b = -3
+    run 40 ticks
+    assert m == 12 and y == 15 and p == 10 and z == 2 and c < 0
+    set a = -7
+    set b = 2
+    run 40 ticks
+    assert m == 0 and y == 15 and p == -6 and z == -2 and (q == 6 or q == -9)
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed: {:?}", r.name, r.failure);
+    }
+    let descs: Vec<&str> = c.cg.netlist.entities.iter().filter_map(|e| e.description.as_deref()).collect();
+    let has = |s: &str| descs.iter().filter(|d| d.contains(s)).count();
+    assert_eq!(has("(load condition)"), 0, "guarded loads need no enable decider: {descs:?}");
+    assert!(
+        descs.iter().any(|d| d.contains("`p` (staged load)") && d.contains("`q` (staged load)") && d.contains("`z` (staged load)")),
+        "one decider loads p, q and z: {descs:?}"
+    );
+    assert_eq!(has("`m` (staged load)"), 1);
+    assert_eq!(has("`c` (staged increment)"), 1);
+}

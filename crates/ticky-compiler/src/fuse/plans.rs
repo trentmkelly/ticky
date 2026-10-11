@@ -93,15 +93,8 @@ impl Fuser<'_> {
         let mut loads = self.plan(next, own)?;
         // Constant loads under a condition can check it themselves, if the "none of them
         // fires" condition (needed by the hold decider) stays small.
-        let mut union: Option<Dnf> = Some(vec![]);
-        let mut any = false;
-        for l in &loads {
-            if matches!(l.val, LoadVal::Const(_)) && !is_true(&l.guard) {
-                any = true;
-                union = union.and_then(|u| or(u, l.guard.clone()));
-            }
-        }
-        let keep = if any { union.as_ref().and_then(negate) } else { None };
+        let guards: Vec<&Dnf> = loads.iter().filter(|l| matches!(l.val, LoadVal::Const(_)) && !is_true(&l.guard)).map(|l| &l.guard).collect();
+        let keep = if guards.is_empty() { None } else { keep_of(&guards) };
         if keep.is_some() {
             for l in &mut loads {
                 l.direct = matches!(l.val, LoadVal::Const(_)) && !is_true(&l.guard);
@@ -109,4 +102,14 @@ impl Fuser<'_> {
         }
         Some(WriterPlan { loads, keep })
     }
+}
+
+/// The hold condition of direct loads with these guards: none of them holds. `None` if it
+/// doesn't stay small.
+pub fn keep_of(guards: &[&Dnf]) -> Option<Dnf> {
+    let mut union: Dnf = vec![];
+    for g in guards {
+        union = or(union, (*g).clone())?;
+    }
+    negate(&union)
 }

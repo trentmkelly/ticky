@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use ticky_factorio::*;
 use ticky_syntax::Diag;
 
-use super::registers::{increments, own_node, Writer};
+use super::registers::{increments, own_node, StageIn, Writer};
 use super::*;
 use crate::fuse::{LoadVal, WriterPlan};
 use crate::ir::{Lit, V};
@@ -67,8 +67,25 @@ pub(super) fn main_proc(
                 .collect(),
         );
     }
+    // Staged loads (see `registers::Cg::stage_loads`); plan `j` of step `i` is key `i * K + j`.
+    let k = steps.iter().map(|s| s.plans.len()).max().unwrap_or(0);
+    let before: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
+    let ins: Vec<StageIn> = steps
+        .iter_mut()
+        .zip(&incs)
+        .enumerate()
+        .flat_map(|(i, (s, inc))| {
+            s.plans.iter_mut().zip(inc).enumerate().filter_map(move |(j, ((si, plan), inc))| match shared.state(*si) {
+                r @ Ref::Op(_) => Some(StageIn { key: i * k + j, writer: i, x: r.sig(), plan, incs: inc }),
+                Ref::Bun(_) => None,
+            })
+        })
+        .collect();
+    let mut staging = cg.stage_loads(g, &before, ins);
+    let mut vals = staging.vals();
     let roots: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
-    let nodes = cg.logic(g, &roots, &src, &m.name)?;
+    let nodes = cg.logic(g, &roots, &src, &mut vals, &m.name)?;
+    staging.settle(&vals);
     let loc = |v: V| locate(g, v, &src, &nodes);
     let opnd = |v: V| loc(v).op();
     let sig_of = |v: V| loc(v).sig();
@@ -208,7 +225,8 @@ pub(super) fn main_proc(
             let Some((cms, prefix)) = &cm[i] else { continue };
             for (j, (w, plan)) in step.plans.iter().enumerate() {
                 if *w == si {
-                    ws.push(Writer { en: *cms, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit });
+                    let stage = staging.of(i * k + j, plan.loads.len());
+                    ws.push(Writer { en: *cms, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit, stage });
                     my_incs.push(incs[i][j].clone());
                 }
             }
@@ -232,7 +250,7 @@ pub(super) fn main_proc(
             })
             .collect();
         let ws: Vec<Writer> =
-            plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit }).collect();
+            plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit, stage: Vec::new() }).collect();
         cg.register(r, 0, &ws, &format!("{}: return address of `{func}`", m.name))?;
     }
     cg.flush_shared(false);

@@ -206,6 +206,8 @@ struct Cg {
     err: Option<Sig>,
     /// Deciders waiting to be merged with others of the same conditions ([`Cg::shared`]).
     pending: Vec<registers::Pending>,
+    /// Enable pulses of guarded loads in the current block or process, by conditions.
+    egs: Vec<(Vec<Cond>, Sig)>,
 }
 
 /// A condition read from the bus only (for combinators whose red input carries a bundle).
@@ -427,6 +429,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         everything: t.special("signal-everything"),
         err: None,
         pending: Vec::new(),
+        egs: Vec::new(),
     };
     let mut state_bun: HashMap<usize, BRef> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {

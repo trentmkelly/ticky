@@ -4,7 +4,7 @@
 use ticky_factorio::*;
 use ticky_syntax::Diag;
 
-use super::registers::{increments, own_node, Writer};
+use super::registers::{increments, own_node, StageIn, Writer};
 use super::*;
 use crate::fuse::WriterPlan;
 use crate::ir::{Lit, V};
@@ -110,10 +110,27 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
             Ref::Bun(_) => vec![false; plan.loads.len()],
         })
         .collect();
-    let mut roots: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
-    roots.extend(b.checks.iter().map(|ck| ck.fail));
+    let roots = |plans: &[(usize, WriterPlan)]| -> Vec<V> {
+        let mut r: Vec<V> = plans.iter().flat_map(|(_, p)| p.operands()).collect();
+        r.extend(b.checks.iter().map(|ck| ck.fail));
+        r
+    };
+    // Staged loads (see `registers::Cg::stage_loads`).
+    let before = roots(&plans);
+    let ins: Vec<StageIn> = plans
+        .iter_mut()
+        .zip(&incs)
+        .enumerate()
+        .filter_map(|(i, ((si, plan), inc))| match shared.state(*si) {
+            r @ Ref::Op(_) => Some(StageIn { key: i, writer: 0, x: r.sig(), plan, incs: inc }),
+            Ref::Bun(_) => None,
+        })
+        .collect();
+    let mut staging = cg.stage_loads(&b.graph, &before, ins);
+    let mut vals = staging.vals();
     let src = |s: u32| src_ref[s as usize];
-    let nodes = cg.logic(&b.graph, &roots, &src, &what)?;
+    let nodes = cg.logic(&b.graph, &roots(&plans), &src, &mut vals, &what)?;
+    staging.settle(&vals);
     let loc = |v: V| locate(&b.graph, v, &src, &nodes);
     let lit = |l: &Lit| lit_cond(l, &loc);
     // Checks are read with the commit; the block keeps running.
@@ -125,7 +142,7 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
         }
         let mine: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].0 == si).collect();
         let ws: Vec<Writer> =
-            mine.iter().map(|&i| Writer { en: es, prefix: es_prefix.clone(), plan: &plans[i].1, val: &loc, lit: &lit, lit_eg: &lit }).collect();
+            mine.iter().map(|&i| Writer { en: es, prefix: es_prefix.clone(), plan: &plans[i].1, val: &loc, lit: &lit, lit_eg: &lit, stage: staging.of(i, plans[i].1.loads.len()) }).collect();
         let my_incs: Vec<Vec<bool>> = mine.iter().map(|&i| incs[i].clone()).collect();
         let name = format!("state {}", s.display_name());
         match shared.state(si) {
