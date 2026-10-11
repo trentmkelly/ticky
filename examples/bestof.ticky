@@ -1,0 +1,71 @@
+# Picking the best of several options with a running maximum ("if s > top: best, top = K, s").
+# The compiler turns the chain into one selector combinator (largest score, ties to the
+# earliest candidate, as with `>`) and a table lookup instead of a comparison per candidate.
+input  a: int @ A = port("a")
+input  b: int @ B = port("b")
+input  c: int @ C = port("c")
+input  d: int @ D = port("d")
+output o: int @ O = port("best")
+output p: int @ P = port("best with floor")
+
+every 10 ticks:
+    best = 0
+    top = 0
+    if a > top:
+        best, top = 7, a
+    if b > top:
+        best, top = 8, b
+    if c > top:
+        best, top = 9, c
+    if d > top:
+        best, top = 10, d
+    o = best
+    best2 = -1
+    top2 = 5
+    if a > top2:
+        best2, top2 = 1, a
+    if b > top2:
+        best2, top2 = 2, b
+    if c > top2:
+        best2, top2 = 3, c
+    p = best2
+
+test "distinct":
+    set a = 3
+    set b = 9
+    set c = 4
+    set d = 1
+    run 40 ticks
+    assert o == 8 and p == 2
+
+test "ties go to the earliest":
+    set a = 6
+    set b = 6
+    set c = 6
+    set d = 2
+    run 40 ticks
+    assert o == 7 and p == 1
+
+test "later tie after a bigger one":
+    set a = 1
+    set b = 9
+    set c = 9
+    set d = 9
+    run 40 ticks
+    assert o == 8 and p == 2
+
+test "nothing above top":
+    set a = -5
+    set b = 0
+    set c = -1
+    set d = 0
+    run 40 ticks
+    assert o == 0 and p == -1
+
+test "floor: only above 5":
+    set a = 5
+    set b = 4
+    set c = 6
+    set d = 100
+    run 40 ticks
+    assert o == 10 and p == 3

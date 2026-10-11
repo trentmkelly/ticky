@@ -393,7 +393,10 @@ Python precedence and associativity apply throughout.
 ### 5.1 Division cost note
 
 Floor `//` and `%` cost the same as Factorio's native operators when the compiler can prove
-the operands are non-negative, which covers most factory quantities. Otherwise they cost
+the operands are non-negative, which covers most factory quantities. The proof uses value
+ranges, narrowed by the conditions that select a value (`x if x > 0 else 1` is at least 1,
+`min`/`max`/`clamp` bound their results) and by the `if`s the division sits under (`(G - x)
+* 1000 // G` inside `if x < G:`). Otherwise they cost
 1–2 extra ticks for sign correction, and `tdiv`/`tmod` are available if you want the native
 behaviour.
 
@@ -866,6 +869,23 @@ work and bundle/array operations scale far better.
   combinators (pipelining sometimes saves combinators, since it needs no sample registers or
   clocks, and sometimes costs them, in delay chains).
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
+
+Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so
+plain code costs about what hand-built logic would (outside pipelined `every tick:` blocks,
+where operands must stay in step):
+
+- **Sums on the wire.** `a + b - c` (and `* k` of such sums) costs no adders when the parts
+  are only used there: each part's combinator writes the result signal, with its sign or
+  factor (a comparison outputs `-1` or `k` instead of 1; `x * k` scales; `x - y` swaps).
+- **Selects.** `K if c else …` is one decider testing `c` itself; `x if c else 0` with `x`
+  computed only for it is one decider passing `x` through; an arm worth 0 costs nothing.
+- **Lookups.** `A if x == 1 else B if x == 2 else …` choosing signals is a constant table and
+  one decider. A count like `(xs[0] == k) + (xs[1] == k) + …` is one filter and one total.
+- **Running maximum.** `best, top = B, T` followed by `if s_i > top: best, top = K_i, s_i` for
+  three or more candidates is one selector combinator (largest score, ties to the earliest,
+  as with `>`) and a table, instead of a comparison and selects per candidate.
+- **Reads and writes of bundle signals** go straight from and to the bundle's wire when the
+  value is only copied.
 
 ### 11.3 Cost report
 

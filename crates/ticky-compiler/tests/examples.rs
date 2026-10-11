@@ -524,3 +524,46 @@ test "the item, not the recipe":
     let item = t.lookup_kind(ticky_factorio::SignalKind::Item, "ticky-test-goo").expect("the item was added");
     assert_eq!(t.lookup("ticky-test-goo"), Some(item));
 }
+
+
+#[test]
+fn optimizations_apply() {
+    // Sums of comparisons on the wire, a count over an array (one filter and a total, with
+    // the `* 100` pushed into it), and a signal chosen by number (a table lookup). Before
+    // these, this block needed 11 ticks and more combinators.
+    let src = r#"input  stock: Bundle
+input  k: int @ K
+output n: int @ N
+output r: Signal
+output s: int @ S
+xs = [0, 0, 0, 0]
+
+every 10 ticks:
+    xs[k % 4] = 3
+    # A count over an array (one filter and a total), scaled (pushed into the total).
+    n = ((1 if xs[0] == 3 else 0) + (1 if xs[1] == 3 else 0) + (1 if xs[2] == 3 else 0) + (1 if xs[3] == 3 else 0)) * 100
+    # A choice of signal by number (a table lookup).
+    r = S("coal") if k == 1 else S("stone") if k == 2 else S("wood") if k == 3 else Bundle().argmax()
+    # A sum of comparisons (on the wire).
+    s = (1 if stock["coal"] > 5 else 0) + (1 if stock["stone"] > 5 else 0) - (1 if stock["wood"] > 5 else 0)
+
+test "behaviour":
+    set k = 3
+    set stock = {"coal": 9, "stone": 9, "wood": 9}
+    run 40 ticks
+    assert n == 100 and r == S("wood") and s == 1
+    set k = 6
+    run 40 ticks
+    assert n == 200 and r == Bundle().argmax()
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let combinators = c.cg.netlist.entities.iter().filter(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Arith(_) | ticky_factorio::netlist::Kind::Decider(_) | ticky_factorio::netlist::Kind::Selector(_) | ticky_factorio::netlist::Kind::Constant(_))).count();
+    assert!(combinators <= 41, "{combinators} combinators (41 when written, ports and controls included)");
+    // The running maximum becomes a selector combinator.
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bestof.ticky")).unwrap();
+    let c = compile(&src, &opts()).unwrap();
+    assert!(c.cg.netlist.entities.iter().any(|e| matches!(e.kind, ticky_factorio::netlist::Kind::Selector(_))));
+}

@@ -263,7 +263,28 @@ impl Iv {
     fn max_abs(self) -> i64 {
         self.lo.abs().max(self.hi.abs())
     }
+
+    /// The part of the interval where `x op k` holds (unchanged if none of it does: the
+    /// fact can't hold, so nothing depends on the value).
+    pub fn restrict(self, op: CmpOp, k: i64) -> Iv {
+        let (lo, hi) = match op {
+            CmpOp::Lt => (self.lo, self.hi.min(k - 1)),
+            CmpOp::Le => (self.lo, self.hi.min(k)),
+            CmpOp::Gt => (self.lo.max(k + 1), self.hi),
+            CmpOp::Ge => (self.lo.max(k), self.hi),
+            CmpOp::Eq => (self.lo.max(k), self.hi.min(k)),
+            CmpOp::Ne => (self.lo, self.hi),
+        };
+        if lo > hi {
+            self
+        } else {
+            Iv { lo, hi }
+        }
+    }
 }
+
+/// A fact `node op k` known to hold on some path.
+pub type Fact = (V, CmpOp, i64);
 
 fn bits_mask(hi: i64) -> i64 {
     let mut m = 0i64;
@@ -395,6 +416,83 @@ impl Graph {
         self.ivs[v as usize]
     }
 
+    /// Facts that hold whenever boolean `c` is true: its comparisons with constants, through
+    /// `and`s and single-term conditions.
+    pub fn facts(&self, c: V, out: &mut Vec<Fact>) {
+        let lit = |op: CmpOp, a: V, b: V, out: &mut Vec<Fact>| {
+            if let Some(k) = self.as_const(b) {
+                out.push((a, op, k as i64));
+            } else if let Some(k) = self.as_const(a) {
+                out.push((b, op.flip(), k as i64));
+            }
+        };
+        match &self.nodes[c as usize] {
+            Op::Cmp(op, a, b) => lit(*op, *a, *b, out),
+            Op::Ar(ArOp::And | ArOp::Mul, x, y) if self.ivs[*x as usize].is_bool() && self.ivs[*y as usize].is_bool() => {
+                let (x, y) = (*x, *y);
+                self.facts(x, out);
+                self.facts(y, out);
+            }
+            Op::Dec(arms) if arms.len() == 1 && arms[0].1 != 0 && arms[0].0.len() == 1 => {
+                for l in &arms[0].0[0] {
+                    lit(l.op, l.a, l.b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The facts implied by the current path conditions (see `path`).
+    pub fn path_facts(&self) -> Vec<Fact> {
+        let mut out = Vec::new();
+        for &c in &self.path {
+            self.facts(c, &mut out);
+        }
+        out
+    }
+
+    /// The interval of `v` when all `facts` hold: recomputed through arithmetic and selects
+    /// from the narrowed intervals of the nodes the facts are about.
+    pub fn iv_under(&self, v: V, facts: &[Fact]) -> Iv {
+        if facts.is_empty() {
+            return self.ivs[v as usize];
+        }
+        let mut memo = HashMap::new();
+        let mut budget = 400usize;
+        self.iv_under_rec(v, facts, &mut memo, &mut budget)
+    }
+
+    fn iv_under_rec(&self, v: V, facts: &[Fact], memo: &mut HashMap<V, Iv>, budget: &mut usize) -> Iv {
+        if let Some(i) = memo.get(&v) {
+            return *i;
+        }
+        let base = self.ivs[v as usize];
+        let mut iv = base;
+        if *budget > 0 {
+            *budget -= 1;
+            if let Op::Ar(..) | Op::Mux { .. } = self.nodes[v as usize] {
+                let ops = self.operands(v);
+                let mut sub = HashMap::new();
+                for o in ops {
+                    let i = self.iv_under_rec(o, facts, memo, budget);
+                    sub.insert(o, i);
+                }
+                let r = interval(&self.nodes[v as usize], |o| sub.get(&o).copied().unwrap_or(self.ivs[o as usize]), |o| self.as_const(o), &self.src_iv);
+                iv = Iv { lo: iv.lo.max(r.lo), hi: iv.hi.min(r.hi) };
+            }
+        }
+        for &(n, op, k) in facts {
+            if n == v {
+                iv = iv.restrict(op, k);
+            }
+        }
+        if iv.lo > iv.hi {
+            iv = base;
+        }
+        memo.insert(v, iv);
+        iv
+    }
+
     pub fn as_const(&self, v: V) -> Option<i32> {
         match self.nodes[v as usize] {
             Op::Const(k) => Some(k),
@@ -458,7 +556,24 @@ impl Graph {
         if let Some(&v) = self.memo.get(&op) {
             return v;
         }
-        let iv = interval(&op, |v| self.ivs[v as usize], |v| self.as_const(v), &self.src_iv);
+        let mut iv = interval(&op, |v| self.ivs[v as usize], |v| self.as_const(v), &self.src_iv);
+        // A select's arms are only taken when their conditions hold: `x if x > 0 else 1`
+        // is at least 1.
+        let guarded: Vec<(V, V)> = match &op {
+            Op::Mux { t, f, a, b } => vec![(*t, *a), (*f, *b)],
+            Op::Sel(arms) => arms.clone(),
+            _ => Vec::new(),
+        };
+        if !guarded.is_empty() {
+            let mut r = if matches!(op, Op::Sel(_)) { Iv::k(0) } else { Iv { lo: MAX, hi: MIN } };
+            for (c, x) in guarded {
+                let mut facts = Vec::new();
+                self.facts(c, &mut facts);
+                let xi = self.iv_under(x, &facts);
+                r = Iv { lo: r.lo.min(xi.lo), hi: r.hi.max(xi.hi) };
+            }
+            iv = Iv { lo: iv.lo.max(r.lo), hi: iv.hi.min(r.hi) };
+        }
         let iv = Iv { lo: iv.lo.max(hint.lo), hi: iv.hi.min(hint.hi) };
         // An interval that pins a single value is a constant.
         if iv.lo == iv.hi && !matches!(op, Op::Const(_)) {
@@ -1334,9 +1449,21 @@ impl Graph {
         match *self.op(v) {
             Op::Const(_) | Op::Src(_) => vec![],
             Op::Ar(_, a, b) | Op::Cmp(_, a, b) => vec![a, b],
-            Op::Mux { t, f, a, b } => vec![t, f, a, b],
+            // An arm worth 0 adds nothing, so the value doesn't depend on its condition.
+            Op::Mux { t, f, a, b } => {
+                let zero = |x: V| self.as_const(x) == Some(0);
+                let mut o = Vec::with_capacity(4);
+                if !zero(a) {
+                    o.push(t);
+                }
+                if !zero(b) {
+                    o.push(f);
+                }
+                o.extend([a, b]);
+                o
+            }
             Op::Dec(ref arms) => arms.iter().flat_map(|(d, _)| dnf_operands(d)).collect(),
-            Op::Sel(ref arms) => arms.iter().flat_map(|(c, v)| [*c, *v]).collect(),
+            Op::Sel(ref arms) => arms.iter().filter(|(_, v)| self.as_const(*v) != Some(0)).flat_map(|(c, v)| [*c, *v]).collect(),
             Op::BConst(_) | Op::Each | Op::SigK(_) => vec![],
             Op::Bun(ref terms) => terms.iter().flat_map(|t| t.operands()).collect(),
             Op::BMux { t, f, a, b } => vec![t, f, a, b],

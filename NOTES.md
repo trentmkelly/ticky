@@ -733,3 +733,48 @@ In-game difftest MATCH with Cubium loaded
 - **Caution:** the user's running game got SIGTERM ~1 min after the headless server with
   their full mod set (SteamAppId=427520) started; cause unproven. Don't run their save
   headless while their game is up without asking.
+
+## 2026-10-11: optimisation pass (cubium-generator 263 → 155, all examples −6%)
+
+User asked for compiler-side savings rather than hand-tuned programs. Tools: `TICKY_DUMP_IR=1`
+prints each block's logic graph (codegen `logic()`); combinator descriptions say what made
+them (tally them from the blueprint JSON). Measured breakdown first by ablation (turns, share
+penalty, scoring maths). Changes, in order, each verified with all example tests + bench:
+
+- **Ranges under conditions** (ir.rs `facts`/`iv_under`/`Iv::restrict`): a select's arms are
+  narrowed by their conditions (`intern_hint`), and `floor_div`/`floor_mod` use the lowering
+  path's facts (`g.path`). Drops floor corrections after clamps/max(1, …). Wire inputs stay
+  FULL, so `1000 - jelly` can still overflow and keeps its correction.
+- **Wire sums** (codegen `logic`: `fold`, `transparent`, `absorbable`): `Add/Sub` trees and
+  `* const` push into single-use operands, which write the sum's signal with a factor `m`
+  (Cmp → dec_const m, Dec arms × m, const-arm selects × m, `Mul` by const scaled, `Sub`
+  swapped for −1, `Div` by −k for −1, reads `each * m`). Only in `logic()` (step/period
+  blocks, read after settling); pipelined blocks have their own emitter and are untouched.
+- **Zero arms**: `Graph::operands` leaves out the condition of a select arm worth 0 (the
+  value doesn't depend on it). The pipelined emitter had to skip such arms too.
+- **Inlined conditions** (`inline_cond`): a Cmp/one-term Dec used only for constant arms (or
+  a gated arm) isn't built; the arm's decider tests it. `eff_operands` rewires consumers.
+- **Table lookups** (fuse `table_lookups`): Bun of one-hot Dec arms all testing `x == c_i`
+  (Ne-literals implied) → `Hot(table, Shift(index, x, k))`, from 3 arms.
+- **Count over slots** (fuse `count_sum`): ≥3 `b[s_i] == k` (same b, const k) in one sum →
+  `BTotal(DFilter(ones on s_i, b, each == k))` (domain-restricted, so extra signals on b
+  don't count; missing ones read 0 so k = 0 works).
+- **Running max** (fuse `argmax_chain`/`argmax`, also from `split` for register loads):
+  `best, top = B0, T0; if s_i > top: best, top = K_i, s_i` (≥3, strict >, T0 ≥ 0) →
+  scores on internal-pool signals sorted by `rank` (tie order = candidate order), Filter
+  `> T0`, `brank` max, DFilter of a `K_i - B0` table, total, `+ B0`. examples/bestof.ticky
+  tests ties, floors and "no winner".
+- **Gated selects** (`gate`): `x if c else …` with `x` single-use: `x` is computed onto the
+  select's own (bus-allocated, reserved in the cluster pool) signal on the cluster wire and a
+  decider passes it (`DOut copy, nets RED`). One gated arm per select (two would share the
+  name on one wire); the select is forced onto the bus (else it would feed itself).
+- **Direct bundle reads/writes**: `One`/`Shift` terms read a single-use `BGet` from the
+  bundle's wire; a scalar used only as `One(s, x)` writes `s` onto the bundle's wire (gated
+  ones pick `s` as their private name). Reads write a cluster wire via `OutRed`
+  (`emit_from_bundle(out_net)`), never a bundle's.
+- Verification: fuzzers clean after each stage (note: the fuzzers default to
+  `./target/debug/ticky`; always pass `TICKY=` a frozen release copy — earlier runs this
+  session had silently tested a stale debug build); 35/35 in-game difftests MATCH after the
+  first seven changes and 37/37 (incl. bestof ties and the generator with Cubium loaded) on
+  the final build; a deep fuzz run (105,800 expressions, 1,100 programs) was clean; test
+  `optimizations_apply` pins the small probe at ≤ 41 entities.

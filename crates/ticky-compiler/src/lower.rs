@@ -586,7 +586,8 @@ pub fn floor_div(g: &mut Graph, a: V, b: V) -> V {
         return g.ar(ArOp::Shr, a, kv);
     }
     let q = g.ar(ArOp::Div, a, b);
-    if g.iv(a).nonneg() && g.iv(b).nonneg() {
+    let facts = g.path_facts();
+    if g.iv_under(a, &facts).nonneg() && g.iv_under(b, &facts).nonneg() {
         return q;
     }
     let r = g.ar(ArOp::Mod, a, b);
@@ -602,7 +603,8 @@ pub fn floor_mod(g: &mut Graph, a: V, b: V) -> V {
         return g.ar(ArOp::And, a, mask);
     }
     let r = g.ar(ArOp::Mod, a, b);
-    if g.iv(a).nonneg() && g.iv(b).nonneg() {
+    let facts = g.path_facts();
+    if g.iv_under(a, &facts).nonneg() && g.iv_under(b, &facts).nonneg() {
         return r;
     }
     let adj = floor_adjust(g, r, b);

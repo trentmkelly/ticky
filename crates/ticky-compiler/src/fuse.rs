@@ -244,6 +244,7 @@ impl<'g> Fuser<'g> {
             Op::Bun(terms) => {
                 let terms = terms.into_iter().map(|t| self.rebuild_term(t)).collect();
                 let terms = self.combine_writes(terms);
+                let terms = self.table_lookups(terms);
                 self.g.bun(terms)
             }
             Op::BMux { .. } => {
@@ -304,6 +305,13 @@ impl<'g> Fuser<'g> {
                     }
                 }
             }
+            Op::Ar(ArOp::Add, x, y) => match self.count_sum(v) {
+                Some(r) => r,
+                None => {
+                    let (x, y) = (self.rebuild(x), self.rebuild(y));
+                    self.g.ar(ArOp::Add, x, y)
+                }
+            },
             Op::Ar(op, x, y) => {
                 let (x, y) = (self.rebuild(x), self.rebuild(y));
                 self.g.ar(op, x, y)
@@ -311,6 +319,10 @@ impl<'g> Fuser<'g> {
             Op::Cmp(op, a, b) => {
                 let (a, b) = (self.rebuild(a), self.rebuild(b));
                 self.g.cmp(op, a, b)
+            }
+            Op::Mux { .. } if self.argmax_chain(v).is_some() => {
+                let (steps, top0, best0) = self.argmax_chain(v).unwrap();
+                self.argmax(steps, top0, best0)
             }
             Op::Mux { t, f, a, b } => {
                 let consts = (self.g.as_const(a), self.g.as_const(b));
@@ -369,6 +381,230 @@ impl<'g> Fuser<'g> {
             BTerm::Hot(t, ix, c) => BTerm::Hot(self.rebuild(t), self.rebuild(ix), c),
             BTerm::Fold(b, op, c, s) => BTerm::Fold(self.rebuild(b), op, c, s),
         }
+    }
+
+    /// A running maximum that remembers which candidate won (`best, top = B0, T0`, then
+    /// `if s_i > top: best, top = K_i, s_i` for each candidate in turn), seen from the final
+    /// `best`: the candidates `(s_i, K_i)` in order, `T0` and `B0`. Strict `>`, so the
+    /// earliest of equal maxima wins; three candidates at least; `T0 ≥ 0`.
+    fn argmax_chain(&self, v: V) -> Option<(Vec<(V, i32)>, i32, i32)> {
+        let g = &self.g;
+        // `s > top`, either way round: (s, top).
+        let gt = |c: V| match *g.op(c) {
+            Op::Cmp(CmpOp::Gt, s, t) => Some((s, t)),
+            Op::Cmp(CmpOp::Lt, t, s) => Some((s, t)),
+            _ => None,
+        };
+        let mut steps = Vec::new();
+        let mut best = v;
+        // The `top` the current step compares with must be the previous step's update.
+        let mut want_top: Option<(V, V, V)> = None; // (top node, its step's condition, its s)
+        loop {
+            let (c, k, prev) = match *g.op(best) {
+                Op::Mux { t, a, b, .. } => match g.as_const(a) {
+                    Some(k) => (t, k, Some(b)),
+                    None => return None,
+                },
+                // `best = 1 if s > top else 0`, simplified to the comparison.
+                Op::Cmp(..) => (best, 1, None),
+                _ => return None,
+            };
+            let (s, top) = gt(c)?;
+            if let Some((tn, tc, ts)) = want_top {
+                match *g.op(tn) {
+                    Op::Mux { t, a, b, .. } if t == tc && a == ts && b == top => {}
+                    _ => return None,
+                }
+            }
+            steps.push((s, k));
+            let prev_best = match prev {
+                Some(p) => p,
+                None => {
+                    // The first step's `best` was folded away: B0 = 0.
+                    let t0 = g.as_const(top)?;
+                    return (steps.len() >= 3 && t0 >= 0).then(|| {
+                        steps.reverse();
+                        (steps, t0, 0)
+                    });
+                }
+            };
+            if let (Some(b0), Some(t0)) = (g.as_const(prev_best), g.as_const(top)) {
+                return (steps.len() >= 3 && t0 >= 0).then(|| {
+                    steps.reverse();
+                    (steps, t0, b0)
+                });
+            }
+            // The previous `top` is `s_prev if c_prev else top_prev`: checked at the next step.
+            let Op::Mux { t: pc, .. } = *g.op(top) else { return None };
+            let ps = gt(pc)?.0;
+            want_top = Some((top, pc, ps));
+            best = prev_best;
+        }
+    }
+
+    /// [`argmax_chain`](Self::argmax_chain) with a selector combinator: the candidates'
+    /// scores on signals ranked in candidate order (so ties go to the earliest, as with
+    /// `>`), those above `T0` kept, the largest selected, and its `K` read from a table.
+    fn argmax(&mut self, steps: Vec<(V, i32)>, top0: i32, best0: i32) -> V {
+        let t = ticky_factorio::SignalTable::base();
+        let mut pool = t.internal_pool();
+        pool.sort_by_key(|s| t.rank(*s));
+        let sigs: Vec<_> = pool.into_iter().take(steps.len()).collect();
+        let terms: Vec<BTerm> = steps.iter().zip(&sigs).map(|((s, _), sig)| {
+            let x = self.rebuild(*s);
+            BTerm::One(*sig, x)
+        }).collect();
+        let terms = terms.into_iter().map(|t| self.rebuild_term(t)).collect();
+        let scores = self.g.bun(terms);
+        let k0 = self.g.konst(top0);
+        let above = self.g.bun(vec![BTerm::Filter(scores, vec![vec![BLit { op: CmpOp::Gt, a: BOp::Each, b: BOp::Val(k0) }]], crate::ir::FOut::Copy)]);
+        let top = self.g.brank(above, true, 0);
+        // K_i - B0 on each candidate's signal (a constant combinator can't hold 0: those
+        // candidates add nothing, which is right).
+        let table = self.g.bconst(steps.iter().zip(&sigs).map(|((_, k), sig)| (*sig, k.wrapping_sub(best0))));
+        let z = self.g.konst(0);
+        let won = self.g.bun(vec![BTerm::DFilter(table, top, vec![vec![BLit { op: CmpOp::Ne, a: BOp::Each, b: BOp::Val(z) }]], crate::ir::FOut::Copy)]);
+        let k = self.g.btotal(won);
+        let b0 = self.g.konst(best0);
+        self.g.ar(ArOp::Add, k, b0)
+    }
+
+    /// The leaves of a tree of `+` (original nodes), at most `limit` of them.
+    fn add_leaves(&self, v: V, out: &mut Vec<V>, limit: usize) -> bool {
+        if out.len() > limit {
+            return false;
+        }
+        match *self.g.op(v) {
+            Op::Ar(ArOp::Add, x, y) => self.add_leaves(x, out, limit) && self.add_leaves(y, out, limit),
+            _ => {
+                out.push(v);
+                true
+            }
+        }
+    }
+
+    /// `bundle[s] == k` (either way round): `(bundle, s, k)`.
+    fn slot_test(&self, v: V) -> Option<(V, ticky_factorio::Sig, i32)> {
+        let Op::Cmp(CmpOp::Eq, a, b) = *self.g.op(v) else { return None };
+        let (x, k) = match (self.g.as_const(a), self.g.as_const(b)) {
+            (None, Some(k)) => (a, k),
+            (Some(k), None) => (b, k),
+            _ => return None,
+        };
+        match *self.g.op(x) {
+            Op::BGet(bun, s) => Some((bun, s, k)),
+            _ => None,
+        }
+    }
+
+    /// A sum counting matches, `(b[s1] == k) + (b[s2] == k) + …` (an array's elements equal
+    /// to a constant, say), from three terms on: one filter over those signals of `b` and
+    /// one total, instead of a comparison per term. The filter iterates the listed signals
+    /// (a missing one reads 0), so other signals on `b`'s wire don't count.
+    fn count_sum(&mut self, v: V) -> Option<V> {
+        let mut leaves = Vec::new();
+        if !self.add_leaves(v, &mut leaves, 64) {
+            return None;
+        }
+        // (bundle, k) → [(leaf index, signal)]
+        let mut groups: Vec<((V, i32), Vec<(usize, ticky_factorio::Sig)>)> = Vec::new();
+        for (i, &l) in leaves.iter().enumerate() {
+            let Some((b, s, k)) = self.slot_test(l) else { continue };
+            match groups.iter_mut().find(|(key, _)| *key == (b, k)) {
+                Some((_, v)) if !v.iter().any(|(_, t)| *t == s) => v.push((i, s)),
+                Some(_) => {}
+                None => groups.push(((b, k), vec![(i, s)])),
+            }
+        }
+        groups.retain(|(_, v)| v.len() >= 3);
+        if groups.is_empty() {
+            return None;
+        }
+        let mut used = vec![false; leaves.len()];
+        let mut terms = Vec::new();
+        for ((b, k), members) in groups {
+            for (i, _) in &members {
+                used[*i] = true;
+            }
+            let b = self.rebuild(b);
+            let dom = self.g.bconst(members.iter().map(|(_, s)| (*s, 1)));
+            let kv = self.g.konst(k);
+            let cond = vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(kv) }]];
+            let hits = self.g.bun(vec![BTerm::DFilter(dom, b, cond, crate::ir::FOut::Copy)]);
+            terms.push(self.g.btotal(hits));
+        }
+        for (i, l) in leaves.into_iter().enumerate() {
+            if !used[i] {
+                terms.push(self.rebuild(l));
+            }
+        }
+        let mut acc = terms[0];
+        for &t in &terms[1..] {
+            acc = self.g.ar(ArOp::Add, acc, t);
+        }
+        Some(acc)
+    }
+
+    /// One-hot outputs picked by comparing one scalar with constants (`A if x == 1 else B if
+    /// x == 2 else …`, a decider per arm) become a table lookup: a constant table of the
+    /// arms' values and one decider passing the signal whose value equals `x` (a [`BTerm::Hot`],
+    /// plus the index signal; the table is shared by equal lookups).
+    fn table_lookups(&mut self, terms: Vec<BTerm>) -> Vec<BTerm> {
+        // x → [(term index, constant, signal)]
+        let mut groups: Vec<(V, Vec<(usize, i32, ticky_factorio::Sig)>)> = Vec::new();
+        for (i, t) in terms.iter().enumerate() {
+            let BTerm::Dec(arms) = t else { continue };
+            let [(d, vals)] = arms.as_slice() else { continue };
+            let ([term], [(sig, 1)]) = (d.as_slice(), vals.as_slice()) else { continue };
+            let side = |l: &Lit| match (self.g.as_const(l.a), self.g.as_const(l.b)) {
+                (None, Some(k)) => Some((l.a, k)),
+                (Some(k), None) => Some((l.b, k)),
+                _ => None,
+            };
+            let eqs: Vec<(V, i32)> = term.iter().filter(|l| l.op == CmpOp::Eq).filter_map(side).collect();
+            let [(x, c)] = eqs.as_slice() else { continue };
+            // Anything else must be `x != c'` for another constant: implied by `x == c`.
+            let implied = term.iter().all(|l| match (l.op, side(l)) {
+                (CmpOp::Eq, Some((y, k))) => y == *x && k == *c,
+                (CmpOp::Ne, Some((y, k))) => y == *x && k != *c,
+                _ => false,
+            });
+            if !implied {
+                continue;
+            }
+            match groups.iter_mut().find(|(y, _)| y == x) {
+                Some((_, v)) => v.push((i, *c, *sig)),
+                None => groups.push((*x, vec![(i, *c, *sig)])),
+            }
+        }
+        let mut drop = vec![false; terms.len()];
+        let mut extra = Vec::new();
+        for (x, arms) in groups {
+            let distinct = |f: &dyn Fn(&(usize, i32, ticky_factorio::Sig)) -> i64| {
+                let mut v: Vec<i64> = arms.iter().map(f).collect();
+                v.sort();
+                v.dedup();
+                v.len() == arms.len()
+            };
+            // Worth it from three arms (index, table and lookup against a decider per arm).
+            if arms.len() < 3 || !distinct(&|a| a.1 as i64) || !distinct(&|a| a.2 .0 as i64) {
+                continue;
+            }
+            // Table values must be non-zero (a constant combinator can't hold 0): shift them,
+            // and the index with them, when an arm compares with 0.
+            let k: i64 = if arms.iter().any(|a| a.1 == 0) { 1 - arms.iter().map(|a| a.1 as i64).min().unwrap() } else { 0 };
+            if arms.iter().any(|a| (a.1 as i64 + k) > i32::MAX as i64 || (a.1 as i64 + k) == 0) {
+                continue;
+            }
+            let table = self.g.bconst(arms.iter().map(|a| (a.2, (a.1 as i64 + k) as i32)));
+            let idx = ticky_factorio::SignalTable::base().index_signal();
+            let ix = self.g.bun(vec![BTerm::Shift(idx, x, k as i32)]);
+            for a in &arms {
+                drop[a.0] = true;
+            }
+            extra.push(BTerm::Hot(table, ix, 1));
+        }
+        terms.into_iter().zip(drop).filter(|(_, d)| !d).map(|(t, _)| t).chain(extra).collect()
     }
 
     /// A rebuilt condition value `x` (constants under conditions) written on signals `sigs`:
@@ -508,6 +744,12 @@ impl<'g> Fuser<'g> {
         // Splitting a select only pays when a path keeps the old value or loads a constant
         // (otherwise it just multiplies loads), and the number of loads stays small.
         let worth = |this: &Self, x: V| Some(x) == own || this.g.as_const(x).is_some() || this.mentions(x, own);
+        // A running maximum is cheaper as one selector than as loads per candidate.
+        if self.argmax_chain(v).is_some() {
+            let r = self.rebuild(v);
+            loads.push(Load { guard, val: LoadVal::Node(r), direct: false });
+            return;
+        }
         if let Some((t, f, a, b)) = self.g.as_mux(v) {
             // The top-level split is cheap (two loads) and saves the select stage.
             let top = is_true(&guard);

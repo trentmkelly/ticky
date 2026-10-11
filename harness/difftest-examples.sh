@@ -37,3 +37,4 @@ run examples/dashboard.ticky --ticks 300 --set temp=345 --set level=50 --set tem
 run examples/readouts.ticky --ticks 400 --set heat=873 --set items=1 --set heat=-45@100 --set items=0@130 --set heat=99999@200 --set items=3@220 --set heat=-999@260 --set heat=0@300 --set items=17@320
 run examples/sounds.ticky --ticks 300 --set heat=950@5 --set bell=1@20 --set heat=100@60 --set bell=0@120 --set bell=1@150 --set bell=0@151 --set heat=901@200 --set heat=900@260
 run examples/controls.ticky --ticks 120 --set stock=50 --set target=40@20 --set enabled=0@40 --set target=500@50 --set enabled=1@60 --set stock=-30@80 --set target=0@100
+run examples/bestof.ticky --ticks 200 --set a=3 --set b=9 --set c=4 --set d=1 --set a=6@40 --set b=6@40 --set c=6@40 --set d=2@40 --set a=1@80 --set b=9@80 --set c=9@80 --set d=9@80 --set a=-5@120 --set b=0@120 --set c=-1@120 --set d=0@120 --set a=5@160 --set b=4@160 --set c=6@160 --set d=100@160
