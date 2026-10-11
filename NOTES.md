@@ -1260,3 +1260,14 @@ bestof 31 → 29, arrays 51 → 50, stats 47 → 46; no example grew.
 - Verified after rebasing on main: `FUZZ_N=150 tools/verify.sh` seeds 11, 9, 3 all clean
   except fuzz_level2 "ran out of signals" once each on seeds 9 and 3 (the limit above); the
   relay failures noted for seed 9 are gone. In-game: 36/36 examples MATCH.
+## 2026-10-11: fix — two selects passing values under one array element's signal
+
+A select whose value is only written into a bundle (`arr[0] = u if x else v`) takes the
+element's signal as its name, and with select stages its passed values carry that name on
+the cluster's private wire. An unrolled loop writing `arr[0]` in each iteration put two
+such passes on one wire, where they added up (arr[0] = 3 instead of 1 for x = y = -20 in
+`passed_values_of_one_array_element`). Later selects with a taken name now use a bus signal
+(their bundle copies it). Introduced with select stages (94c33d1), not by the pipeline merge:
+the bisect that blamed the merge used `git archive` trees built into one shared
+CARGO_TARGET_DIR, where path packages share artifact names and old source mtimes leave stale
+binaries — build each tree with its own target dir. Bench unchanged.
