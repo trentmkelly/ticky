@@ -1116,9 +1116,10 @@ after the register changes; 231 → 134 before them).
 ## 2026-10-11: staged loads (guarded loads in one decider, merged loads)
 
 registers.rs (`Cg::stage_loads`, `Staging`, `LoadStage`, `guard_conds`), logic.rs (`staged`
-parameter), procs.rs/period.rs (call sites), fuse/plans.rs (`keep_of`). Bench 1957 → 1926:
-sorting −13, functions −4, stats −4, calculator, dice, ranking −2, bestof, fib, handshake,
-primes −1; nothing grew.
+parameter), procs.rs/period.rs (call sites), fuse/plans.rs (`keep_of`). Bench on main after
+vectorize/sortnet 1756 → 1735: stats −6, functions −4, calculator, dice, ranking −2, bestof,
+fib, handshake, primes, sorting −1; nothing grew. (Before those merges 1957 → 1926, sorting
+−13: sortnet now builds most of its loads.)
 - **Staged values.** Before `logic()`, a load's value qualifies when no graph node, no other
   root and no other load reads it (`roots` counted; uses inside the same plan's guards are
   allowed, see below). `logic()` then emits it under the register's signal onto a red staging
@@ -1150,7 +1151,8 @@ primes −1; nothing grew.
   hold reading a staged value from the wire (no example needs it: no hit when allowed).
 - Test `staged_loads`. Sim traces of every difftest-examples line identical to the base
   binary. `FUZZ_N=100 tools/verify.sh` passed; fuzz_procs/programs/level2/blocks 400 each
-  (seed 7): one level2 "no room for a wire relay" failure, same on the base binary. In-game
-  (frozen release): 36/36 examples, cubium-generator, and probes (max of a difference, a
+  (seed 7) and procs/programs/level2 300 (seed 11): only level2 layout/branching compile
+  failures, the same count on main. In-game (frozen release, before and after rebasing onto
+  vectorize/sortnet): 36/36 examples, cubium-generator, and probes (max of a difference, a
   guarded load, a staged increment, merged loads with a floor `//` and `%`, a clamp select,
   RUN off/on, INT_MIN) MATCH.
