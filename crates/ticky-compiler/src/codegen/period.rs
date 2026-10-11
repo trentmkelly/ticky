@@ -75,6 +75,7 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
             r => cg.register(r.sig(), s.init, &ws, &name)?,
         }
     }
+    cg.flush_shared(false);
     Ok(BlockStats {
         span: b.span,
         requested: b.requested,

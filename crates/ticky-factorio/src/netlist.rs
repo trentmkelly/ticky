@@ -35,7 +35,7 @@ pub struct Arith {
     pub out: Sig,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Cond {
     pub first: Sig,
     pub first_nets: Nets,

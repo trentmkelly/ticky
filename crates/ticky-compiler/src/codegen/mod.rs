@@ -204,6 +204,8 @@ struct Cg {
     everything: Sig,
     /// With `--checks`: the error code register (the first failed check's code).
     err: Option<Sig>,
+    /// Deciders waiting to be merged with others of the same conditions ([`Cg::shared`]).
+    pending: Vec<registers::Pending>,
 }
 
 /// A condition read from the bus only (for combinators whose red input carries a bundle).
@@ -422,6 +424,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         each: t.special("signal-each"),
         everything: t.special("signal-everything"),
         err: None,
+        pending: Vec::new(),
     };
     let mut state_bun: HashMap<usize, BRef> = HashMap::new();
     for (si, s) in p.states.iter().enumerate() {
@@ -451,7 +454,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     for _ in &p.procs {
         anys.push(cg.alloc()?);
     }
-    cg.core(dec_const(vec![c(run, CmpOp::Ne, 0)], rp, 1), "control: RUN delayed one tick");
+    cg.shared(vec![c(run, CmpOp::Ne, 0)], out_const(rp, 1), "control: RUN delayed one tick");
     let mut st_outs = vec![out_const(st, 1)];
     st_outs.extend(anys.iter().map(|a| out_const(*a, 1)));
     cg.core(dec(vec![c(run, CmpOp::Ne, 0), c(rp, CmpOp::Eq, 0)], st_outs), "control: start pulse (loads initial values)");
@@ -459,7 +462,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     if p.error_port.is_some() {
         let e = cg.alloc()?;
         cg.err = Some(e);
-        cg.core(dec_copy(vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], e), "checks: error code (hold)");
+        cg.hold(vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0)], e, "checks: error code");
         let lamp = cg.net.add(Kind::Lamp(c(e, CmpOp::Ne, 0), None), Role::ErrorLamp);
         cg.net.entities[lamp].description =
             Some("Ticky error lamp (--checks): lights when a runtime check fails; the `error` output port gives the code.".into());
@@ -486,6 +489,7 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         let first_ent = cg.net.entities.len();
         if let Some(pipe) = &b.pipe {
             let (direct, red, extra) = pipelined::pipelined_block(&mut cg, p, bi, b, pipe, &shared, &live, &comb)?;
+            cg.flush_shared(false);
             comb_ref.extend(direct);
             comb_red.extend(red);
             blocks.push(BlockStats {
@@ -507,6 +511,8 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
         procs.push(procs::main_proc(&mut cg, p, m, &shared, *any, &live)?);
     }
 
+    // Program-wide shared deciders (initial values, holds under ST/RUN only).
+    cg.flush_shared(true);
     ports::output_ports(&mut cg, p, &shared, &comb_ref, &comb_red, &mut port_ents, outputs_west);
     let screen_lamps = ports::screens(&mut cg, p, &shared);
     cg.bfinish();

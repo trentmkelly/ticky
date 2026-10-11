@@ -169,8 +169,8 @@ pub(super) fn main_proc(
             }
         }
     }
-    cg.core(dec_copy(vec![c(run, CmpOp::Ne, 0)], pc), format!("{}: program counter (hold)", m.name));
-    cg.core(dec_const(vec![c(st, CmpOp::Ne, 0)], pc, pc_of(Some(m.entry))), format!("{}: program counter (start)", m.name));
+    cg.hold(vec![c(run, CmpOp::Ne, 0)], pc, &format!("{}: program counter", m.name));
+    cg.shared(vec![c(st, CmpOp::Ne, 0)], out_const(pc, pc_of(Some(m.entry))), format!("{}: program counter (start)", m.name));
     for k in pc_loads {
         cg.core(k, format!("{}: program counter (next step)", m.name));
     }
@@ -211,5 +211,6 @@ pub(super) fn main_proc(
             plans.iter().map(|(en, prefix, plan)| Writer { en: *en, prefix: prefix.clone(), plan, val: &loc, lit: &lit, lit_eg: &lit }).collect();
         cg.register(r, 0, &ws, &format!("{}: return address of `{func}`", m.name))?;
     }
+    cg.flush_shared(false);
     Ok(MainStats { name: m.name.clone(), steps: stats, combinators: cg.combinators_since(first_ent) })
 }

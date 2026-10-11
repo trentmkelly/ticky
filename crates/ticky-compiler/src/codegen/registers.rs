@@ -1,5 +1,9 @@
 //! State-holding machinery: registers (hold decider + guarded loads, scalar and bundle),
 //! sample registers, the step-timer style counter and the every-tick accumulator.
+//!
+//! Deciders that differ only in their outputs are built once with all the outputs
+//! ([`Cg::shared`]): the holds of registers held under the same conditions (`[conds] → x
+//! copy, y copy, …`), and every initial value (`[ST≠0] → x = 1, y = 5, …`).
 
 use ticky_factorio::*;
 use ticky_syntax::Diag;
@@ -8,7 +12,45 @@ use super::*;
 use crate::fuse::{is_true, LoadVal, WriterPlan};
 use crate::ir::{Lit, V};
 
+/// A decider waiting for others with the same conditions.
+pub(super) struct Pending {
+    conds: Vec<Cond>,
+    outs: Vec<DOut>,
+    descs: Vec<String>,
+}
+
 impl Cg {
+    /// A decider `[conds] → out`, merged with every other one of the same conditions in this
+    /// block or process (program-wide when the conditions only test RUN, RP and ST). The
+    /// outputs must be on distinct signals. Built by [`Cg::flush_shared`].
+    pub(super) fn shared(&mut self, conds: Vec<Cond>, out: DOut, desc: impl Into<String>) {
+        let desc = desc.into();
+        match self.pending.iter_mut().find(|p| p.conds == conds) {
+            Some(p) => {
+                p.outs.push(out);
+                p.descs.push(desc);
+            }
+            None => self.pending.push(Pending { conds, outs: vec![out], descs: vec![desc] }),
+        }
+    }
+
+    /// Register `x` holds (copies itself) while `conds` hold.
+    pub(super) fn hold(&mut self, conds: Vec<Cond>, x: Sig, name: &str) {
+        self.shared(conds, DOut { sig: x, copy: true, constant: 1, nets: Nets::BOTH }, format!("{name} (hold)"));
+    }
+
+    /// Builds the pending shared deciders: those local to the block or process just built,
+    /// or (`all`) every one.
+    pub(super) fn flush_shared(&mut self, all: bool) {
+        let global = [self.run, self.rp, self.st];
+        let (now, keep): (Vec<Pending>, Vec<Pending>) =
+            std::mem::take(&mut self.pending).into_iter().partition(|p| all || !p.conds.iter().all(|c| global.contains(&c.first)));
+        self.pending = keep;
+        for p in now {
+            self.core(dec(p.conds, p.outs), p.descs.join("; "));
+        }
+    }
+
     /// `sig` counts up by one every tick while `conds` hold, and is 0 otherwise. A decider
     /// copies the signal from a private red loop that also carries a constant +1.
     pub(super) fn counter(&mut self, sig: Sig, conds: Vec<Cond>, desc: &str) {
@@ -79,15 +121,9 @@ impl Cg {
             }
             hold = cand(&hold, &factor);
         }
-        self.core(
-            Kind::Decider(Decider {
-                conds: distribute(&[], &hold),
-                outputs: vec![DOut { sig: x, copy: true, constant: 1, nets: Nets::BOTH }],
-            }),
-            format!("{name} (hold)"),
-        );
+        self.hold(distribute(&[], &hold), x, name);
         if init != 0 {
-            self.core(dec_const(vec![c(self.st, CmpOp::Ne, 0)], x, init), format!("{name} (initial value {init})"));
+            self.shared(vec![c(self.st, CmpOp::Ne, 0)], out_const(x, init), format!("{name} (initial value {init})"));
         }
         Ok(())
     }
@@ -95,7 +131,7 @@ impl Cg {
     /// A sample register: copies `raw` into a new signal whenever `en` fires.
     pub(super) fn sample(&mut self, raw: Sig, en: Sig, what: &str) -> Result<Sig, Diag> {
         let smp = self.alloc()?;
-        self.core(dec_copy(vec![c(en, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)], smp), format!("sample of {what} (hold)"));
+        self.hold(vec![c(en, CmpOp::Eq, 0), c(self.run, CmpOp::Ne, 0)], smp, &format!("sample of {what}"));
         self.core(arith(Operand::Sig(raw), ArOp::Mul, Operand::Sig(en), smp), format!("sample of {what} (load)"));
         Ok(smp)
     }
