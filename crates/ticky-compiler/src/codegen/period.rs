@@ -10,8 +10,41 @@ use crate::fuse::WriterPlan;
 use crate::ir::{Lit, V};
 use crate::program::{Program, SrcKind};
 
-/// A block that commits every `b.period` ticks; `clock` is its clock signal (period ≥ 2).
-pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::program::Block, clock: Option<Sig>, shared: &Shared, live: &[bool]) -> Result<BlockStats, Diag> {
+/// A block clock: `sig` counts 1..=N (from the RUN switch's +1, copied while below N). All
+/// clocks start together, so blocks of the same period share one; `build` is set for the
+/// block that builds it. (A block whose period divides another's could test two phases of
+/// the longer clock, but the commit pulse's conditions must stay one AND-term: register
+/// enable pulses and checks extend them.)
+#[derive(Copy, Clone)]
+pub(super) struct Clock {
+    pub(super) sig: Sig,
+    pub(super) build: bool,
+}
+
+/// The clock of each block (period ≥ 2 and not pipelined).
+pub(super) fn clocks(cg: &mut Cg, p: &Program) -> Result<Vec<Option<Clock>>, Diag> {
+    let mut out: Vec<Option<Clock>> = Vec::new();
+    let mut built: Vec<(u32, Sig)> = Vec::new();
+    for b in &p.blocks {
+        if b.period < 2 || b.pipe.is_some() {
+            out.push(None);
+            continue;
+        }
+        let clock = match built.iter().find(|(n, _)| *n == b.period) {
+            Some(&(_, sig)) => Clock { sig, build: false },
+            None => {
+                let sig = cg.alloc()?;
+                built.push((b.period, sig));
+                Clock { sig, build: true }
+            }
+        };
+        out.push(Some(clock));
+    }
+    Ok(out)
+}
+
+/// A block that commits every `b.period` ticks; `clock` is its clock (period ≥ 2).
+pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::program::Block, clock: Option<Clock>, shared: &Shared, live: &[bool]) -> Result<BlockStats, Diag> {
     let first_ent = cg.net.entities.len();
     let (run, rp) = (cg.run, cg.rp);
     let n = b.period as i32;
@@ -23,14 +56,14 @@ pub(super) fn period_block(cg: &mut Cg, p: &Program, bi: usize, b: &crate::progr
     // When both pulses share a phase, the very first ES would commit before anything
     // was computed; WARM (set by the first EI) suppresses it.
     let warm = if phase_es == 1 { Some(cg.alloc()?) } else { None };
-    let gate = |k: Option<Sig>, phase: i32| -> Vec<Cond> {
+    let gate = |k: Option<Clock>, phase: i32| -> Vec<Cond> {
         match k {
-            Some(k) => vec![c(k, CmpOp::Eq, phase), c(rp, CmpOp::Ne, 0)],
+            Some(k) => vec![c(k.sig, CmpOp::Eq, phase), c(rp, CmpOp::Ne, 0)],
             None => vec![c(rp, CmpOp::Ne, 0)],
         }
     };
-    if let Some(k) = clock {
-        cg.core(dec_copy(vec![c(k, CmpOp::Lt, n), c(rp, CmpOp::Ne, 0)], k), format!("{what}: clock, period {n}"));
+    if let Some(k) = clock.filter(|k| k.build) {
+        cg.core(dec_copy(vec![c(k.sig, CmpOp::Lt, n), c(rp, CmpOp::Ne, 0)], k.sig), format!("{what}: clock, period {n}"));
     }
     // Only built when something reads it: a sample, or the warm-up latch.
     let samples = b.srcs.iter().any(|k| !matches!(k, SrcKind::Own(_)));

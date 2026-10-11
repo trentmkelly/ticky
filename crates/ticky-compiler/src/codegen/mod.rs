@@ -436,12 +436,9 @@ pub fn codegen(p: &Program, autostart: bool, outputs_west: bool) -> Result<Codeg
     }
 
     // RUN switch: RUN=1 plus each block clock's +1.
-    let mut clocks: Vec<Option<Sig>> = Vec::new();
-    for b in &p.blocks {
-        clocks.push(if b.period >= 2 { Some(cg.alloc()?) } else { None });
-    }
+    let clocks = period::clocks(&mut cg, p)?;
     let mut run_values = vec![(run, 1)];
-    run_values.extend(clocks.iter().flatten().map(|k| (*k, 1)));
+    run_values.extend(clocks.iter().flatten().filter(|k| k.build).map(|k| (k.sig, 1)));
     // The start-up counter of every-tick blocks, if they use one, counts like a clock.
     run_values.extend(pipelined::plan_warm(&mut cg, p, &live, &comb)?.map(|w| (w, 1)));
     let run_switch = cg.net.add(Kind::Constant(ConstComb { values: run_values, on: autostart }), Role::RunSwitch);
