@@ -1,0 +1,32 @@
+# Decompose a signed tick offset into whole minutes and the remaining signed ticks.
+# Truncation keeps the residual's sign, useful for early/late timing displays.
+input offset: int @ T
+output minutes: int @ M
+output ticks: int @ S
+
+every tick:
+    whole = tdiv(offset, 3600)
+    minutes = whole
+    ticks = offset - whole * 3600
+
+test "early and late offsets":
+    set offset = 7261
+    run 30 ticks
+    assert minutes == 2 and ticks == 61
+    set offset = -7261
+    run 30 ticks
+    assert minutes == -2 and ticks == -61
+    set offset = -7200
+    run 30 ticks
+    assert minutes == -2 and ticks == 0
+
+test "signed limits":
+    set offset = -2147483648
+    run 30 ticks
+    assert minutes == -596523 and ticks == -848
+    set offset = 2147483647
+    run 30 ticks
+    assert minutes == 596523 and ticks == 847
+    set offset = 0
+    run 30 ticks
+    assert minutes == 0 and ticks == 0

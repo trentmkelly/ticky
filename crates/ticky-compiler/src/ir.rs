@@ -808,6 +808,25 @@ impl Graph {
                 _ => {}
             }
         }
+        // Recover a truncating remainder from its quotient reconstruction. Besides
+        // divide-by-zero, Factorio's MIN / -1 == 0 is exceptional: in those cases
+        // a - (a / b) * b equals a, whereas a % b is zero. Require both absent.
+        if op == ArOp::Sub {
+            if let Op::Ar(ArOp::Mul, p, q) = *self.op(b) {
+                for (quot, divisor) in [(p, q), (q, p)] {
+                    if matches!(*self.op(quot), Op::Ar(ArOp::Div, x, d) if x == a && d == divisor) {
+                        let di = self.iv(divisor);
+                        let ai = self.iv(a);
+                        if !self.is_bundle(a) && !self.is_bundle(divisor)
+                            && (di.lo > 0 || di.hi < 0)
+                            && (di.lo > -1 || di.hi < -1 || ai.lo > MIN)
+                        {
+                            return self.ar(ArOp::Mod, a, divisor);
+                        }
+                    }
+                }
+            }
+        }
         if op == ArOp::And && kb == Some(1) && self.is_bool(a) {
             return a;
         }
