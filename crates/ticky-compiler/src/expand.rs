@@ -23,6 +23,7 @@ use ticky_syntax::{Diag, Span};
 
 use crate::program::eval_const;
 
+mod specialize;
 mod vectorize;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,6 +109,13 @@ pub struct Expander<'a> {
     stack: Vec<String>,
     /// Inside an `every` block: loops are unrolled, `while`/`wait` are errors.
     every: bool,
+    constant_leaves: HashSet<String>,
+    constant_cache: HashMap<(String, Vec<i32>), Option<i32>>,
+    outline_costs: HashMap<String, usize>,
+    outline_site: bool,
+    isolated_calls: HashSet<usize>,
+    unroll_sites: HashSet<usize>,
+    observed: HashSet<String>,
     next_id: usize,
     pub calls: BTreeMap<String, usize>,
     /// Functions compiled once and called as subroutines from sequential code (those with
@@ -482,6 +490,13 @@ impl<'a> Expander<'a> {
             loops: Vec::new(),
             stack: Vec::new(),
             every: false,
+            constant_leaves: HashSet::new(),
+            constant_cache: HashMap::new(),
+            outline_costs: HashMap::new(),
+            outline_site: false,
+            isolated_calls: HashSet::new(),
+            unroll_sites: HashSet::new(),
+            observed: HashSet::new(),
             next_id: 0,
             calls: BTreeMap::new(),
             subs: HashSet::new(),
@@ -1533,7 +1548,10 @@ impl<'a> Expander<'a> {
             }
         }
 
-        if self.subs.contains(f) && !self.every {
+        if let Some(value) = self.constant_call(f, &bound, span) {
+            return Ok(value);
+        }
+        if self.subs.contains(f) && !self.every && (!self.outline_costs.contains_key(f) || self.outline_site) {
             let key = self.sub_key(f);
             *self.sub_sites.entry(key.clone()).or_default() += 1;
             if !self.inline_once.contains(&key) {
@@ -1927,7 +1945,11 @@ impl<'a> Expander<'a> {
         let span = s.span;
         match &s.kind {
             StmtKind::Assign { targets, value } => {
-                let v = self.expr(value, out)?;
+                let previous = self.outline_site;
+                self.outline_site = self.isolated_calls.contains(&s.span.start) && self.outline_assignment(targets, value);
+                let v = self.expr(value, out);
+                self.outline_site = previous;
+                let v = v?;
                 // `a = b = value`: evaluate once, then assign left to right.
                 if targets.len() > 1 {
                     let first = &targets[0];
@@ -2199,9 +2221,10 @@ impl<'a> Expander<'a> {
             return Err(Diag::error(target.span, "the loop variable must be a single name"));
         };
         let is_range = matches!(&iter.kind, ExprKind::Call { func, .. } if matches!(&func.kind, ExprKind::Name(n) if n == "range"));
-        if self.every {
+        let small = self.unroll_values(target, iter, body);
+        if self.every || small.is_some() {
             // Unroll: one labelled block per iteration inside one for the whole loop.
-            let values = self.iteration_values(iter, out)?;
+            let values = match small { Some(values) => values, None => self.iteration_values(iter, out)? };
             let mut assigned_in_body = HashSet::new();
             assigned(body, &mut assigned_in_body);
             let substitute = !assigned_in_body.contains(t);
@@ -2511,6 +2534,7 @@ pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallI
     for round in 0..ROUNDS {
         let mut ex = Expander::new(&fns, &consts, shapes.clone());
         ex.subs = sequential_fns(&fns);
+        ex.prepare_specialization(m);
         ex.inline_once = std::mem::take(&mut inline_once);
         ex.reads = reads.clone();
         ex.elem_written = elem_written.clone();
@@ -2547,7 +2571,10 @@ pub fn expand_module(m: &Module, mem: &HashSet<String>) -> Result<(Module, CallI
             }
         }
         let new: Vec<String> = ex.found_mem.difference(&mem_keys).cloned().collect();
-        inline_once = ex.sub_sites.iter().filter(|(_, n)| **n == 1).map(|(k, _)| k.clone()).collect();
+        inline_once = ex.sub_sites.iter().filter(|(key, n)| {
+            let f = key.rsplit(':').next().unwrap();
+            **n == 1 || ex.outline_costs.get(f).is_some_and(|cost| (**n - 1) * cost <= 12 + 6 * **n)
+        }).map(|(k, _)| k.clone()).collect();
         if round == 0 || (!new.is_empty() && round + 1 < ROUNDS) {
             mem_keys.extend(new);
             // Carry over the shapes of names that are the same every round (inlined calls'

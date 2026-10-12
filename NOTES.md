@@ -1383,3 +1383,26 @@ contents, rot-chest contents. 225 combinators, depth 16, every 60 ticks.
   starts).
 - In-game difftests with Cubium loaded: `harness/difftest-holmium.sh` MATCH 1499 ticks; a
   legendary build with mixed normal/legendary stock MATCH 699 ticks (normal stock ignored).
+
+## 2026-10-12 — Conservative frontend size optimizations
+
+- Closed integer leaf functions with constant arguments can run through the existing constant
+  interpreter outside the prologue. Evaluation is cached and limited to 10,000 statement/loop
+  executions per argument tuple; unsupported operations, runtime reads, failed checks and
+  exhausted budgets fall back to ordinary compilation. This applies under both optimization
+  modes. Functions with waits, global writes, assertions or further calls are excluded.
+- Under `--opt=size`, large straight-line, one-argument scalar functions can share a subroutine.
+  The estimate counts live IR operations after folding/CSE and subtracts call/return overhead.
+  Only complete assignment calls isolated by waits (or first in an iteration, before a wait)
+  qualify; adjacent assignments and calls embedded in expressions retain their sampling and
+  commit boundaries. `--opt=speed` keeps inlining.
+- Under `--opt=size`, tiny constant-range loops in main can unroll when the estimated duplicated
+  arithmetic is cheaper than the controller. Only unobserved scalar state and at most four
+  iterations qualify, with a local-only assignment tail ending in a wait. Runtime input reads,
+  observable writes, live loop indexes, calls, exits, nested loops, expensive arithmetic and
+  `--checks` keep the original loop. Broader unrolling requires a sampling/dependence analysis.
+- Focused source probes: constant `sum(i*i for i in range(10))` implemented as a function inside
+  a runtime loop: 22 → 13 total combinators; three affine local iterations: 23 → 18; six-round
+  arithmetic function called three times between waits: 74 → 52. Semantic tests cover wrapping
+  integers, output order, changing inputs, explicit waits, global side effects and checked
+  division by zero. The function cost report currently labels evaluated calls as inlined.
