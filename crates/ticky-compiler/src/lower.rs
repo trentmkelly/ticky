@@ -294,8 +294,8 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                     }
                     return Ok(r);
                 }
-                // Internal: `#vec(bundle version, unrolled)`, two forms of a bank of a range
-                // comprehension (expand/vectorize.rs): whichever adds fewer operations.
+                // Internal: `#vec(vector version, unrolled)`, two forms of a range
+                // comprehension bank or its whole reduction: whichever adds fewer operations.
                 "#vec" => return vec_or_unrolled(g, names, &args[0], &args[1]),
                 // Internal: `#amap(comprehension, bank, f(0), n)`, `[f(x) for x in arr]` on one
                 // bank of a signal array (expand.rs `mem_map`).
@@ -488,12 +488,14 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
     })
 }
 
-/// The cheaper of two forms of the same bundle: `vector` (a bundle comprehension) unless it
+/// The cheaper of two forms of the same value: `vector` (a bundle or reduction) unless it
 /// fails to lower or adds more operations than `unrolled` (see [`candidate_ops`]). Both are
 /// lowered; the loser's nodes stay unused, and its runtime checks are dropped.
 fn vec_or_unrolled(g: &mut Graph, names: &mut dyn Names, vector: &Expr, unrolled: &Expr) -> Result<V, Diag> {
     let (n0, c0) = (g.nodes.len(), g.checks.len());
+    g.vector_candidate += 1;
     let a = expr(g, names, vector);
+    g.vector_candidate -= 1;
     let c1 = g.checks.len();
     let b = expr(g, names, unrolled)?;
     match a {

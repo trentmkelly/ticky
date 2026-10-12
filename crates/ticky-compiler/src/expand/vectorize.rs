@@ -144,6 +144,64 @@ impl Expander<'_> {
         self.vectorised(items).map(|v| v.banks.clone())
     }
 
+    /// Forward a pure range producer into its adjacent sole reduction. Re-evaluating
+    /// random/selector/user calls, or crossing any intervening statement, is forbidden:
+    /// the original array denotes a snapshot. The normal assignment is still emitted.
+    pub(super) fn forward_range_reduction(&self, producer: &Stmt, consumer: &Stmt) -> Option<Stmt> {
+        let StmtKind::Assign { targets, value } = &producer.kind else { return None };
+        let [Expr { kind: ExprKind::Name(n), .. }] = targets.as_slice() else { return None };
+        if self.reads.get(n) != Some(&1) { return None; }
+        let ExprKind::ListComp { elt, iter, conds, .. } = &value.kind else { return None };
+        if !is_range(iter) || !conds.is_empty() { return None; }
+        fn pure(e: &Expr) -> bool {
+            match &e.kind {
+                ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Name(_) => true,
+                ExprKind::Unary(_, x) | ExprKind::Not(x) => pure(x),
+                ExprKind::Binary(_, a, b) => pure(a) && pure(b),
+                ExprKind::Compare(a, xs) => pure(a) && xs.iter().all(|(_, b)| pure(b)),
+                ExprKind::BoolOp(_, xs) => xs.iter().all(pure),
+                ExprKind::IfExp { cond, then, orelse } => pure(cond) && pure(then) && pure(orelse),
+                ExprKind::Call { func, args, kwargs } => matches!(&func.kind, ExprKind::Name(f) if matches!(f.as_str(), "min" | "max" | "abs" | "tdiv" | "tmod"))
+                    && kwargs.is_empty() && args.iter().all(pure),
+                _ => false,
+            }
+        }
+        if !pure(elt) { return None; }
+        let StmtKind::Assign { targets: dest, value: reduction } = &consumer.kind else { return None };
+        if !matches!(dest.as_slice(), [Expr { kind: ExprKind::Name(d), .. }] if d != n) { return None; }
+        let ExprKind::Call { func, args, kwargs } = &reduction.kind else { return None };
+        if !matches!(&func.kind, ExprKind::Name(f) if matches!(f.as_str(), "sum" | "min" | "max"))
+            || !kwargs.is_empty() || !matches!(args.as_slice(), [Expr { kind: ExprKind::Name(a), .. }] if a == n) {
+            return None;
+        }
+        let reduction = Expr { kind: ExprKind::Call { func: func.clone(), args: vec![value.clone()], kwargs: vec![] }, span: reduction.span };
+        Some(Stmt { kind: StmtKind::Assign { targets: dest.clone(), value: reduction }, span: consumer.span })
+    }
+
+    /// Choose a representation for the whole producer/reduction region. Strip each
+    /// bank's local choice: a cheaper bank is not necessarily a cheaper reduction.
+    /// The scalar fallback retains the original element expressions and their checks.
+    pub(super) fn vectorised_reduction(&self, f: &str, items: &[Expr], scalar: Expr, span: Span) -> Expr {
+        let Some(v) = self.vectorised(items) else { return scalar };
+        let mut parts = Vec::new();
+        for (bank, (_, nb)) in v.banks.iter().zip(bank_ranges(items.len())) {
+            let ExprKind::Call { args, .. } = &bank.kind else { unreachable!() };
+            let b = args[0].clone();
+            let part = match f {
+                "sum" => method_call(b, "total", span),
+                "min" | "max" => call(if f == "min" { "#amin" } else { "#amax" }, vec![b, int(nb as i64, span)], span),
+                _ => unreachable!(),
+            };
+            parts.push(part);
+        }
+        let vector = parts.into_iter().reduce(|a, b| match f {
+            "sum" => bin(BinOp::Add, a, b, span),
+            "min" | "max" => call(f, vec![a, b], span),
+            _ => unreachable!(),
+        }).unwrap();
+        call("#vec", vec![vector, scalar], span)
+    }
+
     /// An expanded element expression as a bundle comprehension's value: Python's floor `//`
     /// and `%` by a constant `c` written with truncating `tdiv`/`tmod` (`tmod(tmod(a, c) + c,
     /// c)`; `tdiv(a, c)` minus 1 where the remainder's sign differs from `c`'s), exact with

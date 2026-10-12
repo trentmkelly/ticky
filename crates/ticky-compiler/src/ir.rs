@@ -504,6 +504,9 @@ pub struct Graph {
     pub path: Vec<V>,
     /// How many bundle comprehensions are being lowered: inside one, `//` and `%` truncate.
     pub in_comp: u32,
+    /// Speculative vector candidates may fall back to scalars when bundle lowering
+    /// would need an ordered subtraction comparison that can overflow.
+    pub vector_candidate: u32,
     /// Random picks made so far (`Op::BSel` numbers).
     pub nonce: u32,
 }

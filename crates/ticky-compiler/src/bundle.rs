@@ -629,6 +629,14 @@ impl Conv {
         match g.op(c).clone() {
             Op::Cmp(CmpOp::Eq, x, z) if g.as_const(z) == Some(0) && g.is_bool(x) => self.restrict(g, x, !neg),
             Op::Cmp(op, a, b) => {
+                // Equality survives wrapping subtraction; ordering does not. A
+                // speculative vector candidate can retain the exact scalar form.
+                if g.vector_candidate != 0 && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                    let (ai, bi) = (g.iv(a), g.iv(b));
+                    if ai.lo - bi.hi < i32::MIN as i64 || ai.hi - bi.lo > i32::MAX as i64 {
+                        return Err(self.unsupported());
+                    }
+                }
                 // Compare the difference with 0, on every signal of the domain.
                 let op = if neg { op.negate() } else { op };
                 let diff = g.ar(ArOp::Sub, a, b);

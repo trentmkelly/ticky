@@ -1477,7 +1477,8 @@ impl<'a> Expander<'a> {
                     return Ok(Val::Scalar(int(0, span)));
                 }
                 let add = |a: Expr, b: Expr| Expr { kind: ExprKind::Binary(BinOp::Add, Box::new(a), Box::new(b)), span };
-                return Ok(Val::Scalar(tree(xs.clone(), &add)));
+                let scalar = tree(xs.clone(), &add);
+                return Ok(Val::Scalar(self.vectorised_reduction(f, xs, scalar, span)));
             }
             ("any" | "all", [Val::Array(xs)]) => {
                 if xs.is_empty() {
@@ -1488,7 +1489,8 @@ impl<'a> Expander<'a> {
                 return Ok(Val::Scalar(Expr { kind: ExprKind::BoolOp(op, tests), span }));
             }
             ("min" | "max", [Val::Array(xs)]) if !xs.is_empty() => {
-                return Ok(Val::Scalar(tree(xs.clone(), &|a, b| call(f, vec![a, b]))));
+                let scalar = tree(xs.clone(), &|a, b| call(f, vec![a, b]));
+                return Ok(Val::Scalar(self.vectorised_reduction(f, xs, scalar, span)));
             }
             ("min" | "max", [Val::Array(_)]) => return Err(Diag::error(span, format!("`{f}` of an empty array"))),
             ("enumerate" | "zip", _) => {
@@ -1935,8 +1937,21 @@ impl<'a> Expander<'a> {
 
     pub fn stmts(&mut self, body: &[Stmt]) -> Result<Vec<Stmt>, Diag> {
         let mut out = Vec::new();
-        for s in body {
-            self.stmt(s, &mut out)?;
+        let mut i = 0;
+        while i < body.len() {
+            let candidates = self.vectorised.len();
+            self.stmt(&body[i], &mut out)?;
+            // Whole-array consumers can choose a representation before element names
+            // hide the producer. Only forward an adjacent, sole read in an every block;
+            // keep the binding itself for shape validation and its original checks.
+            if self.every && self.vectorised.len() > candidates && i + 1 < body.len() {
+                if let Some(next) = self.forward_range_reduction(&body[i], &body[i + 1]) {
+                    self.stmt(&next, &mut out)?;
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
         }
         Ok(out)
     }
