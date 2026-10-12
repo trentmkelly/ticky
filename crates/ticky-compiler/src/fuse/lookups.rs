@@ -1,4 +1,4 @@
-//! Table lookups: one-hot `Bun` arms all testing `x == c_i` (≥3) → a constant table and one
+//! Table lookups: one-hot `Bun` arms all testing `x == c_i` → a constant table and one
 //! `HotEq` (or, shifted off 0, `Hot`) decider ([`Fuser::table_lookups`], from `rebuild` of a
 //! `Bun`). Also: a runtime pick among reads of one bundle → a lookup of the signal and one
 //! `b · onehot` ([`Fuser::picked_read`], from `rebuild` of a `Sel`), and one-hot lookups
@@ -8,6 +8,14 @@ use ticky_factorio::CmpOp;
 
 use super::*;
 use crate::ir::{BTerm, Lit, Op, V};
+
+/// Choose an additive encoding with no zero table entries. Wrapping addition is a
+/// permutation of all i32 values, so it preserves equality even across signed overflow.
+/// With N keys, at most N offsets are forbidden; one of 0..=N must work.
+fn key_offset(keys: impl Iterator<Item = i32>) -> i32 {
+    let forbidden: std::collections::HashSet<i32> = keys.map(i32::wrapping_neg).collect();
+    (0..=forbidden.len()).map(|k| k as i32).find(|k| !forbidden.contains(k)).unwrap()
+}
 
 impl Fuser<'_> {
     /// One-hot outputs picked by comparing one scalar with constants (`A if x == 1 else B if
@@ -51,17 +59,17 @@ impl Fuser<'_> {
                 v.dedup();
                 v.len() == arms.len()
             };
-            // Worth it from three arms (index, table and lookup against a decider per arm).
-            if arms.len() < 3 || !distinct(&|a| a.1 as i64) || !distinct(&|a| a.2 .0 as i64) {
+            if arms.len() < 2 || !distinct(&|a| a.1 as i64) || !distinct(&|a| a.2 .0 as i64) {
                 continue;
             }
-            // Table values must be non-zero (a constant combinator can't hold 0): shift them,
-            // and the index with them, when an arm compares with 0.
-            let k: i64 = if arms.iter().any(|a| a.1 == 0) { 1 - arms.iter().map(|a| a.1 as i64).min().unwrap() } else { 0 };
-            if arms.iter().any(|a| (a.1 as i64 + k) > i32::MAX as i64 || (a.1 as i64 + k) == 0) {
+            // Count active combinators, as the benchmark does: HotEq needs one, whereas
+            // Hot needs an index shift as well. A two-arm shifted table would only tie.
+            let k = key_offset(arms.iter().map(|a| a.1));
+            let cost = if k == 0 { 1 } else { 2 };
+            if arms.len() <= cost {
                 continue;
             }
-            let table = self.g.bconst(arms.iter().map(|a| (a.2, (a.1 as i64 + k) as i32)));
+            let table = self.g.bconst(arms.iter().map(|a| (a.2, a.1.wrapping_add(k))));
             for a in &arms {
                 drop[a.0] = true;
             }
@@ -71,7 +79,7 @@ impl Fuser<'_> {
                 continue;
             }
             let idx = ticky_factorio::SignalTable::base().index_signal();
-            let ix = self.g.bun(vec![BTerm::Shift(idx, x, k as i32)]);
+            let ix = self.g.bun(vec![BTerm::Shift(idx, x, k)]);
             extra.push(BTerm::Hot(table, ix, 1));
         }
         terms.into_iter().zip(drop).filter(|(_, d)| !d).map(|(t, _)| t).chain(extra).collect()
@@ -104,11 +112,11 @@ impl Fuser<'_> {
             picks.push((k, s));
         }
         let (x, b) = (self.rebuild(x0?), self.rebuild(bun?));
-        let fits = |k: i64| picks.iter().all(|p| p.0 as i64 + k != 0 && (p.0 as i64 + k).abs() <= i32::MAX as i64);
-        let table = |g: &mut crate::ir::Graph, k: i64| g.bconst(picks.iter().map(|p| (p.1, (p.0 as i64 + k) as i32)));
-        let hot = match self.index_wire(x0?, x, &|k| fits(k as i64)) {
+        let fits = |k: i32| picks.iter().all(|p| p.0.wrapping_add(k) != 0);
+        let table = |g: &mut crate::ir::Graph, k: i32| g.bconst(picks.iter().map(|p| (p.1, p.0.wrapping_add(k))));
+        let hot = match self.index_wire(x0?, x, &fits) {
             Some((ix, k)) => {
-                let t = table(self.g, k as i64);
+                let t = table(self.g, k);
                 self.g.bun(vec![BTerm::Hot(t, ix, 1)])
             }
             None if fits(0) => {
@@ -116,13 +124,10 @@ impl Fuser<'_> {
                 self.g.bun(vec![BTerm::HotEq(t, x, 1)])
             }
             None => {
-                let k = 1 - picks.iter().map(|p| p.0 as i64).min().unwrap();
-                if !fits(k) {
-                    return None;
-                }
+                let k = key_offset(picks.iter().map(|p| p.0));
                 let t = table(self.g, k);
                 let idx = ticky_factorio::SignalTable::base().index_signal();
-                let ix = self.g.bun(vec![BTerm::Shift(idx, x, k as i32)]);
+                let ix = self.g.bun(vec![BTerm::Shift(idx, x, k)]);
                 self.g.bun(vec![BTerm::Hot(t, ix, 1)])
             }
         };
@@ -174,5 +179,49 @@ impl Fuser<'_> {
             }
         }
         self.rebuild(ix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picked_reads_can_encode_minimum_and_wrapping_keys() {
+        for keys in [[i32::MIN, 1, i32::MAX], [i32::MIN, 0, i32::MAX]] {
+            let mut g = Graph::new(vec![Iv::FULL, Iv::FULL]);
+            g.src_bun = vec![false, true];
+            let x = g.src(0);
+            let b = g.src(1);
+            let mut arms = Vec::new();
+            for (i, &k) in keys.iter().enumerate() {
+                let k = g.konst(k);
+                let cond = g.cmp(CmpOp::Eq, x, k);
+                let value = g.bget(b, Graph::slot(i));
+                arms.push((cond, value));
+            }
+            let pick = g.sel(arms);
+            let result = Fuser::new(&mut g).picked_read(pick).expect("keys can be encoded without zero");
+            let Op::BDot(_, hot) = *g.op(result) else { panic!("expected dot product") };
+            let Op::Bun(terms) = g.op(hot) else { panic!("expected one-hot bundle") };
+            let (table, offset) = match terms.as_slice() {
+                [BTerm::HotEq(t, _, _)] => (*t, 0),
+                [BTerm::Hot(t, ix, _)] => {
+                    let Op::Bun(ts) = g.op(*ix) else { panic!("expected index") };
+                    let [BTerm::Shift(_, _, k)] = ts.as_slice() else { panic!("expected shift") };
+                    (*t, *k)
+                }
+                _ => panic!("expected lookup"),
+            };
+            assert_eq!(offset == 0, !keys.contains(&0));
+            let entries = g.as_bconst(table).unwrap();
+            for candidate in [i32::MIN, i32::MIN + 1, -2, -1, 0, 1, 2, i32::MAX] {
+                for (i, key) in keys.iter().enumerate() {
+                    let encoded = entries.iter().find(|(s, _)| *s == Graph::slot(i)).unwrap().1;
+                    assert_ne!(encoded, 0);
+                    assert_eq!(candidate == *key, candidate.wrapping_add(offset) == encoded);
+                }
+            }
+        }
     }
 }
