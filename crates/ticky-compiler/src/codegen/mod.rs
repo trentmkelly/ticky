@@ -360,7 +360,8 @@ fn live_states(p: &Program) -> Vec<bool> {
         mark(&b.srcs);
     }
     for m in &p.procs {
-        mark(&m.srcs);
+        let used: Vec<SrcKind> = m.used_sources().into_iter().map(|i| m.srcs[i]).collect();
+        mark(&used);
     }
     live
 }

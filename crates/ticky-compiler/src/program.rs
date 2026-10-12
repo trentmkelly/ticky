@@ -241,6 +241,18 @@ pub struct MainProc {
     pub entry: usize,
 }
 
+impl MainProc {
+    /// Sources reachable from emitted stores, checks and control flow. Original writes
+    /// remain available for timing/debugging but do not keep dead samplers alive.
+    pub fn used_sources(&self) -> BTreeSet<usize> {
+        let roots: Vec<V> = self.steps.iter().flat_map(Step::roots).collect();
+        self.graph.reachable(&roots).into_iter().filter_map(|v| match self.graph.op(v) {
+            crate::ir::Op::Src(s) => Some(*s as usize),
+            _ => None,
+        }).collect()
+    }
+}
+
 pub struct TestDef {
     pub name: String,
     pub span: Span,
@@ -1123,7 +1135,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
         let elsewhere: BTreeSet<&String> = code.iter().filter(|(o, _)| *o != Some(owner)).flat_map(|(_, m)| m).collect();
         merged.extend(share_registers(&mut c, owner, &states, &elsewhere));
         let ctx = Ctx { owner, ports: &ports, states: &states, consts: &consts };
-        match lower_main(&ctx, &c) {
+        match lower_main(&ctx, &c, &elsewhere) {
             Ok(mut m) => {
                 m.name = name;
                 m.owner = owner;
@@ -1799,7 +1811,63 @@ fn simplify_steps(steps: &mut [Step], mut entry: usize) -> usize {
     }
 }
 
-fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
+/// Backward demand for individual process stores. Reads in checks and control flow are
+/// always roots; a write's expression is needed only when its destination is live. Using
+/// the original expression includes the old value on conditional keep paths.
+fn prune_dead_stores(ctx: &Ctx, elsewhere: &BTreeSet<&String>, g: &Graph, srcs: &[SrcKind], steps: &mut [Step]) {
+    if std::env::var_os("TICKY_NO_DEAD_STORES").is_some() {
+        return;
+    }
+    let observable: BTreeSet<usize> = ctx.states.iter().enumerate()
+        .filter(|(_, s)| s.port.is_some() || elsewhere.contains(&s.name) || s.name.contains('#'))
+        .map(|(i, _)| i).collect();
+    let reads = |roots: &[V]| -> BTreeSet<usize> {
+        g.reachable(roots).into_iter().filter_map(|v| match g.op(v) {
+            crate::ir::Op::Src(s) => match srcs[*s as usize] {
+                SrcKind::Own(si) => Some(si),
+                _ => None,
+            },
+            _ => None,
+        }).collect()
+    };
+    let control: Vec<BTreeSet<usize>> = steps.iter().map(|s| {
+        let mut st = s.clone();
+        st.plans.clear();
+        reads(&st.roots())
+    }).collect();
+    let uses: Vec<Vec<(usize, BTreeSet<usize>)>> = steps.iter().map(|s|
+        s.writes.iter().map(|(si, v)| (*si, reads(&[*v]))).collect()).collect();
+    let successors: Vec<Vec<usize>> = steps.iter().map(|s| match &s.kind {
+        StepKind::Run(Next::Return { func }) => steps.iter().filter_map(|call| match &call.kind {
+            StepKind::Run(Next::Call { func: f, cont, .. }) if f == func => *cont,
+            _ => None,
+        }).collect(),
+        _ => s.targets().into_iter().flatten().collect(),
+    }).collect();
+    let mut before = vec![BTreeSet::new(); steps.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..steps.len()).rev() {
+            let mut after = observable.clone();
+            for &j in &successors[i] { after.extend(before[j].iter().copied()); }
+            let mut live = after.clone();
+            for (si, _) in &uses[i] { live.remove(si); }
+            live.extend(control[i].iter().copied());
+            for (si, rs) in &uses[i] {
+                if after.contains(si) { live.extend(rs.iter().copied()); }
+            }
+            if before[i] != live { before[i] = live; changed = true; }
+        }
+        if !changed { break; }
+    }
+    for (i, step) in steps.iter_mut().enumerate() {
+        let mut after = observable.clone();
+        for &j in &successors[i] { after.extend(before[j].iter().copied()); }
+        step.plans.retain(|(si, _)| after.contains(si));
+    }
+}
+
+fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<MainProc, Diag> {
     let defined = definite_assignment(c);
     let mut fp = Fixpoint::new(ctx);
     for round in 0.. {
@@ -1919,6 +1987,9 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
             }
             s.depth = d;
         }
+        // Keep the already determined duration, writes and checks: removing a dead store
+        // must not move a later sample, output or runtime error to an earlier tick.
+        prune_dead_stores(ctx, elsewhere, &g, &srcs, &mut steps);
         // Drop steps that are no longer reachable.
         let mut keep = vec![false; steps.len()];
         let mut stack = vec![entry];

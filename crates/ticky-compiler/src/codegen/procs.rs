@@ -36,7 +36,12 @@ pub(super) fn main_proc(
     let mut stage = None;
     let mut staged = Vec::new();
     let mut src_ref: Vec<Ref> = Vec::new();
-    for &kind in &m.srcs {
+    let used_sources = m.used_sources();
+    for (i, &kind) in m.srcs.iter().enumerate() {
+        if !used_sources.contains(&i) {
+            src_ref.push(Ref::Op(Operand::Const(0)));
+            continue;
+        }
         let (raw, name) = shared.raw(p, kind);
         src_ref.push(match kind {
             SrcKind::Input(pi) if shared.staged.contains_key(&pi) => {
