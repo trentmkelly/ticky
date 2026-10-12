@@ -1,5 +1,6 @@
 //! Sorting networks and order statistics: a tree of `min`/`max` (or of compare-and-swaps,
-//! `y if x > y else x`) over up to 16 leaves → selector combinators ranking the leaves.
+//! `y if x > y else x`) → selector combinators ranking the leaves. Mixed networks use
+//! up to 16 leaves; homogeneous min/max reductions can fill the available signal pool.
 //! [`Fuser::plan_order_stats`] (called with a block's or program's roots before anything is
 //! rebuilt) chooses which nodes, [`Fuser::order_stat`] (from `rebuild`) builds them.
 //!
@@ -94,7 +95,10 @@ impl Fuser<'_> {
     /// If the min/max tree under `v` is an order statistic of its leaves: the leaves and the
     /// rank `k` (0 = smallest).
     fn order_stat_of(&self, v: V) -> Option<(Vec<V>, usize)> {
-        let tree = self.min_max_tree(v)?;
+        let tree = match self.min_max_tree(v) {
+            Some(tree) => tree,
+            None => return self.large_extremum(v),
+        };
         let n = tree.leaves.len();
         if tree.nodes < 2 || n < 3 {
             return None;
@@ -131,6 +135,36 @@ impl Fuser<'_> {
             table[w] & mask == want & mask
         });
         ok.then_some((tree.leaves, n - m))
+    }
+
+    /// Associativity/idempotence prove a homogeneous reduction without a truth table.
+    /// Only homogeneous trees qualify; distinct leaves need distinct wire signals.
+    fn large_extremum(&self, v: V) -> Option<(Vec<V>, usize)> {
+        let (_, _, max) = self.min_max(v)?;
+        let capacity = ticky_factorio::SignalTable::base().internal_pool().len();
+        let mut seen = BTreeSet::new();
+        let mut leaves = BTreeSet::new();
+        let mut stack = vec![v];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            match self.min_max(x) {
+                Some((p, q, kind)) if kind == max => stack.extend([p, q]),
+                Some(_) => return None,
+                None => {
+                    leaves.insert(x);
+                    if leaves.len() > capacity {
+                        return None;
+                    }
+                }
+            }
+        }
+        if leaves.len() < 3 {
+            return None;
+        }
+        let k = if max { leaves.len() - 1 } else { 0 };
+        Some((leaves.into_iter().collect(), k))
     }
 
     fn truth_table(&self, v: V, tables: &mut HashMap<V, Vec<u64>>, words: usize) -> Vec<u64> {
@@ -190,8 +224,8 @@ impl Fuser<'_> {
     /// two comparisons 1 (a swap's two selects share them); a rank 5 (two selectors, two
     /// filters, a total), or 2 when the leaves are never negative or never positive; and
     /// gathering the leaves into one bundle. A node is saved when everything reading it is
-    /// saved or replaced. All the candidates together first, else one at a time; either way
-    /// with a [`MARGIN`].
+    /// saved or replaced. Try all candidates, then independent groups and bounded subsets;
+    /// every choice must beat a [`MARGIN`].
     pub fn plan_order_stats(&mut self, roots: &[V], pipelined: bool) {
         // A pipelined select also needs its operands delayed to match.
         let (w_mux, w_cmp) = if pipelined { (7, 2) } else { (4, 2) };
@@ -229,7 +263,7 @@ impl Fuser<'_> {
             }
         }
         cands.sort_by_key(|c| c.0);
-        let pays = |this: &Self, chosen: &[&(V, Vec<V>, usize)]| -> bool {
+        let gain_of = |this: &Self, chosen: &[&(V, Vec<V>, usize)]| -> isize {
             // The trees' selects and their comparisons, newest (readers) first.
             let mut nodes = BTreeSet::new();
             for (v, ..) in chosen {
@@ -256,7 +290,7 @@ impl Fuser<'_> {
             let mut cost = 0;
             let mut gathered = BTreeSet::new();
             for (_, leaves, _) in chosen {
-                cost += if this.one_sided(leaves) { 4 } else { 10 };
+                cost += if this.one_sided(leaves) || this.all_nonzero(leaves) { 4 } else { 10 };
                 if gathered.insert(leaves.clone()) {
                     cost += 2 * this.gather_cost(leaves);
                 }
@@ -265,16 +299,81 @@ impl Fuser<'_> {
                 let outs: Vec<String> = chosen.iter().map(|(v, l, k)| format!("%{v} = rank {k} of {}", l.len())).collect();
                 eprintln!("order statistics [{}]: saves {gain}/2, costs {cost}/2", outs.join(", "));
             }
-            gain > cost + MARGIN
+            gain as isize - cost as isize
         };
         let all: Vec<_> = cands.iter().collect();
-        let chosen: Vec<_> = if pays(self, &all) { all } else { cands.iter().filter(|c| pays(self, &[*c])).collect() };
+        let chosen: Vec<_> = if gain_of(self, &all) > MARGIN as isize {
+            all
+        } else {
+            // Independent networks should not subsidize one another. Connect candidates
+            // sharing removable nodes or a gather, then consider subsets in small groups.
+            let nodes: Vec<BTreeSet<V>> = cands.iter().map(|(v, ..)| {
+                let mut found = BTreeSet::new();
+                let mut stack = vec![*v];
+                while let Some(x) = stack.pop() {
+                    if let Some((p, q, _)) = self.min_max(x) {
+                        if found.insert(x) {
+                            if let Op::Mux { t, f, .. } = *self.g.op(x) {
+                                found.extend([t, f]);
+                            }
+                            stack.extend([p, q]);
+                        }
+                    }
+                }
+                found
+            }).collect();
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            for i in 0..cands.len() {
+                let mut group = vec![i];
+                let mut j = 0;
+                while j < groups.len() {
+                    if groups[j].iter().any(|&k| cands[i].1 == cands[k].1 || !nodes[i].is_disjoint(&nodes[k])) {
+                        group.extend(groups.remove(j));
+                    } else {
+                        j += 1;
+                    }
+                }
+                group.sort_unstable();
+                groups.push(group);
+            }
+            let mut chosen = Vec::new();
+            for group in groups {
+                let whole: Vec<_> = group.iter().map(|&i| &cands[i]).collect();
+                if gain_of(self, &whole) > MARGIN as isize {
+                    chosen.extend(whole);
+                } else if group.len() <= 8 {
+                    let mut best = Vec::new();
+                    let mut best_gain = MARGIN as isize;
+                    for mask in 1..(1usize << group.len()) {
+                        let subset: Vec<_> = group.iter().enumerate().filter(|(j, _)| mask & (1 << j) != 0).map(|(_, &i)| &cands[i]).collect();
+                        let gain = gain_of(self, &subset);
+                        if gain > best_gain {
+                            best_gain = gain;
+                            best = subset;
+                        }
+                    }
+                    chosen.extend(best);
+                } else {
+                    // Keep compilation bounded on many-output networks.
+                    chosen.extend(whole.into_iter().filter(|c| gain_of(self, &[*c]) > MARGIN as isize));
+                }
+            }
+            chosen
+        };
         self.order_stats = chosen.into_iter().map(|(v, leaves, k)| (*v, (leaves.clone(), *k))).collect();
     }
 
     /// Whether the leaves are never negative or never positive (one selector does).
     fn one_sided(&self, leaves: &[V]) -> bool {
         leaves.iter().all(|&l| self.g.iv(l).lo >= 0) || leaves.iter().all(|&l| self.g.iv(l).hi <= 0)
+    }
+
+    /// All leaves are present on the wire, even when their signs differ.
+    fn all_nonzero(&self, leaves: &[V]) -> bool {
+        leaves.iter().all(|&l| {
+            let iv = self.g.iv(l);
+            iv.lo > 0 || iv.hi < 0
+        })
     }
 
     /// Combinators [`leaf_bundle`](Self::leaf_bundle) adds, about.
@@ -305,6 +404,9 @@ impl Fuser<'_> {
         let z = self.g.konst(0);
         let lo = self.g.brank(keys, false, k as u32);
         let hi = self.g.brank(keys, true, (n - 1 - k) as u32);
+        if self.all_nonzero(&leaves) {
+            return Some(self.g.btotal(lo));
+        }
         if nonneg {
             return Some(self.g.btotal(hi));
         }
@@ -314,5 +416,53 @@ impl Fuser<'_> {
         let only = |op| vec![vec![BLit { op, a: BOp::Each, b: BOp::Val(z) }]];
         let both = self.g.bun(vec![BTerm::Filter(lo, only(CmpOp::Lt), FOut::Copy), BTerm::Filter(hi, only(CmpOp::Gt), FOut::Copy)]);
         Some(self.g.btotal(both))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Graph, Iv};
+
+    #[test]
+    fn rank_paths_preserve_zeros_duplicates_and_i32_extremes() {
+        for values in [
+            [i32::MIN, -1, 1, i32::MAX],
+            [-5, -5, 1, 1],
+            [0, -5, 0, 3],
+            [0, 0, 0, 0],
+            [0, 1, 1, i32::MAX],
+            [i32::MIN, -1, -1, 0],
+        ] {
+            let mut expected = values;
+            expected.sort_unstable();
+            for rotation in 0..values.len() {
+                let mut input = values;
+                input.rotate_left(rotation);
+                for (rank, &want) in expected.iter().enumerate() {
+                    let mut g = Graph::default();
+                    let leaves = input.iter().map(|&v| g.konst(v)).collect();
+                    let root = g.konst(12345);
+                    let mut f = Fuser::new(&mut g);
+                    f.order_stats.insert(root, (leaves, rank));
+                    let out = f.order_stat(root).unwrap();
+                    assert_eq!(f.g.as_const(out), Some(want), "rank {rank} of {input:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_sign_nonzero_rank_needs_one_selector() {
+        let mut g = Graph::new(vec![Iv { lo: -20, hi: -1 }, Iv { lo: 1, hi: 20 }, Iv { lo: 2, hi: 30 }]);
+        let leaves: Vec<_> = (0..3).map(|i| g.src(i)).collect();
+        let root = g.konst(12345);
+        let mut f = Fuser::new(&mut g);
+        f.order_stats.insert(root, (leaves, 1));
+        let out = f.order_stat(root).unwrap();
+        let live = f.g.reachable(&[out]);
+        assert_eq!(live.iter().filter(|&&v| matches!(f.g.op(v), Op::BSelect(_, false, 1))).count(), 1);
+        assert_eq!(live.iter().filter(|&&v| matches!(f.g.op(v), Op::BSelect(..))).count(), 1);
+        assert!(matches!(f.g.op(out), Op::BTotal(_)));
     }
 }
