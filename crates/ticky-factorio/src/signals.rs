@@ -121,8 +121,15 @@ impl SignalTable {
 
     fn add(&self, info: SignalInfo) -> Sig {
         let mut g = self.inner.write().unwrap();
+        // A concurrent intern()/with_quality() caller may have inserted this key
+        // since our read-lock lookup. Keep checking and inserting atomic so array
+        // tables and compiler signal pools always agree on a signal's identity.
+        let key = (info.kind, info.name.clone(), info.quality);
+        if let Some(&sig) = g.by_key.get(&key) {
+            return sig;
+        }
         let sig = Sig(g.sigs.len() as u16);
-        g.by_key.insert((info.kind, info.name.clone(), info.quality), sig);
+        g.by_key.insert(key, sig);
         if info.quality == 0 {
             // A plain name means the item (or fluid, or virtual signal) even when a modded
             // recipe of the same name was added first, e.g. by `S("x", type="recipe")`.
@@ -320,6 +327,34 @@ impl SignalTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_signal_cache_misses_share_one_id() {
+        let t = SignalTable { inner: RwLock::new(Inner::default()) };
+        // Force the cache-miss window used by intern()/with_quality(): every caller
+        // has missed before any reaches the insertion lock. This deterministically
+        // reproduces duplicate IDs without depending on scheduler timing.
+        let mut ids = Vec::new();
+        for quality in 0..=1 {
+            let barrier = std::sync::Barrier::new(8);
+            let found = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                    let info = SignalInfo { kind: SignalKind::Item, name: "concurrent-item".into(), usable: true, base: false, known: false, quality };
+                    let key = (info.kind, info.name.clone(), quality);
+                    assert!(!t.inner.read().unwrap().by_key.contains_key(&key));
+                    barrier.wait();
+                    t.add(info)
+                })).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+            });
+            assert!(found.iter().all(|s| *s == found[0]), "one key received different IDs: {found:?}");
+            ids.push(found[0]);
+        }
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.intern(SignalKind::Item, "concurrent-item"), ids[0]);
+        assert_eq!(t.with_quality(ids[0], 1), ids[1]);
+        assert_ne!(ids[0], ids[1]);
+    }
 
     #[test]
     fn resolves_idents() {
