@@ -1235,7 +1235,7 @@ impl Graph {
     pub fn bun(&mut self, terms: Vec<BTerm>) -> V {
         let mut konst: BVals = Vec::new();
         let mut rest = Vec::new();
-        for t in terms {
+        for t in self.simplify_maps(terms) {
             match self.fold_term(&t) {
                 Some(vals) => konst.extend(vals),
                 None => rest.push(t),
@@ -1281,6 +1281,43 @@ impl Graph {
             return self.intern(Op::Bun(rest));
         }
         self.intern(Op::Bun(rest))
+    }
+
+    /// Sparse-safe map algebra. Only zero-preserving operations may cross an
+    /// intermediate that disappears from the wire when its value becomes zero.
+    fn simplify_maps(&mut self, terms: Vec<BTerm>) -> Vec<BTerm> {
+        let mut out: Vec<BTerm> = Vec::new();
+        for mut t in terms {
+            if let BTerm::Map(op @ (ArOp::Mul | ArOp::And), mut b, k) = t {
+                if let Some(mut c) = self.as_const(k) {
+                    loop {
+                        let inner = match self.op(b) {
+                            Op::Bun(ts) => match ts.as_slice() {
+                                [BTerm::Map(inner_op, x, y)] if *inner_op == op => self.as_const(*y).map(|d| (*x, d)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let Some((x, d)) = inner else { break };
+                        c = op.apply(c, d);
+                        b = x;
+                    }
+                    // Sibling multiples sum on the wire, hence factor modulo 2^32.
+                    if op == ArOp::Mul {
+                        if let Some(i) = out.iter().position(|t| matches!(t, BTerm::Map(ArOp::Mul, x, y) if *x == b && self.as_const(*y).is_some())) {
+                            let BTerm::Map(_, _, old) = out[i] else { unreachable!() };
+                            c = c.wrapping_add(self.as_const(old).unwrap());
+                            out.remove(i);
+                        }
+                    }
+                    if c == 0 { continue; }
+                    let k = self.konst(c);
+                    t = BTerm::Map(op, b, k);
+                }
+            }
+            out.push(t);
+        }
+        out
     }
 
     /// The bundle a term passes through unchanged (`b + 0`, `b * 1`, `a + empty`, …).

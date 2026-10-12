@@ -275,8 +275,9 @@ impl Cg {
                 floor_at.insert(v, i);
             }
         }
-        // A total (or count) of a filter that nothing else reads: the filter's decider writes
-        // it (bundles.rs `filter_total`). Filter bundle → the read.
+        // A total of an arithmetic map/zip, or total/count of a filter, that nothing
+        // else reads: its producer writes the scalar directly (bundles.rs `filter_total`).
+        // Bundle producer → the read.
         let filter_totals: HashMap<V, V> = producers
             .iter()
             .copied()

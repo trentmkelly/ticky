@@ -686,7 +686,10 @@ impl Conv {
                 match (uses_each(g, a), uses_each(g, b)) {
                     (true, false) => {
                         let ab = self.bundle(g, a)?;
-                        if keeps_zero || a == self.each {
+                        // `a` is the scalar placeholder expression, not a sparse bundle:
+                        // excluding zero proves every domain lane survives this intermediate.
+                        let ai = g.iv(a);
+                        if keeps_zero || a == self.each || ai.lo > 0 || ai.hi < 0 {
                             Ok(g.bun(vec![BTerm::Map(op, ab, b)]))
                         } else {
                             let kb = self.scalar(g, b);

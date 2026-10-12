@@ -406,7 +406,8 @@ impl Cg {
         conds
     }
 
-    /// For a total (or count) `v` of a one-filter bundle, times `scale`: that bundle, when
+    /// For an unscaled total of one arithmetic map/zip, or a total (or count) `v`
+    /// of a one-filter bundle, times `scale`: that bundle, when
     /// the filter's decider can write the result itself (one output signal on an `each`
     /// decider sums over the passing signals: their values, or its constant). Copied values
     /// can't be scaled, except a domain's that are all equal (counting).
@@ -417,6 +418,10 @@ impl Cg {
             _ => return None,
         };
         let Op::Bun(terms) = g.op(b) else { return None };
+        // Arithmetic can reduce directly by naming a scalar output instead of `each`.
+        if !count && scale == 1 && matches!(terms.as_slice(), [BTerm::Map(..) | BTerm::RMap(..) | BTerm::Zip(..)]) {
+            return Some(b);
+        }
         let [t @ (BTerm::Filter(..) | BTerm::DFilter(..))] = terms.as_slice() else { return None };
         let k = match t {
             _ if count => Some(1),
@@ -435,12 +440,41 @@ impl Cg {
         ok.then_some(b)
     }
 
-    /// [`filter_total`](Self::filter_total) as one decider: the filter's conditions, with the
-    /// sum (or count) of what passes on `out` (on `out_net`, else the bus).
+    /// [`filter_total`](Self::filter_total) as one arithmetic combinator or decider,
+    /// reducing directly onto `out` (on `out_net`, else the bus).
     pub(super) fn emit_filter_total(&mut self, g: &Graph, v: V, out: Sig, scale: i32, out_net: Option<usize>, r: &dyn Fn(V) -> Ref, what: &str) {
         let count = matches!(g.op(v), Op::BCount(_));
         let (Op::BTotal(b) | Op::BCount(b)) = *g.op(v) else { unreachable!("not a total") };
         let Op::Bun(terms) = g.op(b) else { unreachable!("not a filter") };
+        let scalar = |x: V| match r(x).op() {
+            Operand::Const(k) => (Operand::Const(k), Nets::BOTH),
+            o => (o, Nets::GREEN),
+        };
+        let arithmetic = match terms[0] {
+            BTerm::Map(op, x, k) => {
+                let (second, second_nets) = scalar(k);
+                Some((Arith { first: Operand::Sig(self.each), first_nets: Nets::RED, second, second_nets, op, out }, vec![(x, false)], matches!(second, Operand::Sig(_))))
+            }
+            BTerm::RMap(op, k, x) => {
+                let (first, first_nets) = scalar(k);
+                Some((Arith { first, first_nets, second: Operand::Sig(self.each), second_nets: Nets::RED, op, out }, vec![(x, false)], matches!(first, Operand::Sig(_))))
+            }
+            BTerm::Zip(op, x, y) => Some((Arith { first: Operand::Sig(self.each), first_nets: Nets::RED, second: Operand::Sig(self.each), second_nets: Nets::GREEN, op, out }, vec![(x, false), (y, true)], false)),
+            _ => None,
+        };
+        if let Some((ar, reads, bus)) = arithmetic {
+            debug_assert!(!count && scale == 1);
+            let id = self.loose(Kind::Arith(ar), format!("{what}: arithmetic and total"));
+            for (x, green) in reads {
+                self.bread(r(x).bun(), id, green);
+            }
+            if bus { self.on_bus_in(id); }
+            match out_net {
+                Some(n) => self.nets[n].members.push((id, Conn::OutRed)),
+                None => self.nets[0].members.push((id, Conn::OutGreen)),
+            }
+            return;
+        }
         let (conds, reads, bus, o) = match terms[0].clone() {
             BTerm::Filter(x, d, fout) => {
                 let (conds, bus) = self.filter_conds(&d, r);
