@@ -489,15 +489,15 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
 }
 
 /// The cheaper of two forms of the same bundle: `vector` (a bundle comprehension) unless it
-/// fails to lower or adds more operations than `unrolled` (see [`added_ops`]). Both are
+/// fails to lower or adds more operations than `unrolled` (see [`candidate_ops`]). Both are
 /// lowered; the loser's nodes stay unused, and its runtime checks are dropped.
 fn vec_or_unrolled(g: &mut Graph, names: &mut dyn Names, vector: &Expr, unrolled: &Expr) -> Result<V, Diag> {
     let (n0, c0) = (g.nodes.len(), g.checks.len());
     let a = expr(g, names, vector);
-    let (n1, c1) = (g.nodes.len(), g.checks.len());
+    let c1 = g.checks.len();
     let b = expr(g, names, unrolled)?;
     match a {
-        Ok(a) if added_ops(g, n0, n1) < added_ops(g, n1, g.nodes.len()) => {
+        Ok(a) if candidate_ops(g, a, n0, c0..c1) < candidate_ops(g, b, n0, c1..g.checks.len()) => {
             g.checks.truncate(c1);
             Ok(a)
         }
@@ -508,14 +508,16 @@ fn vec_or_unrolled(g: &mut Graph, names: &mut dyn Names, vector: &Expr, unrolled
     }
 }
 
-/// Roughly the combinators needed by graph nodes `from..to`: every operation, and every term
-/// of a bundle except constants and single values copied onto a signal (usually computed
-/// there directly).
-fn added_ops(g: &Graph, from: usize, to: usize) -> usize {
-    g.nodes[from..to].iter().map(op_cost).sum()
+/// Price both candidates against the same pre-existing graph. Interning the second
+/// candidate may reuse the first one's nodes; those are not free if the first loses.
+/// Include its checks, and exclude dead nodes allocated while simplifying expressions.
+fn candidate_ops(g: &Graph, root: V, from: usize, checks: std::ops::Range<usize>) -> usize {
+    let mut roots = vec![root];
+    roots.extend(g.checks[checks].iter().map(|c| c.0));
+    g.reachable(&roots).into_iter().filter(|&v| v as usize >= from).map(|v| op_cost(g.op(v))).sum()
 }
 
-/// Roughly the combinators one node needs (see [`added_ops`]).
+/// Roughly the combinators one node needs (see [`candidate_ops`]).
 pub fn op_cost(op: &Op) -> usize {
     match op {
         Op::Const(_) | Op::BConst(_) | Op::Each(_) | Op::Src(_) => 0,
@@ -708,6 +710,25 @@ mod tests {
         let mut g = Graph::default();
         let v = expr(&mut g, &mut NoNames, value).unwrap();
         g.as_const(v).unwrap_or_else(|| panic!("{src} did not fold"))
+    }
+
+    #[test]
+    fn vector_cost_uses_live_nodes_shared_baseline_and_checks() {
+        let mut g = Graph::new(vec![crate::ir::Iv::FULL]);
+        let x = g.src(0);
+        let n0 = g.nodes.len();
+        let three = g.konst(3);
+        let shared = g.ar(ArOp::Mul, x, three);
+        let seven = g.konst(7);
+        let _dead = g.ar(ArOp::Add, x, seven);
+        // A later candidate reuses the first one's arithmetic; both must pay for it.
+        let second = g.ar(ArOp::Mul, x, three);
+        assert_eq!(candidate_ops(&g, shared, n0, 0..0), 1);
+        assert_eq!(candidate_ops(&g, second, n0, 0..0), 1);
+        let fail = g.cmp(ticky_factorio::CmpOp::Eq, x, seven);
+        g.checks.push((fail, Span::default(), "probe"));
+        assert_eq!(candidate_ops(&g, shared, n0, 0..1), 2);
+        assert_eq!(candidate_ops(&g, shared, g.nodes.len(), 0..1), 0);
     }
 
     #[test]
