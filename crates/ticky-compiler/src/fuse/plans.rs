@@ -38,7 +38,7 @@ impl Fuser<'_> {
         // (otherwise it just multiplies loads), and the number of loads stays small.
         let worth = |this: &Self, x: V| Some(x) == own || this.g.as_const(x).is_some() || this.mentions(x, own);
         // A running maximum is cheaper as one selector than as loads per candidate.
-        if self.argmax_chain(v).is_some() {
+        if self.argmax_chain(v).is_some() || self.argmax_scores.contains_key(&v) {
             let r = self.rebuild(v);
             loads.push(Load { guard, val: LoadVal::Node(r), direct: false });
             return;

@@ -39,6 +39,71 @@ test "extrema":
 }
 
 #[test]
+fn argmax_shares_score_with_labels_and_preserves_ties() {
+    for period in ["tick", "120 ticks"] {
+        let src = format!(r#"input a: int @ A
+input b: int @ B
+input c: int @ C
+input d: int @ D
+output score: int @ S
+output winner: int @ W
+output floor_score: int @ F
+output floor_winner: int @ G
+output middle: int @ M
+
+def choose(floor):
+    best, top = -2147483648, floor
+    if a > top:
+        best, top = 2147483647, a
+    if b > top:
+        best, top = 7, b
+    mid = top
+    if c > top:
+        best, top = -2, c
+    if d > top:
+        best, top = 0, d
+    return best, top, mid
+
+every {period}:
+    winner, score, middle = choose(0)
+    floor_winner, floor_score, unused = choose(5)
+
+test "winner and score":
+    set a = -2147483648
+    set b = -1
+    set c = 0
+    set d = 0
+    run 300 ticks
+    assert score == 0 and winner == -2147483648 and middle == 0
+    assert floor_score == 5 and floor_winner == -2147483648
+    set a = 5
+    set b = 5
+    set c = 5
+    set d = 5
+    run 300 ticks
+    assert score == 5 and winner == 2147483647 and middle == 5
+    assert floor_score == 5 and floor_winner == -2147483648
+    set a = 2147483647
+    set b = 2147483647
+    set c = 10
+    set d = 8
+    run 300 ticks
+    assert score == 2147483647 and winner == 2147483647
+    assert floor_score == 2147483647 and floor_winner == 2147483647
+    set a = 1
+    set b = 2
+    set c = 3
+    set d = 9
+    run 300 ticks
+    assert score == 9 and winner == 0 and middle == 2
+    assert floor_score == 9 and floor_winner == 0
+"#);
+        // Previously 98 pipelined / 75 periodic, including the externally used midpoint.
+        check(&src, if period == "tick" { 51 } else { 41 });
+    }
+}
+
+#[test]
 fn profitable_sort_group_survives_unrelated_candidates() {
     let src = r#"input a: int @ A
 input b: int @ B

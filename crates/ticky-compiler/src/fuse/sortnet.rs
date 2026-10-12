@@ -230,6 +230,7 @@ impl Fuser<'_> {
         // A pipelined select also needs its operands delayed to match.
         let (w_mux, w_cmp) = if pipelined { (7, 2) } else { (4, 2) };
         let live = self.g.reachable(roots);
+        self.plan_argmax_scores(&live);
         let mut users: HashMap<V, Vec<V>> = HashMap::new();
         for &v in &live {
             for o in self.g.operands(v) {

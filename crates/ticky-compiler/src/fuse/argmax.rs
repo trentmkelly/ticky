@@ -67,10 +67,36 @@ impl Fuser<'_> {
         }
     }
 
+    /// Match the score companion before rebuilding either output. Intermediate scores
+    /// remain ordinary nodes if other expressions need them.
+    pub(super) fn plan_argmax_scores(&mut self, live: &[V]) {
+        self.argmax_scores.clear();
+        let scores: std::collections::HashMap<_, _> = live.iter().filter_map(|&v| {
+            match *self.g.op(v) {
+                Op::Mux { t, f, a, b } => Some(((t, f, a, b), v)),
+                _ => None,
+            }
+        }).collect();
+        for &best in live {
+            if self.argmax_chain(best).is_none() {
+                continue;
+            }
+            let Op::Mux { t, f, .. } = *self.g.op(best) else { continue };
+            let (s, prev) = match *self.g.op(t) {
+                Op::Cmp(CmpOp::Gt, s, prev) | Op::Cmp(CmpOp::Lt, prev, s) => (s, prev),
+                _ => continue,
+            };
+            if let Some(&top) = scores.get(&(t, f, s, prev)) {
+                // The same score can have several label chains. Share one deterministically.
+                self.argmax_scores.entry(top).or_insert(best);
+            }
+        }
+    }
+
     /// [`argmax_chain`](Self::argmax_chain) with a selector combinator: the candidates'
     /// scores on signals ranked in candidate order (so ties go to the earliest, as with
     /// `>`), those above `T0` kept, the largest selected, and its `K` read from a table.
-    pub(super) fn argmax(&mut self, steps: Vec<(V, i32)>, top0: i32, best0: i32) -> V {
+    pub(super) fn argmax(&mut self, steps: Vec<(V, i32)>, top0: i32, best0: i32) -> (V, V) {
         let t = ticky_factorio::SignalTable::base();
         let mut pool = t.internal_pool();
         pool.sort_by_key(|s| t.rank(*s));
@@ -91,6 +117,47 @@ impl Fuser<'_> {
         let won = self.g.bun(vec![BTerm::DFilter(table, top, vec![vec![BLit { op: CmpOp::Ne, a: BOp::Each, b: BOp::Val(z) }]], crate::ir::FOut::Copy)]);
         let k = self.g.btotal(won);
         let b0 = self.g.konst(best0);
-        self.g.ar(ArOp::Add, k, b0)
+        let winner = self.g.ar(ArOp::Add, k, b0);
+        let score = self.g.btotal(top);
+        // Selected scores are strictly positive because T0 >= 0. An empty result
+        // therefore has total 0, which must preserve the initial score T0.
+        let score = if top0 == 0 {
+            score
+        } else {
+            let present = self.g.cmp(CmpOp::Ne, score, z);
+            self.g.mux(present, score, k0)
+        };
+        (winner, score)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Graph, Iv};
+
+    #[test]
+    fn shared_argmax_is_independent_of_root_rebuild_order() {
+        for score_first in [true, false] {
+            let mut g = Graph::new(vec![Iv::FULL; 4]);
+            let mut best = g.konst(0);
+            let mut top = best;
+            for i in 0..4 {
+                let s = g.src(i);
+                let c = g.cmp(CmpOp::Gt, s, top);
+                let label = g.konst(i as i32 + 11);
+                best = g.mux(c, label, best);
+                top = g.mux(c, s, top);
+            }
+            let mut f = Fuser::new(&mut g);
+            f.plan_order_stats(&[top, best], true);
+            assert_eq!(f.argmax_scores.get(&top), Some(&best));
+            let roots = if score_first { [top, best] } else { [best, top] };
+            let out = roots.map(|v| f.rebuild(v));
+            let live = f.g.reachable(&out);
+            assert_eq!(live.iter().filter(|&&v| matches!(f.g.op(v), Op::BSelect(..))).count(), 1);
+            let score = f.rebuild(top);
+            assert!(matches!(f.g.op(score), Op::BTotal(_)));
+        }
     }
 }

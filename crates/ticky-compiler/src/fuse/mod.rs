@@ -178,11 +178,13 @@ pub struct Fuser<'g> {
     dnf_memo: HashMap<(V, bool), Option<Dnf>>,
     /// Min/max nodes to build as order statistics: their leaves and rank (`sortnet.rs`).
     order_stats: HashMap<V, (Vec<V>, usize)>,
+    /// Final score nodes whose winner-ID chain also computes their value.
+    argmax_scores: HashMap<V, V>,
 }
 
 impl<'g> Fuser<'g> {
     pub fn new(g: &'g mut Graph) -> Self {
-        Fuser { g, memo: HashMap::new(), dnf_memo: HashMap::new(), order_stats: HashMap::new() }
+        Fuser { g, memo: HashMap::new(), dnf_memo: HashMap::new(), order_stats: HashMap::new(), argmax_scores: HashMap::new() }
     }
 
     /// A single literal, folding constants.
@@ -262,6 +264,10 @@ impl<'g> Fuser<'g> {
     pub fn rebuild(&mut self, v: V) -> V {
         if let Some(&r) = self.memo.get(&v) {
             return r;
+        }
+        if let Some(&best) = self.argmax_scores.get(&v) {
+            self.rebuild(best);
+            return self.memo[&v];
         }
         // A tree of min/max that is an order statistic: selector combinators.
         if let Some(r) = self.order_stat(v) {
@@ -353,7 +359,13 @@ impl<'g> Fuser<'g> {
             }
             Op::Mux { .. } if self.argmax_chain(v).is_some() => {
                 let (steps, top0, best0) = self.argmax_chain(v).unwrap();
-                self.argmax(steps, top0, best0)
+                let (winner, score) = self.argmax(steps, top0, best0);
+                for (&top, &best) in &self.argmax_scores {
+                    if best == v {
+                        self.memo.insert(top, score);
+                    }
+                }
+                winner
             }
             Op::Mux { t, f, a, b } => {
                 let consts = (self.g.as_const(a), self.g.as_const(b));
