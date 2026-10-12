@@ -1,5 +1,5 @@
 //! Register sharing: a process's variables that are never live at the same time can use one
-//! register (one signal, one hold decider). Liveness is computed over the process's steps
+//! register (a scalar signal or a private bundle wire). Liveness is computed over the process's steps
 //! (`cfg::Cfg`), and statement by statement inside each step, so two variables interfere when
 //! one is assigned while the other still holds a value that will be read. Non-interfering
 //! variables of the same class are coalesced greedily; the caller renames them.
@@ -174,7 +174,7 @@ fn term_expr(t: &Term) -> Option<&Expr> {
 
 /// Groups of variables of `cfg` that can share a register: each grouped candidate maps to its
 /// group's representative (the member whose initial value the register must start with, if
-/// any). Candidates must be the process's own scalar variables that no one else reads.
+/// any). Candidates must be the process's own variables that no one else reads.
 /// Variables without a register (never read across a step boundary) are left out. A
 /// candidate without an initial value that's read where it might not be assigned yet (live
 /// on entry, or not in `defined`, the definitely-assigned sets on entry to each step) is left
@@ -228,17 +228,67 @@ pub fn coalesce(cfg: &Cfg, cands: &BTreeMap<String, Cand>, defined: &[BTreeSet<S
         let unsafe_read = !cands[v].init && (entry.contains(v) || (0..n).any(|i| gen[i].contains(v) && !defined[i].contains(v)));
         register && !unsafe_read && !walk.pinned.contains(v)
     };
-    let mut groups: Vec<Vec<&String>> = Vec::new();
-    for v in cands.keys().filter(|v| ok(v)) {
-        let clash = |m: &&String| {
-            let (a, b) = if v < *m { (v, *m) } else { (*m, v) };
-            walk.edges.contains(&(a.clone(), b.clone()))
+    let candidates: Vec<&String> = cands.keys().filter(|v| ok(v)).collect();
+    let clash = |a: &String, b: &String| {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        walk.edges.contains(&(a.clone(), b.clone()))
+    };
+    fn colour<'a>(order: &[&'a String], cands: &BTreeMap<String, Cand>, edges: &BTreeSet<(String, String)>) -> Vec<Vec<&'a String>> {
+        let clash = |a: &String, b: &String| {
+            let (a, b) = if a < b { (a, b) } else { (b, a) };
+            edges.contains(&(a.clone(), b.clone()))
         };
-        match groups.iter_mut().find(|ms| cands[ms[0]].class == cands[v].class && !ms.iter().any(clash)) {
-            Some(ms) => ms.push(v),
-            None => groups.push(vec![v]),
+        let mut groups: Vec<Vec<&String>> = Vec::new();
+        for &v in order {
+            match groups.iter_mut().find(|ms| cands[ms[0]].class == cands[v].class && !ms.iter().any(|m| clash(v, m))) {
+                Some(ms) => ms.push(v),
+                None => groups.push(vec![v]),
+            }
+        }
+        groups
+    }
+    // A hold can already serve several registers written by exactly the same steps.
+    // Count distinct writer sets, rather than assuming every saved colour saves a hold.
+    // Include remaining register-to-register copies as loads in the estimate. This is a
+    // deliberately cheap proxy; keep the original allocation on equal estimated cost.
+    let mut writers: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    let mut copies = Vec::new();
+    fn writes(body: &[Stmt], step: usize, writers: &mut BTreeMap<String, BTreeSet<usize>>, copies: &mut Vec<(String, String)>) {
+        for s in body {
+            let mut d = Names::new();
+            match &s.kind {
+                StmtKind::Assign { targets, value } => {
+                    for t in targets { defs(t, &mut d, &mut Names::new()); }
+                    if let ExprKind::Name(n) = &value.kind {
+                        copies.extend(d.iter().map(|x| (x.clone(), n.clone())));
+                    }
+                }
+                StmtKind::AnnAssign { target, value: Some(_), .. } | StmtKind::AugAssign { target, .. } => defs(target, &mut d, &mut Names::new()),
+                StmtKind::If { body, orelse, .. } => { writes(body, step, writers, copies); writes(orelse, step, writers, copies); }
+                _ => {}
+            }
+            for n in d { writers.entry(n).or_default().insert(step); }
         }
     }
+    for (i, d) in cfg.steps.iter().enumerate() { writes(&d.stmts, i, &mut writers, &mut copies); }
+    let cost = |groups: &Vec<Vec<&String>>| {
+        let holds: BTreeSet<BTreeSet<usize>> = groups.iter().filter(|ms| cands[ms[0]].class != 2).map(|ms|
+            ms.iter().flat_map(|m| writers.get(*m).into_iter().flatten().copied()).collect()).collect();
+        let loads = copies.iter().filter(|(a, b)| candidates.contains(&a) && candidates.contains(&b)
+            && !groups.iter().any(|ms| ms.contains(&a) && ms.contains(&b))).count();
+        (holds.len() + groups.iter().filter(|ms| cands[ms[0]].class == 2).count() + loads, groups.len())
+    };
+    let mut groups = colour(&candidates, cands, &walk.edges);
+    let mut degree_order = candidates.clone();
+    degree_order.sort_by_key(|v| std::cmp::Reverse(candidates.iter().filter(|w| clash(v, w)).count()));
+    let mut reverse_order = candidates.clone();
+    reverse_order.reverse();
+    for order in [&degree_order, &reverse_order] {
+        let trial = colour(order, cands, &walk.edges);
+        if cost(&trial) < cost(&groups) { groups = trial; }
+    }
+    // Stable representatives independent of whichever traversal won.
+    for ms in &mut groups { ms.sort(); }
     let mut map = BTreeMap::new();
     for ms in groups.into_iter().filter(|ms| ms.len() > 1) {
         // The member live on entry (at most one: they interfere) starts the register with its
