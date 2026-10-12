@@ -1,0 +1,402 @@
+# Holmium generator for Cubium: an endless supply of holmium plates at one quality, made in a
+# closed loop from microcubes, with only water and light oil coming in.
+#
+# Every machine keeps one recipe (set by hand). A warehouse feeds a sushi belt that passes
+# every machine group and runs back into the warehouse. This controller decides which groups
+# may take from the belt (or, for fluid-only groups, run their pumps) and what to put on it:
+#
+#   enables  signal-A..V = 1 for each group that may run; wire every inserter from the belt
+#            into a group (and the pumps of the fluid-only groups) with "signal-X > 0"
+#   release  items to put on the belt, each with how many more are wanted there (warehouse
+#            unloaders with "Set filters", or one unloader per item enabled on its signal)
+#   trash    filters for the trash chute: spoilage, and items over their caps
+#   lamps    one lamp per group, A on the left: green running, amber wanted but missing an
+#            input, dim idle
+#
+# Inputs: the warehouse wire (every item, each quality separately, plus the fluid tanks) and
+# the belt's contents ("read entire belt"). Stocks count both, so items riding the belt
+# aren't counted as missing.
+#
+#   A  dream-holmium-plate       50 steel, 10 cube, 10 inverted cube, 50 jelly, 350 dream
+#                                concentrate, 550 hope -> 20 holmium (+ the cubes, spent)
+#   B  copper ore                cube + 50 jelly -> 41 copper ore          (cubes recharge)
+#   C  iron ore                  cube + 50 jelly -> 41 iron ore            (for steel)
+#   D  matter amplification      cube + 10 jelly -> 17 jelly
+#   E  metallic aggravation      2 copper + dormant cube -> cube
+#   F  copper furnaces           copper ore -> copper plate
+#   G  iron furnaces             iron ore -> iron plate
+#   H  steel furnaces            5 iron plate -> steel
+#   I  inversion awakening       inverted dormant + 100 fear + 100 courage -> inverted cube
+#   J  fear inversion            inverted cube + 1000 fear -> 1000 courage
+#   K  anger cracking (pumps)    50 liquid dream + 100 anger -> 100 fear + 30 hate
+#   L  anger reconstitution      cube + 700 disgust + 1000 hate -> 1300 anger
+#   M  emotional cracking        100 tar + 35 water -> 55 hope, 35 anger, 35 disgust
+#      (refinery, pumps)
+#   N  emotional tar (pumps)     35 dream concentrate + 35 light oil -> 70 tar
+#   O  dream concentrate (pumps) 100 liquid dream -> 50 dream concentrate
+#   P  liquid dream              3 dream + 200 water -> 200 liquid dream
+#   Q  hope spoilage             dormant cube + 600 disgust + 600 hope -> cube + 15 spoilage
+#   R  solid fuel from hope      cube + 150 hope + 150 liquid dream -> 5 solid fuel
+#   S  solid fuel massage        20 solid fuel + dormant cube -> cube
+#   T  steam bath                dormant cube + 500 steam (from awakening) -> cube
+#   U  cube jelly                cube -> 2 jelly (only to start from no jelly)
+#   V  rot chest                 a chest jelly goes into; an inserter filtered to dream
+#                                takes it back out to the belt 8 minutes later
+#
+# Dream is jelly left to rot (jelly -> destabilized cube matter -> dream, 3 + 5 minutes) in
+# the rot chest, whose contents are a third input: jelly is made past its need while dream
+# (counting what's rotting) runs low. Jelly that sits in the warehouse rots too, and cubes
+# rot both ways (charged ones go dormant in 30 minutes, dormant ones recharge in 60).
+# Emotional cracking makes far more hope and disgust than holmium needs; hope spoilage and
+# the solid-fuel pair turn the surplus back into cube charges. Ratios per holmium craft:
+# tools/holmium_econ.py.
+#
+# Every group runs only with a craft's worth of every input in stock, so nothing sits in a
+# machine waiting (a cube waiting in a machine would rot). Cubes are shared: holmium has
+# first call on CUBE_RESERVE of them; copper ore (which keeps the cubes charged) comes before
+# iron ore, as in cubium-generator.ticky. Two deadlocks found by tools/holmium_sim.py are
+# guarded against: fear inversion keeps the last inverted cubes (INV_RESERVE), aggravation
+# leaves DORMANT_KEEP dormant cubes for the sinks that need one, and hate and anger can't
+# fill up together (ANGER_HIGH, DISGUST_KEEP, HATE_HIGH).
+
+import display
+
+QUALITY = "normal"    # "uncommon", "rare", "epic" or "legendary": the quality of everything made
+
+PLANTS = 4            # holmium machines; the stocks below are sized from it
+
+# Items, at the chosen quality.
+HOLMIUM = S("holmium-plate", quality=QUALITY)
+CUBE    = S("energized-microcube", quality=QUALITY)
+DORMANT = S("dormant-microcube", quality=QUALITY)
+INV     = S("inverted-microcube", quality=QUALITY)
+INV_D   = S("inverted-dormant-microcube", quality=QUALITY)
+JELLY   = S("cube-jelly", quality=QUALITY)
+DESTAB  = S("destabilized-cube-matter", quality=QUALITY)
+DREAM   = S("dream", quality=QUALITY)
+CU      = S("copper-plate", quality=QUALITY)
+CU_ORE  = S("copper-ore", quality=QUALITY)
+FE      = S("iron-plate", quality=QUALITY)
+FE_ORE  = S("iron-ore", quality=QUALITY)
+STEEL   = S("steel-plate", quality=QUALITY)
+SF      = S("solid-fuel", quality=QUALITY)
+SPOIL   = S("spoilage", quality=QUALITY)
+
+# Fluids (no quality).
+DC      = S("dream-concentrate", type="fluid")
+LD      = S("liquid-dream", type="fluid")
+HOPE    = S("liquid-hope", type="fluid")
+FEAR    = S("liquid-fear", type="fluid")
+COURAGE = S("liquid-courage", type="fluid")
+ANGER   = S("liquid-anger", type="fluid")
+HATE    = S("liquid-hate", type="fluid")
+DISGUST = S("liquid-disgust", type="fluid")
+TAR     = S("emotional-tar", type="fluid")
+OIL     = S("light-oil", type="fluid")
+WATER   = S("water", type="fluid")
+STEAM   = S("steam", type="fluid")
+
+# Stocks.
+HOLMIUM_MAX   = 100000          # stop here (the warehouse's room for it)
+STEEL_GOAL    = 100 * PLANTS    # two crafts per plant
+CUBE_RESERVE  = 10 * PLANTS     # charged cubes only holmium (and copper ore) may dip into
+COPPER_FLOOR  = 200             # iron ore waits for this much copper beyond what's owed
+COPPER_MAX    = 2000            # copper furnaces stop here
+IRON_MAX      = 1000            # iron furnaces stop here
+JELLY_GOAL    = 50 * PLANTS + 200
+DREAM_GOAL    = 600 * PLANTS    # dream, counting what's rotting: a plant uses ~0.8 a second
+                                # and rotting takes 480 seconds
+DREAM_EXTRA   = 200 * PLANTS    # jelly made past its need while the rot chest wants more
+AMP_MIN       = 10              # amplification needs 10 jelly; plain cube jelly below
+JELLY_RESERVE = 50 * PLANTS     # jelly kept for amplification, the only real source of it:
+                                # ore crafts and the rot chest take only above this (copper
+                                # ore not while cubes are short: amplification couldn't use
+                                # it, and copper is what recharges them)
+INV_GOAL      = 20 * PLANTS     # charged inverted cubes
+INV_RESERVE   = 2               # ...of which fear inversion alone may use the last ones (else
+                                # courage runs out with every inverted cube dormant: deadlock)
+DORMANT_KEEP  = 10              # dormant cubes aggravation leaves for the sinks (Q, S, T)
+COURAGE_GOAL  = 3000
+SF_MAX        = 200
+
+# Fluids, as totals over each fluid's tanks.
+FLUID_FULL    = 20000           # stop making a fluid here (a storage tank holds 25000)
+DC_KEEP       = 350 * PLANTS    # dream concentrate kept for holmium
+DC_GOAL       = 1000 * PLANTS   # dream concentrate made up to here
+LD_KEEP       = 1000            # liquid dream dream concentrate leaves for anger cracking
+                                # (the only source of fear) and the hope sink
+HOPE_KEEP     = 550 * PLANTS    # hope kept for holmium
+HOPE_HIGH     = 10000           # surplus hope above this goes to the sinks (Q, R)
+DISGUST_HIGH  = 10000           # likewise disgust (Q)
+DISGUST_KEEP  = 1400            # disgust the hope sink leaves for anger reconstitution
+ANGER_HIGH    = 15000           # emotional cracking stops here, leaving room for
+                                # reconstitution: otherwise hate (stopping anger cracking) and
+                                # anger (stopping reconstitution) can fill up together
+HATE_HIGH     = 10000           # above this, reconstitution may use reserve cubes
+
+# How many of each item to keep on the belt while a group that takes it is on (a group's
+# items add up when several are on).
+BELT_A = {STEEL: 100, CUBE: 20, INV: 20, JELLY: 100}
+BELT_ORE = {CUBE: 10, JELLY: 200}
+BELT_D = {CUBE: 10, JELLY: 50}
+BELT_E = {CU: 50, DORMANT: 20}
+BELT_F = {CU_ORE: 100}
+BELT_G = {FE_ORE: 100}
+BELT_H = {FE: 50}
+BELT_I = {INV_D: 20}
+BELT_J = {INV: 5}
+BELT_CUBE = {CUBE: 5}
+BELT_P = {DREAM: 30}
+BELT_DORMANT = {DORMANT: 5}
+BELT_S = {SF: 40, DORMANT: 5}
+BELT_V = {JELLY: 100}
+
+# Trash anything over these (spoilage always: -1).
+CAPS = {SPOIL: -1, DREAM: 5000, SF: 1000, CU_ORE: 2000, FE_ORE: 2000, CU: 4000, FE: 2000}
+CAPPED = {SPOIL: 1, DREAM: 1, SF: 1, CU_ORE: 1, FE_ORE: 1, CU: 1, FE: 1}
+
+GREEN = 0x00C000
+AMBER = 0xFF9000
+DIM   = 0x181818
+
+input  warehouse: Bundle = port("Warehouse contents (items and tanks)")
+input  belt: Bundle = port("Belt contents")
+input  rotting: Bundle = port("Rot chest contents")
+
+output enables: Bundle = port("Group enables, signal-A..V")
+output release: Bundle = port("Items to put on the belt")
+output trash: Bundle = port("Trash chute filters")
+output lamps: display.Screen(22, 1) = port("Groups A..V")
+
+def lamp(want, have):
+    return GREEN if want and have else AMBER if want else DIM
+
+every 60 ticks:
+    stock = warehouse + belt
+    ho = stock[HOLMIUM]
+    cube = stock[CUBE]
+    dormant = stock[DORMANT]
+    inv = stock[INV]
+    inv_d = stock[INV_D]
+    jelly = stock[JELLY]
+    cu = stock[CU]
+    cu_ore = stock[CU_ORE]
+    fe = stock[FE]
+    fe_ore = stock[FE_ORE]
+    steel = stock[STEEL]
+    dream = stock[DREAM]
+    dreaming = dream + stock[DESTAB] + rotting[JELLY] + rotting[DESTAB] + rotting[DREAM]
+    sf = stock[SF]
+    dc = warehouse[DC]
+    ld = warehouse[LD]
+    hope = warehouse[HOPE]
+    fear = warehouse[FEAR]
+    courage = warehouse[COURAGE]
+    anger = warehouse[ANGER]
+    hate = warehouse[HATE]
+    disgust = warehouse[DISGUST]
+    tar = warehouse[TAR]
+    oil = warehouse[OIL]
+    water = warehouse[WATER]
+    steam = warehouse[STEAM]
+
+    spare = cube > CUBE_RESERVE
+    owed = cu + cu_ore - 2 * dormant    # copper beyond what recharging every dormant cube takes
+    want_v = dreaming < DREAM_GOAL
+    jelly_goal = JELLY_GOAL + (DREAM_EXTRA if want_v else 0)
+
+    want_a = ho < HOLMIUM_MAX
+    have_a = steel >= 50 and cube >= 10 and inv >= 10 + INV_RESERVE and jelly >= 50 and dc >= 350 and hope >= 550
+    want_b = owed < COPPER_FLOOR
+    have_b = cube >= 1 and jelly >= 50 + (JELLY_RESERVE if spare else 0)
+    want_c = steel + (fe + fe_ore) // 5 < STEEL_GOAL and owed >= COPPER_FLOOR
+    have_c = spare and jelly >= 50 + JELLY_RESERVE
+    want_d = jelly < jelly_goal
+    have_d = jelly >= AMP_MIN and (spare or (jelly < 50 and cube >= 1))
+    want_e = dormant > DORMANT_KEEP
+    have_e = cu >= 2
+    want_f = cu < COPPER_MAX
+    have_f = cu_ore > 0
+    want_g = fe < IRON_MAX
+    have_g = fe_ore > 0
+    want_h = steel < STEEL_GOAL
+    have_h = fe >= 5
+    want_i = inv < INV_GOAL
+    have_i = inv_d >= 1 and fear >= 100 and courage >= 100
+    want_j = courage < COURAGE_GOAL
+    have_j = inv >= 1 and fear >= 1000
+    want_k = fear < FLUID_FULL and hate < FLUID_FULL
+    have_k = ld >= 50 and anger >= 100
+    want_l = anger < FLUID_FULL
+    have_l = (spare or hate > HATE_HIGH) and cube >= 1 and disgust >= 700 and hate >= 1000
+    want_m = hope < FLUID_FULL and anger < ANGER_HIGH and disgust < FLUID_FULL
+    have_m = tar >= 100 and water >= 35
+    want_n = tar < FLUID_FULL
+    have_n = oil >= 35 and dc >= 35 + DC_KEEP
+    want_o = dc < DC_GOAL
+    have_o = ld >= 100 + LD_KEEP
+    want_p = ld < FLUID_FULL
+    have_p = dream >= 3 and water >= 200
+    want_q = hope > HOPE_HIGH or disgust > DISGUST_HIGH
+    have_q = dormant >= 1 and disgust >= 600 + DISGUST_KEEP and hope >= 600 + HOPE_KEEP
+    want_r = hope > HOPE_HIGH and sf < SF_MAX
+    have_r = spare and ld >= 150
+    want_s = sf >= 20
+    have_s = dormant >= 1
+    want_t = steam >= 500
+    have_t = dormant >= 1
+    want_u = jelly < AMP_MIN
+    have_u = cube >= 1
+    have_v = jelly >= 50 + JELLY_RESERVE
+
+    a = want_a and have_a
+    b = want_b and have_b
+    c = want_c and have_c
+    d = want_d and have_d
+    e = want_e and have_e
+    f = want_f and have_f
+    g = want_g and have_g
+    h = want_h and have_h
+    i = want_i and have_i
+    j = want_j and have_j
+    k = want_k and have_k
+    l = want_l and have_l
+    m = want_m and have_m
+    n = want_n and have_n
+    o = want_o and have_o
+    p = want_p and have_p
+    q = want_q and have_q
+    r = want_r and have_r
+    s = want_s and have_s
+    t = want_t and have_t
+    u = want_u and have_u
+    v = want_v and have_v
+
+    enables = Bundle(A=a, B=b, C=c, D=d, E=e, F=f, G=g, H=h, I=i, J=j, K=k, L=l, M=m,
+                     N=n, O=o, P=p, Q=q, R=r, S=s, T=t, U=u, V=v)
+
+    belt_want = BELT_A * a + BELT_ORE * (b + c) + BELT_D * d + BELT_E * e + BELT_F * f \
+        + BELT_G * g + BELT_H * h + BELT_I * i + BELT_J * j + BELT_CUBE * (l + r + u) \
+        + BELT_P * p + BELT_DORMANT * (q + t) + BELT_S * s + BELT_V * v
+    short = {x: v for x, v in (belt_want - belt).items() if v > 0}
+    there = {x: 1 for x, v in warehouse.items() if v > 0}
+    release = short * there
+
+    over = (warehouse - CAPS) * CAPPED
+    trash = {x: 1 for x, v in over.items() if v > 0}
+
+    lamps[0] = lamp(want_a, have_a)
+    lamps[1] = lamp(want_b, have_b)
+    lamps[2] = lamp(want_c, have_c)
+    lamps[3] = lamp(want_d, have_d)
+    lamps[4] = lamp(want_e, have_e)
+    lamps[5] = lamp(want_f, have_f)
+    lamps[6] = lamp(want_g, have_g)
+    lamps[7] = lamp(want_h, have_h)
+    lamps[8] = lamp(want_i, have_i)
+    lamps[9] = lamp(want_j, have_j)
+    lamps[10] = lamp(want_k, have_k)
+    lamps[11] = lamp(want_l, have_l)
+    lamps[12] = lamp(want_m, have_m)
+    lamps[13] = lamp(want_n, have_n)
+    lamps[14] = lamp(want_o, have_o)
+    lamps[15] = lamp(want_p, have_p)
+    lamps[16] = lamp(want_q, have_q)
+    lamps[17] = lamp(want_r, have_r)
+    lamps[18] = lamp(want_s, have_s)
+    lamps[19] = lamp(want_t, have_t)
+    lamps[20] = lamp(want_u, have_u)
+    lamps[21] = lamp(want_v, have_v)
+
+test "cold start: cubes but no jelly, so plain cube jelly; holmium waits":
+    set warehouse = {CUBE: 50, WATER: 10000, OIL: 10000}
+    run 120 ticks
+    assert enables["signal-U"] == 1 and not enables["signal-D"] and not enables["signal-A"]
+    assert release[CUBE] == 5
+    assert lamps[20] == GREEN and lamps[0] == AMBER and lamps[3] == AMBER
+
+test "amplify once there's jelly, while cubes are spare":
+    set warehouse = {CUBE: 50, JELLY: 30}
+    run 120 ticks
+    assert enables["signal-D"] == 1 and not enables["signal-U"]
+    assert release[JELLY] == 50 and release[CUBE] == 10
+
+test "holmium runs with a craft of everything, and the belt is topped up":
+    set warehouse = {STEEL: 400, CUBE: 100, INV: 20, JELLY: 300, DC: 5000, HOPE: 5000}
+    set belt = {STEEL: 30, JELLY: 120}
+    run 120 ticks
+    assert enables["signal-A"] == 1
+    assert release[STEEL] == 70 and release[INV] == 20
+    assert lamps[0] == GREEN
+
+test "missing inverted cubes hold holmium back":
+    set warehouse = {STEEL: 400, CUBE: 100, INV: 11, JELLY: 300, DC: 5000, HOPE: 5000}
+    run 120 ticks
+    assert not enables["signal-A"] and not release[STEEL]
+    assert lamps[0] == AMBER
+
+test "short of cubes, copper ore needn't leave jelly for amplification":
+    set warehouse = {CUBE: 20, DORMANT: 100, JELLY: 60}
+    run 120 ticks
+    assert enables["signal-B"] == 1 and not enables["signal-D"]
+
+test "copper first: dormant cubes owe copper, so copper ore and not iron ore":
+    set warehouse = {CUBE: 50, DORMANT: 500, JELLY: 300}
+    run 120 ticks
+    assert enables["signal-B"] == 1 and not enables["signal-C"]
+
+test "iron ore once copper is covered and steel is low":
+    set warehouse = {CUBE: 50, DORMANT: 20, JELLY: 300, CU: 1000}
+    run 120 ticks
+    assert enables["signal-C"] == 1 and not enables["signal-B"]
+    assert enables["signal-E"] == 1
+
+test "furnaces and steel":
+    set warehouse = {CU_ORE: 100, FE_ORE: 100, FE: 50}
+    run 120 ticks
+    assert enables["signal-F"] == 1 and enables["signal-G"] == 1 and enables["signal-H"] == 1
+    set warehouse = {FE: 4, STEEL: 5000}
+    run 120 ticks
+    assert not enables["signal-H"]
+
+test "the fluid chain":
+    set warehouse = {INV_D: 5, INV: 20, FEAR: 5000, COURAGE: 500, LD: 5000, ANGER: 500,
+                     TAR: 500, WATER: 10000, OIL: 1000, DC: 3000, DREAM: 100, HATE: 2000,
+                     DISGUST: 1000, CUBE: 100}
+    run 120 ticks
+    assert enables["signal-I"] == 1 and enables["signal-J"] == 1 and enables["signal-K"] == 1
+    assert enables["signal-L"] == 1 and enables["signal-M"] == 1 and enables["signal-N"] == 1
+    assert enables["signal-O"] == 1 and enables["signal-P"] == 1
+    assert not enables["signal-Q"] and not enables["signal-R"]
+
+test "hate and anger both high: reconstitution still runs, emotional cracking doesn't":
+    set warehouse = {HATE: 20000, ANGER: 17000, DISGUST: 800, CUBE: 5, TAR: 500, WATER: 1000}
+    run 120 ticks
+    assert enables["signal-L"] == 1 and not enables["signal-M"]
+
+test "full tanks stop their makers":
+    set warehouse = {LD: 5000, ANGER: 500, FEAR: 25000, TAR: 500, WATER: 1000, HOPE: 25000}
+    run 120 ticks
+    assert not enables["signal-K"] and not enables["signal-M"]
+
+test "surplus hope and disgust go to the sinks":
+    set warehouse = {HOPE: 15000, DISGUST: 15000, DORMANT: 10, CUBE: 100, LD: 1000, SF: 40,
+                     STEAM: 600}
+    run 120 ticks
+    assert enables["signal-Q"] == 1 and enables["signal-R"] == 1
+    assert enables["signal-S"] == 1 and enables["signal-T"] == 1
+
+test "trash: spoilage always, dream over its cap":
+    set warehouse = {DREAM: 6000, SPOIL: 30, CU: 100}
+    run 120 ticks
+    assert trash[SPOIL] == 1 and trash[DREAM] == 1 and not trash[CU]
+
+test "extra jelly for the rot chest when dream runs low":
+    set warehouse = {CUBE: 100, JELLY: 450, DREAM: 2000}
+    set rotting = {DESTAB: 500}
+    run 120 ticks
+    assert not enables["signal-D"] and not enables["signal-V"]
+    set rotting = {DESTAB: 300}
+    run 120 ticks
+    assert enables["signal-D"] == 1 and enables["signal-V"] == 1 and release[JELLY] > 0
+    assert lamps[21] == GREEN

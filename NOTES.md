@@ -1352,3 +1352,34 @@ string, so everything that takes a quoted string takes a constant. Assigning one
 rebinding it anywhere, or a parameter or port of that name is an error; a use as a value
 gets the usual "strings can't be used as values". Test `string_constants`. Bench unchanged.
 The user confirmed "Set recipe" honours the recipe signal's quality.
+
+## 2026-10-11: holmium generator (Cubium)
+
+`examples/holmium-generator.ticky`, at the user's request: endless holmium plates at one
+quality (`QUALITY = "normal"` … `"legendary"`, a string constant) from microcubes, with only
+water and light oil coming in. All machines keep fixed recipes, 22 groups A–V around a
+warehouse-fed sushi belt; the controller outputs `enables` (signal-A..V), `release` (items to
+put on the belt, topped up to per-group belt targets), `trash` (filters for the user's
+ocean-dumping chute: spoilage and items over caps) and a 22×1 lamp strip (green running, amber
+wanted but missing an input, dim idle). Inputs: warehouse (items per quality + tanks), belt
+contents, rot-chest contents. 225 combinators, depth 16, every 60 ticks.
+- Cubium facts from the prototypes (`cubium/prototypes/item.lua`): cube jelly spoils into
+  destabilized cube matter in 3 min, that into dream in 5 (the only dream source besides
+  recycling); energized cubes spoil to dormant in 30 min and dormant back to energized in 60;
+  inverted cube jelly explodes when it spoils (never stock it). Spoilage keeps quality.
+- `tools/holmium_econ.py`: steady-state runs per holmium craft (linear solve, cubes
+  conserved). Per 20 plates: ~136 aggravations (272 copper), 112 amplifications, 50 steel,
+  ~96 jelly rotted into dream, 7.7k water, 1.9k light oil; emotional cracking's surplus hope
+  and disgust need sinks (hope spoilage; solid fuel from hope + massage).
+- `tools/holmium_sim.py`: time-stepped factory (machines sized from the econ ratios ×1.3,
+  rot, tank caps) running a hand-kept copy of the policy. It found, in order: inverted cubes
+  all dormant with no courage (INV_RESERVE for fear inversion); sinks starved of dormant cubes
+  by aggravation (DORMANT_KEEP); dream concentrate hoarding liquid dream (DC_GOAL, LD_KEEP);
+  bursty dream from warehouse rot (the rot chest, group V); amplification starved of jelly by
+  50-jelly consumers (JELLY_RESERVE, waived for copper ore while cubes are short, else a cold
+  start with few cubes stalls); hate and anger tanks filling together (ANGER_HIGH,
+  DISGUST_KEEP, HATE_HIGH). Now 92–100% of holmium capacity in steady state for 1–8 plants
+  with ≥ 50 starting cubes per plant (73% at 30, 40% at 20; 10 per plant = CUBE_RESERVE never
+  starts).
+- In-game difftests with Cubium loaded: `harness/difftest-holmium.sh` MATCH 1499 ticks; a
+  legendary build with mixed normal/legendary stock MATCH 699 ticks (normal stock ignored).
