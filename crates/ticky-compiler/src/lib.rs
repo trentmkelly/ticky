@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod place;
 pub mod program;
 pub mod stdlib;
+pub mod strconst;
 pub mod testrun;
 
 use serde_json::Value;

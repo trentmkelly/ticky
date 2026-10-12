@@ -720,8 +720,9 @@ pub fn timing(what: &str, since: std::time::Instant) {
 
 pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let t = std::time::Instant::now();
-    let imported = crate::stdlib::imports(m)?;
     let mut m = m.clone();
+    crate::strconst::substitute(&mut m)?;
+    let imported = crate::stdlib::imports(&m)?;
     crate::stdlib::rewrite_calls(&mut m, &imported)?;
     let controls = crate::stdlib::controls(&mut m, &imported)?;
     let random = if imported.contains("random") { crate::stdlib::random_names(&m) } else { Default::default() };

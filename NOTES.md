@@ -1341,3 +1341,14 @@ changes (1696 → 1684).
   (min/max/clamps/offsets/`//`/`%`/selects/random), element writes by constant and runtime
   index (zeros), dict comprehensions, `every` blocks and main-program loops, vs Python. A build
   that skips the fixpoint fails 37/60. Test `element_ranges_and_nested_bundle_selects`.
+
+## 2026-10-11: string constants
+
+`QUALITY = "legendary"` at the top level, then `S("holmium-plate", quality=QUALITY)`: for the
+holmium generator, whose quality is one setting chosen before compiling (SPEC §4.6). Module
+`strconst.rs`, run first in `program::analyze`: top-level `NAME = "text"` assignments are
+removed and every use of `NAME` (statements, tests, port signals and labels) becomes the
+string, so everything that takes a quoted string takes a constant. Assigning one twice,
+rebinding it anywhere, or a parameter or port of that name is an error; a use as a value
+gets the usual "strings can't be used as values". Test `string_constants`. Bench unchanged.
+The user confirmed "Set recipe" honours the recipe signal's quality.

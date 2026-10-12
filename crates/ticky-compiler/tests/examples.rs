@@ -527,6 +527,36 @@ test "the item, not the recipe":
 
 
 #[test]
+fn string_constants() {
+    // One setting at the top picks the quality of every signal that names it.
+    let src = r#"
+QUALITY = "legendary"
+PLATE = "holmium-plate"
+input  stock: Bundle = port("Stock")
+output o: int @ O
+output r: Signal = port("Recipe")
+R = S("dream-holmium-plate", type="recipe", quality=QUALITY)
+every tick:
+    o = stock[S(PLATE, quality=QUALITY)]
+    r = R
+
+test "reads the chosen quality":
+    set stock = {S("holmium-plate", quality="legendary"): 5, "holmium-plate": 7}
+    run 10 ticks
+    assert o == 5 and r == S("dream-holmium-plate", type="recipe", quality="legendary")
+"#;
+    let c = compile(src, &opts()).unwrap_or_else(|d| panic!("{}", d[0].message));
+    for r in run_tests(&c, src) {
+        assert!(r.failure.is_none(), "test {} failed", r.name);
+    }
+    let json = c.blueprint_json().to_string();
+    assert!(json.contains(r#""quality":"legendary""#));
+    assert!(error_of("Q = \"rare\"\nQ = \"epic\"\n").contains("assigned twice"));
+    assert!(error_of("Q = \"rare\"\noutput o: int @ O\nevery tick:\n    o = Q\n").contains("strings can't be used as values"));
+    assert!(error_of("Q = \"rare\"\noutput o: int @ O\nevery tick:\n    Q = 1\n    o = 1\n").contains("string constant"));
+}
+
+#[test]
 fn optimizations_apply() {
     // Sums of comparisons on the wire, a count over an array (one filter and a total, with
     // the `* 100` pushed into it), and a signal chosen by number (a table lookup). Before
