@@ -1335,19 +1335,51 @@ impl Graph {
         }
     }
 
-    fn merge_filter(&self, t: BTerm) -> BTerm {
+    fn merge_filter(&mut self, t: BTerm) -> BTerm {
         if let BTerm::Filter(b, d, out) = &t {
-            if let Op::Bun(inner) = self.op(*b) {
-                if let [BTerm::Filter(b2, d2, FOut::Copy)] = inner.as_slice() {
+            if let Op::Bun(inner) = self.op(*b).clone() {
+                if let [BTerm::Filter(b2, d2, inner_out)] = inner.as_slice() {
+                    let mut d = d.clone();
+                    let mut out = *out;
+                    if let FOut::Const(k) = *inner_out {
+                        // The second predicate observes the flag, not the original value.
+                        // Zero flags disappear, leaving no sparse domain to filter.
+                        if k == 0 { return BTerm::K(Vec::new()); }
+                        let kv = self.konst(k);
+                        d = d.into_iter().filter_map(|term| {
+                            let mut result = Vec::new();
+                            for mut l in term {
+                                if l.a == BOp::Each { l.a = BOp::Val(kv); }
+                                if l.b == BOp::Each { l.b = BOp::Val(kv); }
+                                let constant = |o| match o { BOp::Val(v) => self.as_const(v), BOp::Each => None };
+                                match (constant(l.a), constant(l.b)) {
+                                    (Some(a), Some(b)) => {
+                                        if !l.op.apply(a, b) { return None; }
+                                        continue;
+                                    }
+                                    (Some(_), None) => {
+                                        std::mem::swap(&mut l.a, &mut l.b);
+                                        l.op = l.op.flip();
+                                    }
+                                    _ => {}
+                                }
+                                result.push(l);
+                            }
+                            Some(result)
+                        }).collect();
+                        if d.is_empty() { return BTerm::K(Vec::new()); }
+                        if out == FOut::Copy { out = FOut::Const(k); }
+                    }
+                    if d2.len().saturating_mul(d.len()) > 12 {
+                        return t;
+                    }
                     let mut both: BDnf = Vec::new();
                     for x in d2 {
-                        for y in d {
+                        for y in &d {
                             both.push(x.iter().chain(y.iter()).copied().collect());
                         }
                     }
-                    if both.len() <= 12 {
-                        return BTerm::Filter(*b2, both, *out);
-                    }
+                    return BTerm::Filter(*b2, both, out);
                 }
             }
         }

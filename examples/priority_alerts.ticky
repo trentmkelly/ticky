@@ -1,0 +1,35 @@
+# Classify shortages, then apply the operator's alert priority cutoff.
+# The flags also feed other controllers; queries must preserve this shared value.
+input stock: Bundle
+input cutoff: int @ C
+output flags: Bundle
+output urgent: Bundle
+output kinds: int @ K
+output weight: int @ W
+
+every tick:
+    flags = {s: 3 for s, v in stock.items() if v < 10}
+    urgent = {s: v for s, v in flags.items() if v >= cutoff}
+    kinds = len(urgent)
+    weight = urgent.total()
+
+test "shortages, foreign signals and missing lanes":
+    set cutoff = 2
+    set stock = Bundle(iron_plate=5, copper_plate=40, coal=-7, stone=0, signal_C=8)
+    run 40 ticks
+    assert flags == Bundle(iron_plate=3, coal=3, signal_C=3)
+    assert urgent == flags and kinds == 3 and weight == 9
+    set cutoff = 4
+    run 40 ticks
+    assert urgent == Bundle() and kinds == 0 and weight == 0
+    assert flags == Bundle(iron_plate=3, coal=3, signal_C=3)
+    set stock = Bundle()
+    set cutoff = -2147483648
+    run 40 ticks
+    assert flags == Bundle() and urgent == Bundle() and kinds == 0 and weight == 0
+
+test "signed extremes":
+    set cutoff = 3
+    set stock = Bundle(iron_plate=-2147483648, copper_plate=2147483647)
+    run 40 ticks
+    assert urgent == Bundle(iron_plate=3) and kinds == 1 and weight == 3
