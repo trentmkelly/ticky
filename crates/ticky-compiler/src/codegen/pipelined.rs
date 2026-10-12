@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ticky_factorio::*;
 use ticky_syntax::Diag;
 
-use super::registers::{accumulator, Writer};
+use super::registers::{accumulator, AccumulatorBank, Writer};
 use super::*;
 use crate::fuse::{is_true, LoadVal, WriterPlan};
 use crate::ir::{Graph, Lit, Op, V};
@@ -338,6 +338,7 @@ fn build(
     let lit_at = |l: &Lit, when: i32| Cond { second: ready[&(l.b, when)].op(), ..c(ready[&(l.a, when)].sig(), l.op, 0) };
     let lit = |l: &Lit| lit_at(l, 0);
     let lit_eg = |l: &Lit| lit_at(l, -1);
+    let mut accumulator_bank = AccumulatorBank::default();
     for (si, s) in p.states.iter().enumerate() {
         if s.owner != Some(bi) || !live[si] {
             continue;
@@ -348,7 +349,7 @@ fn build(
         let name = format!("state {}", s.display_name());
         if let Some((_, w)) = acc_w.iter().find(|(a, _)| *a == si) {
             let acc = &accs.iter().find(|(a, _)| *a == si).unwrap().1;
-            accumulator(cg, shared.state_sig[&si], s.init, *w, acc, en, &lit, &name);
+            accumulator(cg, &mut accumulator_bank, shared.state_sig[&si], s.init, *w, acc, en, &lit, &name);
             continue;
         }
         let ws: Vec<Writer> = plans

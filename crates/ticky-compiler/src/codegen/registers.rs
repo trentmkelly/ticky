@@ -579,11 +579,44 @@ fn guard_conds(w: &Writer, guard: &crate::ir::Dnf, x: Sig, stage: Option<LoadSta
         .collect()
 }
 
-/// `x += w` every tick: the hold decider copies x from a private red loop on which `w`
-/// (renamed to x's signal) is also summed.
+/// Accumulators in one pipeline use distinct signals on a shared private feedback wire.
+/// Conditions read the bus; only explicit copy outputs read feedback. This lets holds,
+/// startup holds, resets and initialization share deciders without mixing signal counts.
+#[derive(Default)]
+pub(super) struct AccumulatorBank {
+    wire: Option<usize>,
+    deciders: Vec<(Vec<Cond>, EntId)>,
+}
+
+impl AccumulatorBank {
+    fn wire(&mut self, cg: &mut Cg) -> usize {
+        *self.wire.get_or_insert_with(|| {
+            cg.nets.push(NetSpec { red: true, members: Vec::new() });
+            cg.nets.len() - 1
+        })
+    }
+
+    fn emit(&mut self, cg: &mut Cg, conds: Vec<Cond>, out: DOut, desc: String) {
+        let wire = self.wire(cg);
+        let conds: Vec<Cond> = conds.into_iter().map(green).collect();
+        if let Some((_, id)) = self.deciders.iter().find(|(cs, _)| *cs == conds) {
+            let e = &mut cg.net.entities[*id];
+            let Kind::Decider(d) = &mut e.kind else { unreachable!() };
+            d.outputs.push(out);
+            e.description.as_mut().unwrap().push_str(&format!("; {desc}"));
+        } else {
+            let id = cg.core(dec(conds.clone(), vec![out]), desc);
+            cg.nets[wire].members.extend([(id, Conn::InRed), (id, Conn::OutRed)]);
+            self.deciders.push((conds, id));
+        }
+    }
+}
+
+/// `x += w` every tick: copy x from feedback, where its increment is also summed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn accumulator(
     cg: &mut Cg,
+    bank: &mut AccumulatorBank,
     x: Sig,
     init: i32,
     w: Operand,
@@ -594,39 +627,22 @@ pub(super) fn accumulator(
 ) {
     let (st, run) = (cg.st, cg.run);
     let running = [c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0), c(en, CmpOp::Ne, 0)];
-    let hold = cg.core(
-        dec(
-            distribute(&running, &lits(&acc.otherwise, lit)),
-            vec![DOut { sig: x, copy: true, constant: 1, nets: Nets::RED }],
-        ),
-        format!("{name} (accumulator)"),
-    );
-    // Constant loads (e.g. a reset) replace the accumulator's output while they apply.
-    let mut loads = Vec::new();
+    bank.emit(cg, distribute(&running, &lits(&acc.otherwise, lit)),
+        DOut { sig: x, copy: true, constant: 1, nets: Nets::RED }, format!("{name} (accumulator)"));
     for (d, k) in &acc.consts {
         if *k != 0 {
-            let id = cg.core(dec_const(distribute(&[c(en, CmpOp::Ne, 0)], &lits(d, lit)), x, *k), format!("{name} (load)"));
-            loads.push(id);
+            bank.emit(cg, distribute(&[c(en, CmpOp::Ne, 0)], &lits(d, lit)), out_const(x, *k), format!("{name} (load)"));
         }
     }
-    // Before the block is enabled, hold without adding (copy from the bus, not the loop).
-    let idle = cg.core(
-        dec(
-            vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0), c(en, CmpOp::Eq, 0)],
-            vec![DOut { sig: x, copy: true, constant: 1, nets: Nets::GREEN }],
-        ),
-        format!("{name} (hold while starting)"),
-    );
-    let mut loop_net = vec![(hold, Conn::InRed), (hold, Conn::OutRed), (idle, Conn::OutRed)];
-    loop_net.extend(loads.into_iter().map(|id| (id, Conn::OutRed)));
+    bank.emit(cg, vec![c(st, CmpOp::Eq, 0), c(run, CmpOp::Ne, 0), c(en, CmpOp::Eq, 0)],
+        DOut { sig: x, copy: true, constant: 1, nets: Nets::GREEN }, format!("{name} (hold while starting)"));
     if init != 0 {
-        let i = cg.core(dec_const(vec![c(st, CmpOp::Ne, 0)], x, init), format!("{name} (initial value {init})"));
-        loop_net.push((i, Conn::OutRed));
+        bank.emit(cg, vec![c(st, CmpOp::Ne, 0)], out_const(x, init), format!("{name} (initial value {init})"));
     }
-    // The increment only goes onto the private loop, never the bus.
+    // Explicit per-signal injection; the increment never goes directly onto the bus.
     let add = cg.net.add(arith(w, ArOp::Add, Operand::Const(0), x), Role::Core);
     cg.net.entities[add].description = Some(format!("{name} (increment)"));
     cg.nets[0].members.push((add, Conn::InGreen));
-    loop_net.push((add, Conn::OutRed));
-    cg.nets.push(NetSpec { red: true, members: loop_net });
+    let wire = bank.wire(cg);
+    cg.nets[wire].members.push((add, Conn::OutRed));
 }
