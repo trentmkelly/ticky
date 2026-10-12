@@ -14,7 +14,17 @@ impl Fuser<'_> {
         }
         let mut loads = Vec::new();
         self.split(next, vec![vec![]], own, &mut loads);
-        Some(loads)
+        // Equivalent leaves need one load under the union of their exclusive guards.
+        // Merge before staging and hold planning so both see the reduced usage count.
+        let mut merged: Vec<Load> = Vec::new();
+        for load in loads {
+            let same = merged.iter().position(|l| l.val == load.val);
+            match same.and_then(|i| or(merged[i].guard.clone(), load.guard.clone()).map(|d| (i, d))) {
+                Some((i, d)) => merged[i].guard = d,
+                None => merged.push(load),
+            }
+        }
+        Some(merged)
     }
 
     pub(super) fn split(&mut self, v: V, guard: Dnf, own: Option<V>, loads: &mut Vec<Load>) {

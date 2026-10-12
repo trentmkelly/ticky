@@ -290,7 +290,9 @@ fn simplify(g: &Graph, d: SDnf) -> Option<SDnf> {
             out.push(lits);
         }
     }
-    Some(out)
+    let reduced = crate::fuse::simplify_terms(out.clone(), |l: SLit| SLit { op: l.op.negate(), ..l });
+    // Stages need an explicit signal-reading condition, even for a tautology.
+    Some(if reduced.iter().any(Vec::is_empty) { out } else { reduced })
 }
 
 /// Replaces value `n` by `by` in every literal.
@@ -518,6 +520,12 @@ fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, V
                     }
                 }
                 None => deciders.push((d, out)),
+            }
+        }
+        for (d, _) in &mut deciders {
+            let reduced = crate::fuse::simplify_terms(d.clone(), |l: SLit| SLit { op: l.op.negate(), ..l });
+            if !reduced.iter().any(Vec::is_empty) {
+                *d = reduced;
             }
         }
         if !a.is_empty() && deciders.iter().any(|(d, _)| d.iter().map(|t| t.len()).sum::<usize>() > MAX_LITS) {

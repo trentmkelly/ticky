@@ -16,6 +16,8 @@
 //! [`Fuser::rebuild`] (or `Fuser::split` for register loads).
 
 mod argmax;
+mod boolean;
+pub(crate) use boolean::simplify_terms;
 mod counts;
 mod lookups;
 mod plans;
@@ -40,7 +42,7 @@ const MAX_ARMS: usize = 8;
 const MAX_TERMS: usize = 12;
 const MAX_LITS: usize = 32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LoadVal {
     Const(i32),
     Node(V),
@@ -126,6 +128,7 @@ fn or(a: Dnf, b: Dnf) -> Option<Dnf> {
             d.push(t);
         }
     }
+    let d = simplify_terms(d, negated);
     size_ok(&d).then_some(d)
 }
 
@@ -150,11 +153,12 @@ fn and(a: &Dnf, b: &Dnf) -> Option<Dnf> {
             if !d.contains(&t) {
                 d.push(t);
             }
-            if d.len() > MAX_TERMS {
+            if d.len() > MAX_TERMS * MAX_TERMS {
                 return None;
             }
         }
     }
+    let d = simplify_terms(d, negated);
     size_ok(&d).then_some(d)
 }
 
