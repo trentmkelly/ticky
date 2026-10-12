@@ -1035,7 +1035,19 @@ impl Graph {
 
     /// A decider node; simplifies trivial cases. `hint` bounds its value.
     pub fn dec(&mut self, arms: Vec<(Dnf, i32)>, hint: Iv) -> V {
-        let arms: Vec<(Dnf, i32)> = arms.into_iter().filter(|(d, k)| *k != 0 && !d.is_empty()).collect();
+        let mut arms: Vec<(Dnf, i32)> = arms.into_iter().filter(|(d, k)| *k != 0 && !d.is_empty()).collect();
+        // Scalar operand canonicalization can change conjunction construction order.
+        // Conditions are sets: normalize their ordering before hash-consing so checks
+        // with the same predicates continue to share their decider.
+        let key = |l: &Lit| (l.a, l.b, l.op as u8);
+        for (dnf, _) in &mut arms {
+            for term in dnf.iter_mut() {
+                term.sort_unstable_by_key(key);
+                term.dedup();
+            }
+            dnf.sort_unstable_by(|a, b| a.iter().map(key).cmp(b.iter().map(key)));
+            dnf.dedup();
+        }
         match arms.as_slice() {
             [] => return self.konst(0),
             [(d, k)] if d.iter().any(|t| t.is_empty()) => return self.konst(*k),
@@ -1807,6 +1819,20 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decider_value_numbering_ignores_condition_order() {
+        let mut g = Graph::new(vec![Iv::FULL, Iv::FULL]);
+        let x = g.src(0);
+        let y = g.src(1);
+        let zero = g.konst(0);
+        let a = Lit { op: CmpOp::Lt, a: x, b: zero };
+        let b = Lit { op: CmpOp::Gt, a: y, b: zero };
+        let c = Lit { op: CmpOp::Gt, a: x, b: zero };
+        let first = g.dec(vec![(vec![vec![a, b], vec![c, b]], 1)], Iv::BOOL);
+        let second = g.dec(vec![(vec![vec![b, c], vec![b, a]], 1)], Iv::BOOL);
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn scalar_value_numbering_preserves_comprehension_orientation() {

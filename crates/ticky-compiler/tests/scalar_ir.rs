@@ -65,3 +65,16 @@ fn scalar_streaming_wrapping_semantics() {
         }
     }
 }
+
+#[test]
+fn checked_sorting_shares_reordered_check_predicates() {
+    let src = include_str!("../../../examples/sorting.ticky");
+    for opt in [ticky_compiler::Opt::Speed, ticky_compiler::Opt::Size] {
+        let c = compile(src, &Options { checks: true, opt, ..Default::default() }).unwrap();
+        let count = c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
+        assert!(count <= 122, "{opt:?}: {count} combinators; checked baseline is 122");
+        for result in ticky_compiler::testrun::run_tests(&c, src) {
+            assert!(result.failure.is_none(), "{opt:?}: {}: {:?}", result.name, result.failure);
+        }
+    }
+}
