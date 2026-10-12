@@ -381,6 +381,11 @@ mod pipeline_choice_tests {
         let src = format!(r#"input stock: Bundle
 input x: int @ X
 input charge: int @ A
+input choose: bool
+input left: int
+input right: int
+output tail_value: int
+output tail_result: int
 output a: Bundle
 output z: int @ Z
 output steam: bool @ H
@@ -393,23 +398,44 @@ every tick:
     elif charge > 80:
         steam = False
 
+if choose:
+    wait 5
+    tail_value = left
+else:
+    wait 7
+    tail_value = right
+tail_result = (((tail_value * 73) ^ (tail_value >> 3)) * 91) ^ ((tail_value * 127) >> 7)
+
 test "mixed blocks":
+    set choose = 1
+    set left = 123
+    set right = 456
     set stock = Bundle(iron_plate=3)
     set x = 1
     set charge = 10
     run 90 ticks
     assert a == Bundle(iron_plate=6) and z == 21 and steam
+    assert tail_value == 123
+    assert tail_result == (((123 * 73) ^ (123 >> 3)) * 91) ^ ((123 * 127) >> 7)
     set charge = 90
     run 10 ticks
     assert not steam
 "#);
         let opts = Options { opt: Opt::Size, ..Default::default() };
         let chosen = compile(&src, &opts).unwrap();
+        assert!(copy_tails(), "speculative size choices must not leak into the next compilation");
         let module = ticky_syntax::parse(&src).unwrap();
-        let fast = compile_module(&module, &opts, true, &[]).unwrap();
-        let slow = compile_module(&module, &opts, false, &[]).unwrap();
         let count = |c: &Compiled| c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
-        assert!(count(&chosen) < count(&fast).min(count(&slow)));
+        let mut smallest_global = usize::MAX;
+        for copy in [true, false] {
+            COPY_TAILS.with(|c| c.set(copy));
+            for pipeline in [true, false] {
+                let endpoint = compile_module(&module, &opts, pipeline, &[]).unwrap();
+                smallest_global = smallest_global.min(count(&endpoint));
+            }
+        }
+        COPY_TAILS.with(|c| c.set(true));
+        assert!(count(&chosen) < smallest_global);
         assert!(chosen.program.blocks[0].pipe.is_none());
         assert!(chosen.program.blocks[1].pipe.is_some());
         assert!(chosen.cg.netlist.validate(true).is_empty());
