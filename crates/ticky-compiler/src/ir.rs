@@ -464,10 +464,28 @@ fn decide(op: CmpOp, x: Iv, y: Iv) -> Option<bool> {
     }
 }
 
+/// Conservative facts about scalar bit patterns, independent of signed intervals.
+#[derive(Clone, Copy, Default)]
+struct KnownBits {
+    zero: u32,
+    one: u32,
+}
+
+impl KnownBits {
+    fn constant(k: i32) -> Self {
+        Self { zero: !(k as u32), one: k as u32 }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self { zero: self.zero & other.zero, one: self.one & other.one }
+    }
+}
+
 #[derive(Default)]
 pub struct Graph {
     pub nodes: Vec<Op>,
     ivs: Vec<Iv>,
+    bits: Vec<KnownBits>,
     memo: HashMap<Op, V>,
     /// Interval assumed for each source.
     pub src_iv: Vec<Iv>,
@@ -673,6 +691,45 @@ impl Graph {
         }
     }
 
+    fn known_bits(&self, op: &Op, iv: Iv) -> KnownBits {
+        let bits = |v: V| self.bits[v as usize];
+        let mut result = match *op {
+            Op::Const(k) => KnownBits::constant(k),
+            Op::Ar(ar, a, b) => {
+                let (x, y) = (bits(a), bits(b));
+                match ar {
+                    ArOp::And => KnownBits { zero: x.zero | y.zero, one: x.one & y.one },
+                    ArOp::Or => KnownBits { zero: x.zero & y.zero, one: x.one | y.one },
+                    ArOp::Xor => KnownBits { zero: (x.zero & y.zero) | (x.one & y.one), one: (x.zero & y.one) | (x.one & y.zero) },
+                    ArOp::Shl | ArOp::Shr => {
+                        if let Some(k) = self.as_const(b) {
+                            let n = k as u32 & 31;
+                            if ar == ArOp::Shl {
+                                KnownBits { zero: (x.zero << n) | ((1u32 << n) - 1), one: x.one << n }
+                            } else {
+                                // Signed shifts extend a known sign bit into the high bits.
+                                KnownBits { zero: ((x.zero as i32) >> n) as u32, one: ((x.one as i32) >> n) as u32 }
+                            }
+                        } else {
+                            KnownBits::default()
+                        }
+                    }
+                    _ => KnownBits::default(),
+                }
+            }
+            Op::Mux { a, b, .. } => bits(a).join(bits(b)),
+            Op::Sel(ref arms) => arms.iter().fold(KnownBits::constant(0), |acc, (_, v)| acc.join(bits(*v))),
+            _ => KnownBits::default(),
+        };
+        // Every interval shares the prefix above the highest differing endpoint bit.
+        let (lo, hi) = (iv.lo as i32 as u32, iv.hi as i32 as u32);
+        let varying = lo ^ hi;
+        let prefix = if varying == 0 { u32::MAX } else { u32::MAX.checked_shl(32 - varying.leading_zeros()).unwrap_or(0) };
+        result.zero |= !lo & prefix;
+        result.one |= lo & prefix;
+        result
+    }
+
     /// Interns `op` as it is (for rebuilding nodes without simplification).
     pub fn intern_op(&mut self, op: Op) -> V {
         self.intern(op)
@@ -695,7 +752,12 @@ impl Graph {
         if iv.lo == iv.hi && !matches!(op, Op::Const(_) | Op::Each(_)) && !op.is_bundle(&self.src_bun) {
             return self.konst(iv.lo as i32);
         }
+        let bits = if op.is_bundle(&self.src_bun) { KnownBits::default() } else { self.known_bits(&op, iv) };
+        if bits.zero | bits.one == u32::MAX && !matches!(op, Op::Const(_) | Op::Each(_)) && !op.is_bundle(&self.src_bun) {
+            return self.konst(bits.one as i32);
+        }
         let v = self.nodes.len() as V;
+        self.bits.push(bits);
         self.bun.push(op.is_bundle(&self.src_bun));
         self.nodes.push(op.clone());
         self.ivs.push(iv);
@@ -718,8 +780,10 @@ impl Graph {
         if let (Some(x), Some(y)) = (ka, kb) {
             return self.konst(op.apply(x, y));
         }
-        // Constants go second for commutative operators.
-        let (a, b, ka, kb) = if op.commutative() && ka.is_some() { (b, a, kb, ka) } else { (a, b, ka, kb) };
+        // Constants go second; otherwise canonicalize scalar operands for hash-consing.
+        // Comprehension conversion deliberately swaps Each-dependent operands (bundle.rs),
+        // so leave their orientation alone.
+        let (a, b, ka, kb) = if op.commutative() && (ka.is_some() || (kb.is_none() && a > b && !self.uses_each(a) && !self.uses_each(b))) { (b, a, kb, ka) } else { (a, b, ka, kb) };
         let zero = self.konst(0);
         match (op, kb) {
             (ArOp::Add | ArOp::Sub | ArOp::Or | ArOp::Xor, Some(0)) => return a,
@@ -743,6 +807,32 @@ impl Graph {
         }
         if op == ArOp::And && kb == Some(1) && self.is_bool(a) {
             return a;
+        }
+        if let Some(k) = kb {
+            let known = self.bits[a as usize];
+            if (op == ArOp::And && !(k as u32) & !known.zero == 0)
+                || (op == ArOp::Or && k as u32 & !known.one == 0)
+            {
+                return a;
+            }
+            if let Op::Ar(inner, x, cv) = *self.op(a) {
+                if let Some(c) = self.as_const(cv) {
+                    let combined = match (inner, op) {
+                        (ArOp::Add | ArOp::Sub, ArOp::Add | ArOp::Sub) => {
+                            let c = if inner == ArOp::Sub { c.wrapping_neg() } else { c };
+                            let k = if op == ArOp::Sub { k.wrapping_neg() } else { k };
+                            Some((ArOp::Add, c.wrapping_add(k)))
+                        }
+                        (ArOp::Mul, ArOp::Mul) => Some((op, c.wrapping_mul(k))),
+                        (ArOp::And, ArOp::And) | (ArOp::Or, ArOp::Or) | (ArOp::Xor, ArOp::Xor) => Some((op, op.apply(c, k))),
+                        _ => None,
+                    };
+                    if let Some((ar, c)) = combined {
+                        let cv = self.konst(c);
+                        return self.ar(ar, x, cv);
+                    }
+                }
+            }
         }
         // `(x >> j) >> k` is `x >> (j + k)` (both floor divisions by powers of two) while the
         // total stays below 32: `x // 4 // 4`.
@@ -781,14 +871,15 @@ impl Graph {
                 return v;
             }
         }
-        // `x + k <op> c` → `x <op> c - k`, when neither side can wrap: saves a combinator.
+        // Equality offsets cancel modulo 2^32. Ordered comparisons require no wrapping.
+        // `x + k <op> c` → `x <op> c - k` saves a combinator.
         if let (Op::Ar(aop @ (ArOp::Add | ArOp::Sub), x, kv), Some(c)) = (self.op(a).clone(), self.as_const(b)) {
             if let Some(k) = self.as_const(kv) {
                 let k = if aop == ArOp::Add { k as i64 } else { -(k as i64) };
                 let xi = self.iv(x);
                 let c2 = c as i64 - k;
                 let no_wrap = xi.lo + k >= MIN && xi.hi + k <= MAX;
-                if no_wrap && (MIN..=MAX).contains(&c2) {
+                if matches!(op, CmpOp::Eq | CmpOp::Ne) || (no_wrap && (MIN..=MAX).contains(&c2)) {
                     let c2 = self.konst(c2 as i32);
                     return self.cmp(op, x, c2);
                 }
@@ -798,6 +889,7 @@ impl Graph {
         if self.is_bool(a) && matches!((op, self.as_const(b)), (CmpOp::Ne, Some(0)) | (CmpOp::Eq, Some(1)) | (CmpOp::Gt, Some(0))) {
             return a;
         }
+        let (a, b) = if matches!(op, CmpOp::Eq | CmpOp::Ne) && self.as_const(b).is_none() && a > b && !self.uses_each(a) && !self.uses_each(b) { (b, a) } else { (a, b) };
         self.intern(Op::Cmp(op, a, b))
     }
 
@@ -1715,6 +1807,52 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_value_numbering_preserves_comprehension_orientation() {
+        let mut g = Graph::new(vec![Iv::FULL, Iv::FULL]);
+        let x = g.src(0);
+        let y = g.src(1);
+        assert_eq!(g.ar(ArOp::Mul, x, y), g.ar(ArOp::Mul, y, x));
+        assert_eq!(g.cmp(CmpOp::Eq, x, y), g.cmp(CmpOp::Eq, y, x));
+        assert_eq!(g.cmp(CmpOp::Ne, x, y), g.cmp(CmpOp::Ne, y, x));
+        let each = g.intern_op(Op::Each(Iv::FULL));
+        let mapped = g.ar(ArOp::Mul, each, x);
+        assert!(matches!(g.op(mapped), Op::Ar(ArOp::Mul, a, b) if *a == each && *b == x));
+    }
+
+    #[test]
+    fn scalar_bits_and_rewrites_are_sound() {
+        fn eval(g: &Graph, v: V, input: i32) -> i32 {
+            match *g.op(v) {
+                Op::Const(k) => k,
+                Op::Src(_) => input,
+                Op::Ar(op, a, b) => op.apply(eval(g, a, input), eval(g, b, input)),
+                _ => unreachable!(),
+            }
+        }
+        let inputs = [i32::MIN, i32::MAX, -65537, -256, -1, 0, 1, 255, 256, 65537];
+        let ops = [ArOp::Add, ArOp::Sub, ArOp::Mul, ArOp::And, ArOp::Or, ArOp::Xor, ArOp::Shl, ArOp::Shr];
+        let mut g = Graph::new(vec![Iv::FULL]);
+        let x = g.src(0);
+        for &first in &ops {
+            for &second in &ops {
+                for k in [i32::MIN, -1, 0, 1, 8, 31, 32, 33, 255, i32::MAX] {
+                    let kv = g.konst(k);
+                    let a = g.ar(first, x, kv);
+                    let b = g.ar(second, a, kv);
+                    let known = g.bits[b as usize];
+                    assert_eq!(known.zero & known.one, 0);
+                    for input in inputs {
+                        let expected = second.apply(first.apply(input, k), k);
+                        assert_eq!(eval(&g, b, input), expected, "{first:?}, {second:?}, {k}, {input}");
+                        assert_eq!(expected as u32 & known.zero, 0);
+                        assert_eq!(expected as u32 & known.one, known.one);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn folding_and_intervals() {
