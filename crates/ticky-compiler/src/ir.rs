@@ -1638,6 +1638,24 @@ impl Graph {
             }
             return self.bset(b, Graph::slot(k as usize), x);
         }
+        // Explicit read/modify/write is the same sparse delta update as `+=`,
+        // but only when the read uses this exact SSA bundle and index table.
+        // A saved read from an older snapshot (or another index) must not match.
+        // Wrapping addition/subtraction and out-of-range no-op stores preserve
+        // this identity even when the selected slot is absent (implicitly zero).
+        let old = self.aget(b, i, n);
+        let delta = match *self.op(x) {
+            Op::Ar(ArOp::Add, a, d) if a == old => Some(d),
+            Op::Ar(ArOp::Add, d, a) if a == old => Some(d),
+            Op::Ar(ArOp::Sub, a, d) if a == old => {
+                let z = self.konst(0);
+                Some(self.ar(ArOp::Sub, z, d))
+            }
+            _ => None,
+        };
+        if let Some(d) = delta {
+            return self.aadd(b, i, d, n);
+        }
         let h = self.ahot(i, n, 1);
         let z = self.konst(0);
         let keep = BTerm::DFilter(b, h, vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]], FOut::Copy);

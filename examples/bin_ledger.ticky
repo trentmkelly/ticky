@@ -1,0 +1,54 @@
+# Inventory ledger: saved reads feed additive stores, with both old and new reports.
+# Unlike histogram's +=, an explicit read/modify/write must prove the read belongs
+# to exactly this array snapshot and index before it can become a sparse update.
+input pick: int @ P
+input amount: int @ A
+input strobe: bool @ S
+output before: int @ B
+output after: int @ C
+output total: int @ T
+output stock: int @ V
+bins = [0] * 64
+
+every tick:
+    stock = bins[pick]
+    total = sum(bins)
+
+while True:
+    wait until strobe
+    previous = bins[pick]
+    before = previous
+    bins[pick] = previous + amount
+    after = bins[pick]
+    wait until not strobe
+
+test "receipts, cancellations, and wrapping stock":
+    set pick = 7
+    set amount = 19
+    set strobe = True
+    run 80 ticks
+    assert before == 0 and after == 19 and total == 19 and stock == 19
+    set strobe = False
+    run 40 ticks
+    set amount = -19
+    set strobe = True
+    run 80 ticks
+    assert before == 19 and after == 0 and total == 0 and stock == 0
+    set strobe = False
+    run 40 ticks
+    set pick = 63
+    set amount = 2147483647
+    set strobe = True
+    run 80 ticks
+    assert before == 0 and after == 2147483647 and total == 2147483647
+    set strobe = False
+    run 40 ticks
+    set amount = 1
+    set strobe = True
+    run 80 ticks
+    assert before == 2147483647 and after == -2147483648 and total == -2147483648
+    set strobe = False
+    run 40 ticks
+    set pick = 7
+    run 40 ticks
+    assert stock == 0
