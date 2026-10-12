@@ -41,15 +41,15 @@ pub(super) fn pipelined_block(
     let mut best: Option<(usize, Cg, Built)> = None;
     let mut err = None;
     for (ti, tau) in pipe.taus.iter().enumerate() {
-        for inline in [false, true] {
+        for (inline, economical) in [(false, false), (true, false), (false, true), (true, true)] {
             for stages in 0.. {
                 let mut trial = cg.clone();
-                let shape = Shape { tau, stages, inline };
+                let shape = Shape { tau, stages, inline, economical };
                 let used = match build(&mut trial, p, bi, b, pipe, &shape, shared, live, comb) {
                     Ok((r, used)) => {
                         let n = trial.combinators_since(first);
                         if std::env::var_os("TICKY_DUMP_PIPE").is_some() {
-                            eprintln!("block {}: schedule {ti}, inline {inline}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
+                            eprintln!("block {}: schedule {ti}, inline {inline}, economical {economical}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
                         }
                         if best.as_ref().is_none_or(|(m, _, _)| n < *m) {
                             best = Some((n, trial, r));
@@ -86,6 +86,8 @@ struct Shape<'a> {
     /// Whether conditions used only to choose constants are tested by the select's deciders
     /// themselves (reading their operands a tick later) rather than built.
     inline: bool,
+    /// Cost delayed reads and permit two carry ages on separate wire colors.
+    economical: bool,
 }
 
 /// Builds the block. Also returns how many carry wires it built.
@@ -151,6 +153,8 @@ fn build(
         src_ref: &src_ref,
         what: &what,
         stages,
+        economical: shape.economical,
+        green_carry: HashMap::new(),
         carry: Vec::new(),
         first: None,
         carried: HashSet::new(),
@@ -426,9 +430,16 @@ fn dl_terms(d: &crate::ir::Dnf, r: &[(Operand, Nets)], cond: &dyn Fn((Operand, N
 
 /// Operands as read by one combinator (each with the wires to read it on), and the carry
 /// wire to connect to its red input.
-type Reads = (Vec<(Operand, Nets)>, Option<usize>);
+type Reads = (Vec<(Operand, Nets)>, Connections);
+
+#[derive(Default)]
+struct Connections {
+    red: Option<usize>,
+    green: Option<usize>,
+}
 
 /// Operands delayed to their consumer's iteration (see the module docs).
+#[derive(Clone)]
 struct Delays<'a> {
     g: &'a Graph,
     tau: &'a [Option<i32>],
@@ -437,6 +448,8 @@ struct Delays<'a> {
     what: &'a str,
     /// How many carry wires may be built.
     stages: usize,
+    economical: bool,
+    green_carry: HashMap<usize, usize>,
     /// Nets of the carry wires built so far: `carry[d - 1]` holds the bus `d` ticks ago.
     carry: Vec<usize>,
     /// The decider copying signals off the bus onto the first carry wire.
@@ -564,13 +577,62 @@ impl Delays<'_> {
             }
         }
         let pick = by_delay.iter().max_by_key(|(d, us)| (us.len(), **d)).map(|(d, _)| *d);
+        if !self.economical {
+            return self.read_from(cg, ops, pick, None);
+        }
+        // Trial marginal costs, including previously materialized taps and extending
+        // carry chains. Keep the legacy choice first as the deterministic tie-break.
+        let mut choices = vec![(pick, None), (None, None)];
+        choices.extend(by_delay.keys().rev().take(6).map(|&d| (Some(d), None)));
+        // No current-bus values may be needed when both colors carry old buses.
+        if by_delay.len() == 2 && ops.iter().all(|&(u, at)| {
+            matches!(self.base(u), Ref::Op(Operand::Const(_)))
+                || self.delayed(u, at).is_some_and(|(_, d)| by_delay.contains_key(&d))
+        }) {
+            let mut ds = by_delay.keys();
+            choices.push((Some(*ds.next().unwrap()), Some(*ds.next().unwrap())));
+        }
+        let first = cg.net.entities.len();
+        let mut best = None;
+        let mut error = None;
+        for (red, green) in choices {
+            let mut trial = cg.clone();
+            let mut delays = self.clone();
+            match delays.read_from(&mut trial, ops, red, green) {
+                Ok(reads) => {
+                    let cost = trial.combinators_since(first);
+                    if best.as_ref().is_none_or(|(n, _, _, _)| cost < *n) {
+                        best = Some((cost, trial, delays, reads));
+                    }
+                }
+                Err(e) => { error.get_or_insert(e); }
+            }
+        }
+        let (_, trial, delays, reads) = best.ok_or_else(|| error.unwrap())?;
+        *cg = trial;
+        *self = delays;
+        Ok(reads)
+    }
+
+    fn read_from(&mut self, cg: &mut Cg, ops: &[(V, i32)], pick: Option<i32>, green: Option<i32>) -> Result<Reads, Diag> {
         let mut out = Vec::new();
-        let mut red = None;
+        let mut links = Connections::default();
         for &(u, at) in ops {
             match self.delayed(u, at) {
                 Some((s, d)) if Some(d) == pick => {
-                    red = Some(self.wire(cg, s, d as usize));
+                    links.red = Some(self.wire(cg, s, d as usize));
                     out.push((Operand::Sig(s), Nets::RED));
+                }
+                Some((s, d)) if Some(d) == green => {
+                    let red_net = self.wire(cg, s, d as usize);
+                    let net = *self.green_carry.entry(d as usize).or_insert_with(|| {
+                        // The stage's output is available on both colors without a copy.
+                        let producer = cg.nets[red_net].members.iter().find(|(_, c)| *c == Conn::OutRed).unwrap().0;
+                        cg.nets.push(NetSpec { red: false, members: vec![(producer, Conn::OutGreen)] });
+                        cg.nets.len() - 1
+                    });
+                    links.green = Some(net);
+                    out.push((Operand::Sig(s), Nets::GREEN));
                 }
                 _ => {
                     let o = self.at(cg, u, at)?.op();
@@ -578,13 +640,18 @@ impl Delays<'_> {
                 }
             }
         }
-        Ok((out, red))
+        Ok((out, links))
     }
 
-    /// Connects a combinator built from [`Delays::read`] operands to its carry wire.
-    fn attach(&self, cg: &mut Cg, id: EntId, red: Option<usize>) {
-        if let Some(n) = red {
+    /// Connect private carry inputs, replacing the ordinary bus input when both
+    /// colors are used. Outputs remain on the bus.
+    fn attach(&self, cg: &mut Cg, id: EntId, links: Connections) {
+        if let Some(n) = links.red {
             cg.nets[n].members.push((id, Conn::InRed));
+        }
+        if let Some(n) = links.green {
+            cg.nets[0].members.retain(|&(e, c)| e != id || c != Conn::InGreen);
+            cg.nets[n].members.push((id, Conn::InGreen));
         }
     }
 }
@@ -664,6 +731,74 @@ impl Cg {
             _ if n == 0 => vec![rp],
             Some((w, _)) => vec![rp, c(w, CmpOp::Ge, n as i32 + 1)],
             None => vec![c(self.warm.chain[n - 1], CmpOp::Ne, 0)],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::Iv;
+
+    fn delayed_xor(economical: bool, cached: bool) -> (Netlist, EntId, EntId, Sig, Sig, Sig, usize, bool) {
+        let t = SignalTable::base();
+        let mut pool: std::collections::VecDeque<Sig> = t.internal_pool().into();
+        let (run, rp, st, x, y, out) = (pool.pop_front().unwrap(), pool.pop_front().unwrap(), pool.pop_front().unwrap(), pool.pop_front().unwrap(), pool.pop_front().unwrap(), pool.pop_front().unwrap());
+        let mut cg = Cg {
+            net: Netlist::default(), nets: vec![NetSpec { red: false, members: Vec::new() }], pool, used: 6,
+            run, rp, st, warm: Default::default(), bvals: Vec::new(), each: t.special("signal-each"),
+            everything: t.special("signal-everything"), err: None, pending: Vec::new(), egs: Vec::new(),
+        };
+        let input = cg.net.add(Kind::Constant(ConstComb { values: vec![(x, 1), (y, 2)], on: true }), Role::Core);
+        cg.nets[0].members.push((input, Conn::Green));
+        let mut g = Graph::new(vec![Iv::FULL, Iv::FULL]);
+        let a = g.src(0);
+        let b = g.src(1);
+        let tau = [Some(-2), Some(-5)];
+        let refs = [Ref::Op(Operand::Sig(x)), Ref::Op(Operand::Sig(y))];
+        let nodes = HashMap::new();
+        let mut dl = Delays { g: &g, tau: &tau, node_ref: &nodes, src_ref: &refs, what: "probe", stages: 5,
+            economical, green_carry: HashMap::new(), carry: Vec::new(), first: None, carried: HashSet::new(), bus: HashMap::new() };
+        dl.wire(&mut cg, x, 5);
+        dl.wire(&mut cg, y, 5);
+        if cached { dl.at(&mut cg, b, 0).unwrap(); }
+        let before = cg.net.entities.len();
+        let (r, links) = dl.read(&mut cg, &[(a, 0), (b, 0)]).unwrap();
+        let added = cg.net.entities.len() - before;
+        let dual = links.green.is_some();
+        let id = cg.core(Kind::Arith(Arith { first: r[0].0, first_nets: r[0].1, second: r[1].0, second_nets: r[1].1, op: ArOp::Xor, out }), "probe xor");
+        dl.attach(&mut cg, id, links);
+        for net in &cg.nets {
+            for pair in net.members.windows(2) { cg.net.wire(pair[0], pair[1]); }
+        }
+        (cg.net, input, id, x, y, out, added, dual)
+    }
+
+    #[test]
+    fn two_carry_ages_remove_a_tap_without_changing_ticks() {
+        compare_delayed_xor(false);
+    }
+
+    #[test]
+    fn marginal_carry_choice_reuses_an_existing_tap() {
+        compare_delayed_xor(true);
+    }
+
+    fn compare_delayed_xor(cached: bool) {
+        let (old, input0, out0, x, y, out, added0, _) = delayed_xor(false, cached);
+        let (new, input1, out1, _, _, _, added1, dual) = delayed_xor(true, cached);
+        assert_eq!((added0, added1), (1, 0));
+        assert_eq!(dual, !cached);
+        let mut old = ticky_sim::Sim::new(&old);
+        let mut new = ticky_sim::Sim::new(&new);
+        for tick in 0i32..80 {
+            // Include zeros, negatives, and a quiet interval then restart.
+            let values = if (30..38).contains(&tick) { vec![] } else { vec![(x, tick * 71 - 1000), (y, tick.wrapping_mul(123456789))] };
+            old.set_constant_values(input0, values.clone());
+            new.set_constant_values(input1, values);
+            old.step();
+            new.step();
+            assert_eq!(old.output_of(out0, out), new.output_of(out1, out), "tick {tick}, cached {cached}");
         }
     }
 }
