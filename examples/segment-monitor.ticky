@@ -1,0 +1,42 @@
+# Dim segments remain visible underneath a live four-digit instrument readout.
+# Unlike a blank dashboard, this redraw starts with a sparse, multicolour background.
+import display
+
+input reading: int @ R = port("Instrument reading")
+output face: display.Screen(15, 6) = port("Segment monitor")
+
+DIM = 0x181818
+BRIGHT = 0x40FF40
+
+every tick:
+    face.fill(0)
+    face.text(0, 0, "8888", DIM)
+    face.hline(0, 5, 15, 0x204060)
+    # Clamp extreme sensor faults before formatting; values outside four digits show overflow.
+    face.number(0, 0, clamp(reading, -99999, 99999), BRIGHT, width=4)
+
+test "segments follow changing readings":
+    set reading = 123
+    run 80 ticks
+    assert face[0, 0] == DIM
+    assert face[4, 0] == DIM
+    assert face[5, 0] == BRIGHT
+    assert face[8, 0] == BRIGHT
+    assert face[3, 0] == 0
+    assert face[0, 5] == 0x204060
+    set reading = -42
+    run 80 ticks
+    assert face[4, 2] == BRIGHT
+    assert face[5, 0] == DIM
+    assert face[8, 0] == BRIGHT
+    set reading = 0
+    run 80 ticks
+    assert face[4, 2] == DIM
+    assert face[13, 2] == DIM
+    assert face[12, 0] == BRIGHT
+    set reading = 2147483647
+    run 80 ticks
+    assert face[1, 1] == BRIGHT
+    set reading = -2147483648
+    run 80 ticks
+    assert face[1, 1] == BRIGHT

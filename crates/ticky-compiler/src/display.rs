@@ -1296,6 +1296,18 @@ fn paint(g: &mut crate::ir::Graph, bank: crate::ir::V, mask: crate::ir::V, c: cr
         let table = g.as_bconst(bank).unwrap().to_vec();
         return g.bun(vec![BTerm::K(table), BTerm::Map(ArOp::Mul, mask, delta)]);
     }
+    // A fixed colour over any constant image also has a constant per-pixel delta.
+    // Include blank slots: their delta is -c, even though zero pixels are absent
+    // from the sparse background bundle. Arithmetic wraps just like the circuit.
+    if let (Some(background), Some(colour)) = (g.as_bconst(bank).filter(|b| !b.is_empty()), g.as_const(c)) {
+        let background = background.to_vec();
+        let values: std::collections::HashMap<_, _> = background.iter().copied().collect();
+        let delta = g.bconst((0..nb).map(|i| {
+            let slot = crate::ir::Graph::slot(i);
+            (slot, values.get(&slot).copied().unwrap_or(0).wrapping_sub(colour))
+        }));
+        return g.bun(vec![BTerm::K(background), BTerm::Zip(ArOp::Mul, mask, delta)]);
+    }
     let z = g.konst(0);
     let neg_c = g.ar(ArOp::Sub, z, c);
     if g.as_bconst(bank).is_some_and(|b| b.is_empty()) {
