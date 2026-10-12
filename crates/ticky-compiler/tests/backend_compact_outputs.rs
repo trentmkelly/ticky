@@ -19,19 +19,21 @@ fn compact_west_outputs_save_one_gate_and_one_tick() {
         let mut n = Harness::new(&normal);
         let mut c = Harness::new(&compact);
         let mut previous: Vec<_> = outs.iter().map(|&p| c.get(p)).collect();
+        let mut saw_error = false;
         for tick in 0..100 {
             let on = !matches!(tick, 11 | 26..=31 | 61..=63);
             n.sim.set_constant_on(normal.cg.run_switch, on);
             c.sim.set_constant_on(compact.cg.run_switch, on);
             for h in [&mut n, &mut c] {
-                h.set(0, PVal::Int((tick * 17) % 31 - 15));
+                h.set(0, PVal::Int(if tick >= 80 { 3 } else { (tick * 17) % 31 - 15 }));
                 h.set(1, PVal::Bun(vec![(normal.program.ports[0].sig, tick - 40)]));
                 h.sim.step();
             }
             assert_eq!(outs.iter().map(|&p| n.get(p)).collect::<Vec<_>>(), previous, "tick {tick}");
             previous = outs.iter().map(|&p| c.get(p)).collect();
+            saw_error |= c.get(compact.program.error_port.unwrap()) != PVal::Int(0);
         }
+        assert!(saw_error, "the trace must exercise a nonzero error output");
     }
     assert!(compile(src, &Options { compact_outputs: true, ..Default::default() }).is_err());
 }
-

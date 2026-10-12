@@ -1428,3 +1428,15 @@ and control networks to the gate, keeping the externally connectable output isol
 `backend_compact_outputs` checks scalar, bundle and active error outputs, exact one-tick
 trace equivalence under RUN interruptions, one combinator saved per port, and powered
 layout validation with grid and annealed placement.
+
+## 2026-10-12: peripheral hold elimination rejected
+
+A fully redrawn, zero-initialized `every tick` screen still needs its hold to preserve
+existing restart behavior. Short RUN interruptions can cause a delayed commit-enable
+bubble while RUN is high. Removing the hold makes a visible pixel briefly zero where
+it previously kept its last value. This occurs with both startup-delay chains and the
+saturating-counter warmup, so restricting the optimization to counter warmup is not safe.
+No hold-elision code was retained. `backend_peripheral_holds` records two exact traces:
+`s.fill(x)` retains -116 at zero-based tick 16; `s.fill(x * 3 + 1)` retains 4609 at tick
+254 of the deterministic restart sequence. Both became zero with the attempted elision.
+Future work must prove a stronger enable invariant or explicitly change restart semantics.
