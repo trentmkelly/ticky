@@ -1827,8 +1827,16 @@ fn prune_dead_stores(ctx: &Ctx, elsewhere: &BTreeSet<&String>, g: &Graph, srcs: 
     if std::env::var_os("TICKY_NO_DEAD_STORES").is_some() {
         return;
     }
+    // Return slots and expression temporaries are private transport, not externally
+    // observable state. Demand follows their consumers (including every continuation
+    // of a shared subroutine). Keep other generated state, notably array banks, pinned.
+    let private_transport = |name: &str| {
+        let local = name.rsplit_once(':').map_or(name, |(_, local)| local);
+        local.rsplit_once(".#ret").is_some_and(|(_, suffix)| suffix.bytes().all(|c| c.is_ascii_digit()))
+            || local.strip_prefix("#t").is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
+    };
     let observable: BTreeSet<usize> = ctx.states.iter().enumerate()
-        .filter(|(_, s)| s.port.is_some() || elsewhere.contains(&s.name) || s.name.contains('#'))
+        .filter(|(_, s)| s.port.is_some() || elsewhere.contains(&s.name) || (s.name.contains('#') && !private_transport(&s.name)))
         .map(|(i, _)| i).collect();
     let reads = |roots: &[V]| -> BTreeSet<usize> {
         g.reachable(roots).into_iter().filter_map(|v| match g.op(v) {

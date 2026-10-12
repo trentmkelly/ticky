@@ -1,0 +1,32 @@
+# Forecast total production from two lines ramping their rate each cycle.
+# The reusable statistics helper also returns the second moment, useful for
+# variance estimates; this display only needs total production.
+input rate: int @ R
+output total: int @ T
+
+def ramp_moments(start, cycles):
+    amount = 0
+    squares = 0
+    for i in range(cycles):
+        value = start + i
+        amount += value
+        squares += value * value
+    return amount, squares
+
+while True:
+    sampled_rate = rate
+    first, second_moment = ramp_moments(sampled_rate, 4)
+    second, second_moment = ramp_moments(sampled_rate + 2, 3)
+    total = first + second
+    wait 1
+
+test "ramping production totals":
+    set rate = 5
+    run 600 ticks
+    assert total == 50
+    set rate = 11
+    run 600 ticks
+    assert total == 92
+    set rate = -3
+    run 600 ticks
+    assert total == -6
