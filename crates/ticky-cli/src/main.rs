@@ -112,6 +112,10 @@ struct Placement {
     /// row, after the inputs).
     #[arg(long, value_parser = parse_side)]
     outputs: Option<Side>,
+    /// With --ports=ns --outputs=west, move each gate to its port, saving one combinator
+    /// and one tick of output latency. The default keeps the existing return buffers.
+    #[arg(long)]
+    compact_outputs: bool,
     /// How to place the combinators: `grid` (default) or `anneal` (experimental: simulated
     /// annealing for a smaller footprint).
     #[arg(long, default_value = "grid", value_parser = ["grid", "anneal"])]
@@ -259,7 +263,7 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
             (n.clone(), side)
         })
         .collect();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone() };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, compact_outputs: place.compact_outputs, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone() };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -473,7 +477,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new() }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, compact_outputs: false, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new() }
 }
 
 fn main() -> ExitCode {

@@ -496,6 +496,10 @@ in-game description.
   - `--outputs=west`: outputs at the west edge too, north of the blueprint, each fed from a
     gate on the east edge by a line of poles (with `--place=anneal`, the gates are placed
     like any other combinator and wired to their ports directly, with relays as needed);
+  - `--compact-outputs` with `--ports=ns --outputs=west`: put the RUN gate directly at
+    each output port, without an extra return buffer. Saves one combinator per output;
+    outputs (including stop/reset changes) arrive **one tick earlier** than ordinary west
+    outputs. Internal process timing is unchanged. Routing may require additional poles.
   - `--ports=ew`: ports in rows instead of columns, first port westernmost: the RUN switch
     (above the error lamp) and the inputs along the north edge (facing south), the outputs
     along the south edge (`--outputs=south`, default) or continuing the north row

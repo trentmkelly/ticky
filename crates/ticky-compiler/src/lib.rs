@@ -76,6 +76,9 @@ pub struct Options {
     /// where the output port would be (annealed: by a gate placed like the rest). With E-W
     /// ports: in the north row, after the inputs.
     pub outputs_west: bool,
+    /// With west-facing N-S outputs, put the gate at the port and omit its return buffer.
+    /// This saves one combinator and one tick of output latency per port.
+    pub compact_outputs: bool,
     /// Ports in rows (E-W): inputs (and `outputs_west` outputs) along the north edge, other
     /// outputs along the south edge, first port westernmost. Otherwise columns (N-S).
     pub ports_ew: bool,
@@ -99,7 +102,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new() }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, compact_outputs: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new() }
     }
 }
 
@@ -163,7 +166,10 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     let t = std::time::Instant::now();
     let mut program = program::analyze_with_pipelines(module, pipeline, choices)?;
     // Gates and return lines only for N-S ports with the outputs on the west.
-    let gates = opts.outputs_west && !opts.ports_ew;
+    if opts.compact_outputs && (!opts.outputs_west || opts.ports_ew) {
+        return Err(vec![Diag::error(Default::default(), "compact outputs require --ports=ns --outputs=west")]);
+    }
+    let gates = opts.outputs_west && !opts.ports_ew && !opts.compact_outputs;
     let mut cg = codegen::codegen(&program, opts.autostart, gates).map_err(|d| vec![d])?;
     program::timing("codegen", t);
     let mut warnings = Vec::new();

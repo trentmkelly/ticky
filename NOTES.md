@@ -1416,3 +1416,15 @@ all bank slots, and wrapping arithmetic, zero colours and clipped shapes are pre
 `backend_display_paint`: a uniform/nonuniform comparison saves exactly one combinator,
 pixel checks include zero, matching-background, negative and MIN colours, and a changing
 input trace checks that coordinates and colour stay in the same pipeline iteration.
+
+## 2026-10-12: opt-in compact west outputs
+
+`--compact-outputs` (compiler `Options.compact_outputs`) requires `--ports=ns
+--outputs=west`. The RUN gate sits directly at each west-facing port; the extra return
+buffer and its dedicated pole line disappear. Normal west output behavior stays the
+default. Compact outputs arrive one tick earlier, including RUN/stop and error-output
+changes; internal process timing is unchanged. Existing layout wiring routes the source
+and control networks to the gate, keeping the externally connectable output isolated.
+`backend_compact_outputs` checks scalar, bundle and active error outputs, exact one-tick
+trace equivalence under RUN interruptions, one combinator saved per port, and powered
+layout validation with grid and annealed placement.
