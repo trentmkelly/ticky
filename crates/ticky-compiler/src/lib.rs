@@ -27,12 +27,18 @@ pub use codegen::Codegen;
 
 thread_local! {
     static CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COPY_TAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static SIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether this compilation is `--opt=size`: set by [`compile`].
 pub fn opt_size() -> bool {
     SIZE.with(|c| c.get())
+}
+
+/// Whether CFG fusion may duplicate a successor with multiple predecessors.
+pub(crate) fn copy_tails() -> bool {
+    COPY_TAILS.with(|c| c.get())
 }
 
 /// Whether this compilation has runtime checks (`--checks`): set by [`compile`].
@@ -113,16 +119,26 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     ticky_factorio::items::set_space_age(opts.space_age);
     set_checks(opts.checks);
     SIZE.with(|c| c.set(opts.opt == Opt::Size));
+    COPY_TAILS.with(|c| c.set(true));
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
     let fast = compile_module(&module, opts, true)?;
     if opts.opt == Opt::Speed {
         return Ok(fast);
     }
-    // Pipelining sometimes saves combinators (no sample registers or clocks), sometimes
-    // costs them (delay chains): build both and keep the smaller.
-    let slow = compile_module(&module, opts, false)?;
+    // Compare emitted circuits, not source statement counts: both pipelining and
+    // copying a shared tail can either save registers/control or duplicate expensive
+    // logic. Single-predecessor fusion is always retained in all four candidates.
     let count = |c: &Compiled| c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
-    Ok(if count(&slow) < count(&fast) { slow } else { fast })
+    let mut best = fast;
+    for (copy, pipeline) in [(true, false), (false, true), (false, false)] {
+        COPY_TAILS.with(|c| c.set(copy));
+        // A speculative alternative can exceed the signal pool; keep the valid circuit.
+        if let Ok(candidate) = compile_module(&module, opts, pipeline) {
+            if count(&candidate) < count(&best) { best = candidate; }
+        }
+    }
+    COPY_TAILS.with(|c| c.set(true));
+    Ok(best)
 }
 
 fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool) -> Result<Compiled, Vec<Diag>> {

@@ -437,7 +437,7 @@ fn fuse(steps: &mut [Draft], protected: &[usize]) {
             // jump, so each gets a copy and `b` goes): a copy for some predecessors saves
             // those paths a step (2 ticks) but adds code.
             let partial = || steps.iter().filter(|d| matches!(d.term, Term::Goto(Some(t)) if t == b)).count() != preds(steps, b);
-            if !only && (steps[b].stmts.len() > MAX_COPY || budget == 0 || crate::opt_size() && partial()) {
+            if !only && (!crate::copy_tails() || steps[b].stmts.len() > MAX_COPY || budget == 0 || crate::opt_size() && partial()) {
                 continue;
             }
             if !only {
