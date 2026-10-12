@@ -58,7 +58,7 @@ pub enum Opt {
     /// Fastest circuits: `every tick:` blocks run every tick where possible.
     #[default]
     Speed,
-    /// Fewest combinators: no pipelining (blocks run every few ticks instead).
+    /// Fewest combinators: compare pipelining and periodic evaluation, including mixed blocks.
     Size,
 }
 
@@ -121,29 +121,47 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     SIZE.with(|c| c.set(opts.opt == Opt::Size));
     COPY_TAILS.with(|c| c.set(true));
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
-    let fast = compile_module(&module, opts, true)?;
+    let fast = compile_module(&module, opts, true, &[])?;
     if opts.opt == Opt::Speed {
         return Ok(fast);
     }
-    // Compare emitted circuits, not source statement counts: both pipelining and
-    // copying a shared tail can either save registers/control or duplicate expensive
-    // logic. Single-predecessor fusion is always retained in all four candidates.
+    // Preserve all four global candidates before trying mixed pipeline choices.
+    // Both shared-tail duplication and pipelining can save or cost combinators.
     let count = |c: &Compiled| c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
+    let eligible: Vec<usize> = fast.program.blocks.iter().enumerate().filter_map(|(i, b)| b.pipe.as_ref().map(|_| i)).collect();
+    let block_count = fast.program.blocks.len();
     let mut best = fast;
+    let (mut best_copy, mut best_pipeline) = (true, true);
     for (copy, pipeline) in [(true, false), (false, true), (false, false)] {
         COPY_TAILS.with(|c| c.set(copy));
         // A speculative alternative can exceed the signal pool; keep the valid circuit.
-        if let Ok(candidate) = compile_module(&module, opts, pipeline) {
-            if count(&candidate) < count(&best) { best = candidate; }
+        if let Ok(candidate) = compile_module(&module, opts, pipeline, &[]) {
+            if count(&candidate) < count(&best) {
+                best = candidate;
+                (best_copy, best_pipeline) = (copy, pipeline);
+            }
+        }
+    }
+    COPY_TAILS.with(|c| c.set(best_copy));
+    let mut choices = vec![best_pipeline; block_count];
+    // A bounded coordinate search includes shared clocks/start-up/ports in the cost,
+    // retaining the winning shared-tail policy. Failed alternatives leave it intact.
+    if eligible.len() > 1 {
+        for &bi in eligible.iter().take(8) {
+            choices[bi] = !choices[bi];
+            match compile_module(&module, opts, best_pipeline, &choices) {
+                Ok(candidate) if count(&candidate) < count(&best) => best = candidate,
+                _ => choices[bi] = !choices[bi],
+            }
         }
     }
     COPY_TAILS.with(|c| c.set(true));
     Ok(best)
 }
 
-fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool) -> Result<Compiled, Vec<Diag>> {
+fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool, choices: &[bool]) -> Result<Compiled, Vec<Diag>> {
     let t = std::time::Instant::now();
-    let mut program = program::analyze(module, pipeline)?;
+    let mut program = program::analyze_with_pipelines(module, pipeline, choices)?;
     // Gates and return lines only for N-S ports with the outputs on the west.
     let gates = opts.outputs_west && !opts.ports_ew;
     let mut cg = codegen::codegen(&program, opts.autostart, gates).map_err(|d| vec![d])?;
@@ -349,5 +367,52 @@ impl Compiled {
             self.cg.signals_used
         ));
         out
+    }
+}
+
+#[cfg(test)]
+mod pipeline_choice_tests {
+    use super::*;
+
+    #[test]
+    fn size_can_mix_pipeline_and_period_blocks() {
+        let mut expr = "x".to_string();
+        for k in 7..19 { expr = format!("(({expr}) * x) ^ {k}"); }
+        let src = format!(r#"input stock: Bundle
+input x: int @ X
+input charge: int @ A
+output a: Bundle
+output z: int @ Z
+output steam: bool @ H
+every tick:
+    a = stock * 2
+    z = {expr}
+every tick:
+    if charge < 20:
+        steam = True
+    elif charge > 80:
+        steam = False
+
+test "mixed blocks":
+    set stock = Bundle(iron_plate=3)
+    set x = 1
+    set charge = 10
+    run 90 ticks
+    assert a == Bundle(iron_plate=6) and z == 21 and steam
+    set charge = 90
+    run 10 ticks
+    assert not steam
+"#);
+        let opts = Options { opt: Opt::Size, ..Default::default() };
+        let chosen = compile(&src, &opts).unwrap();
+        let module = ticky_syntax::parse(&src).unwrap();
+        let fast = compile_module(&module, &opts, true, &[]).unwrap();
+        let slow = compile_module(&module, &opts, false, &[]).unwrap();
+        let count = |c: &Compiled| c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
+        assert!(count(&chosen) < count(&fast).min(count(&slow)));
+        assert!(chosen.program.blocks[0].pipe.is_none());
+        assert!(chosen.program.blocks[1].pipe.is_some());
+        assert!(chosen.cg.netlist.validate(true).is_empty());
+        for r in crate::testrun::run_tests(&chosen, &src) { assert!(r.failure.is_none(), "{:?}", r.failure); }
     }
 }

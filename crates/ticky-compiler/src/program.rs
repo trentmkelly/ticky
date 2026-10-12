@@ -731,6 +731,11 @@ pub fn timing(what: &str, since: std::time::Instant) {
 }
 
 pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
+    analyze_with_pipelines(m, pipeline, &[])
+}
+
+/// Optional per-block choices; omitted entries use `pipeline`.
+pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Program, Vec<Diag>> {
     let t = std::time::Instant::now();
     let mut m = m.clone();
     crate::strconst::substitute(&mut m)?;
@@ -742,7 +747,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
-    let mut p = analyze_expanded(&expanded, pipeline)?;
+    let mut p = analyze_expanded(&expanded, pipeline, choices)?;
     p.screens = screens;
     p.random = random;
     p.controls = controls;
@@ -752,7 +757,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     Ok(p)
 }
 
-fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
+fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Program, Vec<Diag>> {
     let t0 = std::time::Instant::now();
     let table = SignalTable::base();
     let mut errs = Vec::new();
@@ -1039,6 +1044,7 @@ fn analyze_expanded(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
     let mut blocks = Vec::new();
     let mut warnings = Vec::new();
     for (bi, (stmt, period, body)) in every.iter().enumerate() {
+        let pipeline = choices.get(bi).copied().unwrap_or(pipeline);
         // Readouts' drawing blocks (`display::NATURAL`): as often as they can, unpipelined.
         let natural = matches!(period, Some(Expr { kind: ExprKind::Name(n), .. }) if n == crate::display::NATURAL);
         let requested = match period {

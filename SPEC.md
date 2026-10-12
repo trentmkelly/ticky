@@ -875,7 +875,8 @@ work and bundle/array operations scale far better.
 - `--opt=speed` (default) pipelines `every tick:` blocks wherever possible.
 - `--opt=size` builds the program with and without pipelining and keeps whichever uses fewer
   combinators (pipelining sometimes saves combinators, since it needs no sample registers or
-  clocks, and sometimes costs them, in delay chains).
+  clocks, and sometimes costs them, in delay chains). It then tries up to eight per-block
+  pipeline choices, keeping a change only when the complete circuit gets smaller.
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
 
 Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so
