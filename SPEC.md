@@ -370,6 +370,13 @@ is a constant. Constant expressions may call functions with constant arguments. 
 no hardware unless used as a runtime value, in which case they become a constant combinator or a
 combinator's literal operand. `ALL_CAPS` is conventional but not required.
 
+A module-level name assigned once from a string literal is a **string constant**:
+`QUALITY = "legendary"`. It can be used wherever a quoted string can (signal names, `type=`,
+`quality=`, port labels, `quality.set(b, Q)`), so one setting at the top can choose, say, the
+quality of every signal a program names: `S("holmium-plate", quality=QUALITY)`. It is replaced
+by its text before compiling; using one as a value, assigning it again or making it a
+parameter is an error.
+
 ---
 
 ## 5. Expressions and operators
