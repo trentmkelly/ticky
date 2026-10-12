@@ -336,11 +336,11 @@ impl<'g> Fuser<'g> {
                     }
                 }
             }
-            Op::Ar(ArOp::Add, x, y) => match self.count_sum(v) {
+            Op::Ar(op @ (ArOp::Add | ArOp::Sub), x, y) => match self.count_sum(v) {
                 Some(r) => r,
                 None => {
                     let (x, y) = (self.rebuild(x), self.rebuild(y));
-                    self.g.ar(ArOp::Add, x, y)
+                    self.g.ar(op, x, y)
                 }
             },
             Op::Ar(op, x, y) => {
