@@ -156,7 +156,7 @@ pub struct Block {
     pub pipe: Option<crate::pipeline::Pipe>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Next {
     /// `None` halts the process.
     Goto(Option<usize>),
@@ -167,14 +167,14 @@ pub enum Next {
     Return { func: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WaitN {
     Const(i32),
     /// `n - 2`, compared against the step timer.
     Dyn(V),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StepKind {
     Run(Next),
     WaitUntil(CondPlan, Option<usize>),
@@ -1731,6 +1731,74 @@ fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: 
     map
 }
 
+/// Normalize the lowered CFG, where constant folding has exposed additional empty jumps.
+/// Checks are observable actions even when the step has no variable writes.
+fn simplify_steps(steps: &mut [Step], mut entry: usize) -> usize {
+    fn retarget(kind: &mut StepKind, resolve: &impl Fn(Option<usize>) -> Option<usize>) {
+        match kind {
+            StepKind::Run(Next::Goto(t)) | StepKind::WaitUntil(_, t) | StepKind::WaitTicks(_, t) => *t = resolve(*t),
+            StepKind::Run(Next::Branch(_, a, b)) => { *a = resolve(*a); *b = resolve(*b); }
+            StepKind::Run(Next::Call { entry, cont, .. }) => {
+                *entry = resolve(Some(*entry)).unwrap_or(*entry);
+                *cont = resolve(*cont);
+            }
+            StepKind::Run(Next::Return { .. }) => {}
+        }
+    }
+    loop {
+        let resolve = |mut t: Option<usize>| {
+            let mut path = Vec::new();
+            while let Some(i) = t {
+                if let Some(start) = path.iter().position(|&p| p == i) {
+                    // Canonicalize empty cycles rather than repeatedly rotating their IDs.
+                    return path[start..].iter().copied().min();
+                }
+                path.push(i);
+                match steps[i].kind {
+                    StepKind::Run(Next::Goto(n)) if steps[i].writes.is_empty() && steps[i].checks.is_empty() => t = n,
+                    _ => break,
+                }
+            }
+            t
+        };
+        let mut kinds: Vec<_> = steps.iter().map(|s| s.kind.clone()).collect();
+        for kind in &mut kinds {
+            retarget(kind, &resolve);
+            if let StepKind::Run(Next::Branch(_, a, b)) = kind {
+                if a == b { *kind = StepKind::Run(Next::Goto(*a)); }
+            }
+        }
+        let next_entry = resolve(Some(entry)).unwrap_or(entry);
+        let mut changed = next_entry != entry;
+        entry = next_entry;
+        for (s, kind) in steps.iter_mut().zip(kinds) {
+            changed |= s.kind != kind;
+            s.kind = kind;
+        }
+        // Exact common tails: keep each state's actions and timing, redirect only its
+        // incoming edges. Checked states keep their own source location/error identity.
+        let mut representatives: Vec<usize> = (0..steps.len()).collect();
+        for i in 0..steps.len() {
+            if !steps[i].checks.is_empty() { continue; }
+            if let Some(j) = (0..i).find(|&j| representatives[j] == j
+                && steps[j].checks.is_empty()
+                && steps[i].writes == steps[j].writes
+                && steps[i].plans == steps[j].plans
+                && steps[i].kind == steps[j].kind) {
+                representatives[i] = j;
+            }
+        }
+        for s in steps.iter_mut() {
+            let old = s.kind.clone();
+            retarget(&mut s.kind, &|t| t.map(|i| representatives[i]));
+            changed |= old != s.kind;
+        }
+        changed |= entry != representatives[entry];
+        entry = representatives[entry];
+        if !changed { return entry; }
+    }
+}
+
 fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
     let defined = definite_assignment(c);
     let mut fp = Fixpoint::new(ctx);
@@ -1830,6 +1898,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
                 };
             }
         }
+        let entry = simplify_steps(&mut steps, c.entry);
         let depths = g.depths();
         let ready = |nodes: Vec<V>| nodes.iter().map(|v| depths[*v as usize]).max().unwrap_or(0);
         for s in &mut steps {
@@ -1850,44 +1919,6 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg) -> Result<MainProc, Diag> {
             }
             s.depth = d;
         }
-        // Thread jumps through steps that do nothing but jump (e.g. `while True:` headers,
-        // whose branch only became a plain jump once its condition was folded).
-        let empty = |s: &Step| s.writes.is_empty() && matches!(s.kind, StepKind::Run(Next::Goto(_)));
-        let resolve = |mut t: Option<usize>| {
-            let mut hops = 0;
-            while let Some(i) = t {
-                match &steps[i].kind {
-                    StepKind::Run(Next::Goto(n)) if empty(&steps[i]) && hops < steps.len() => {
-                        t = *n;
-                        hops += 1;
-                    }
-                    _ => break,
-                }
-            }
-            t
-        };
-        let threaded: Vec<StepKind> = steps
-            .iter()
-            .map(|s| match s.kind.clone() {
-                StepKind::Run(Next::Goto(t)) => StepKind::Run(Next::Goto(resolve(t))),
-                StepKind::Run(Next::Branch(v, a, b)) => StepKind::Run(Next::Branch(v, resolve(a), resolve(b))),
-                StepKind::Run(Next::Call { func, entry, cont }) => {
-                    StepKind::Run(Next::Call { func, entry: resolve(Some(entry)).unwrap_or(entry), cont: resolve(cont) })
-                }
-                StepKind::Run(Next::Return { func }) => StepKind::Run(Next::Return { func }),
-                StepKind::WaitUntil(v, t) => StepKind::WaitUntil(v, resolve(t)),
-                StepKind::WaitTicks(n, t) => StepKind::WaitTicks(n, resolve(t)),
-            })
-            .collect();
-        // An entry step that only jumps can be skipped too, unless the jump leads nowhere.
-        let entry = match resolve(Some(c.entry)) {
-            Some(e) => e,
-            None => c.entry,
-        };
-        for (s, k) in steps.iter_mut().zip(threaded) {
-            s.kind = k;
-        }
-
         // Drop steps that are no longer reachable.
         let mut keep = vec![false; steps.len()];
         let mut stack = vec![entry];

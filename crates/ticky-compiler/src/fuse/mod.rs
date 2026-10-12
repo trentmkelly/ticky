@@ -54,7 +54,7 @@ pub enum LoadVal {
 /// A *direct* load is a constant whose guard is checked by the load decider itself, on the
 /// commit tick (codegen also makes staged values direct: `registers::stage_loads`). Other
 /// guarded loads first compute an enable pulse one tick earlier.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Load {
     pub guard: Dnf,
     pub val: LoadVal,
@@ -62,7 +62,7 @@ pub struct Load {
 }
 
 /// How one writer (an `every` block or a main-program step) updates a register.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WriterPlan {
     pub loads: Vec<Load>,
     /// For direct loads: the condition under which none of them fires (so the register may
@@ -99,7 +99,7 @@ impl WriterPlan {
 }
 
 /// A branch or wait condition: its node, and (when small enough) its condition lists.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CondPlan {
     pub node: V,
     pub pos: Option<Dnf>,

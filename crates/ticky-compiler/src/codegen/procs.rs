@@ -116,6 +116,9 @@ pub(super) fn main_proc(
     // Commit deciders.
     let mut cm: Vec<Option<(Sig, Vec<Cond>)>> = Vec::new();
     let mut stats = Vec::new();
+    // Action-free states only need ANY and a PC offset. Their mutually exclusive
+    // predicates can share a decider even though the state IDs remain distinct.
+    let mut idle_commits: Vec<(i32, CDnf)> = Vec::new();
     for (i, s) in steps.iter().enumerate() {
         let line = format!("{} step {}", m.name, i + 1);
         let here = i as i32 + 1;
@@ -165,15 +168,39 @@ pub(super) fn main_proc(
         }
         // A failure halts: the PC drops to 0.
         cg.error_deciders(&base, &[(any, 1), (pc, -here)], &fails, &line);
-        let cms = cg.alloc()?;
-        let mut outs = vec![out_const(cms, 1), out_const(any, 1)];
-        if let Some(t) = fall[i] {
-            outs.push(out_const(pc, t - here));
-        }
-        cg.core(dec(distribute(&prefix, &extra), outs), format!("{line}: commit"));
+        let idle = s.writes.is_empty() && s.plans.is_empty() && s.checks.is_empty()
+            && matches!(s.kind, StepKind::Run(Next::Goto(_)) | StepKind::WaitUntil(..) | StepKind::WaitTicks(..));
+        let cms = if idle {
+            let offset = fall[i].expect("static next state") - here;
+            let terms: CDnf = extra.iter().map(|term| {
+                let mut all = prefix.clone();
+                all.extend(term.iter().cloned());
+                all
+            }).collect();
+            if let Some((_, group)) = idle_commits.iter_mut().find(|(delta, _)| *delta == offset) {
+                group.extend(terms);
+            } else {
+                idle_commits.push((offset, terms));
+            }
+            // No writer, branch, call or return can consume this placeholder enable.
+            any
+        } else {
+            let cms = cg.alloc()?;
+            let mut outs = vec![out_const(cms, 1), out_const(any, 1)];
+            if let Some(t) = fall[i] {
+                outs.push(out_const(pc, t - here));
+            }
+            cg.core(dec(distribute(&prefix, &extra), outs), format!("{line}: commit"));
+            cms
+        };
         cm.push(Some((cms, prefix)));
         let self_loop = s.targets().contains(&Some(i));
         stats.push(StepStats { span: s.span, duration, self_loop });
+    }
+
+    for (offset, terms) in idle_commits {
+        cg.core(dec(distribute(&[], &terms), vec![out_const(any, 1), out_const(pc, offset)]),
+            format!("{}: shared action-free commit", m.name));
     }
 
     // Return-address registers, one per subroutine.
