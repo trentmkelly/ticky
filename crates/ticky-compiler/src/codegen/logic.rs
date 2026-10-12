@@ -437,6 +437,7 @@ impl Cg {
             }
         };
         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
+        let mut shared_deciders: HashMap<Vec<(usize, Conn)>, Vec<EntId>> = HashMap::new();
         let mut floor_done: std::collections::HashSet<usize> = Default::default();
 
         for v in producers {
@@ -489,6 +490,14 @@ impl Cg {
             };
             let out_local = local(target);
             let out_bundle = bundle_writes.get(&target).map(|(bun, _)| node_ref[bun].bun());
+            let scalar_output = if out_bundle.is_some() {
+                None
+            } else if !out_local {
+                Some((0, Conn::OutGreen))
+            } else {
+                let n = own_wire.get(&target).copied().unwrap_or_else(|| self.cluster_net(&mut cluster_net, cluster[&v]));
+                Some((n, Conn::OutRed))
+            };
             // Where a combinator's output goes: a bundle's wire, the bus, or (for a value that
             // lives on a private wire) that wire.
             let wire_out = |cg: &mut Cg, cluster_net: &mut HashMap<usize, usize>, id: EntId| {
@@ -559,6 +568,9 @@ impl Cg {
                         self.nets[n].members.push((id, Conn::InRed));
                     }
                     wire_out(self, &mut cluster_net, id);
+                    if let Some(output) = scalar_output {
+                        self.share_logic_decider(id, red, output, &mut shared_deciders);
+                    }
                 }
                 continue;
             }
@@ -634,12 +646,53 @@ impl Cg {
                 }
                 // Output to its sum's wire (the same cluster whenever that is local).
                 wire_out(self, &mut cluster_net, id);
+                // Bundle readers have wiring outside the scalar cluster model.
+                if let Some(output) = scalar_output.filter(|_| !cond_reads.contains_key(&v)) {
+                    let red = reads_local.then(|| cluster_net[&cluster[&v]]);
+                    self.share_logic_decider(id, red, output, &mut shared_deciders);
+                }
             }
         }
         for v in staged.keys() {
             node_ref.remove(v);
         }
         Ok(node_ref)
+    }
+
+    /// Share only constant-output scalar deciders on exactly the same physical networks.
+    /// The newest entity has no published entity-id references beyond these connectors;
+    /// removing it leaves all earlier ids intact. Bundle producers/readers stay separate.
+    fn share_logic_decider(&mut self, id: EntId, red: Option<usize>, output: (usize, Conn), seen: &mut HashMap<Vec<(usize, Conn)>, Vec<EntId>>) {
+        let Kind::Decider(d) = &self.net.entities[id].kind else {
+            return;
+        };
+        if d.outputs.iter().any(|o| o.copy) {
+            return;
+        }
+        let mut wires = vec![(0, Conn::InGreen), output];
+        if let Some(n) = red {
+            wires.push((n, Conn::InRed));
+        }
+        let candidates = seen.entry(wires.clone()).or_default();
+        let same = candidates.iter().copied().find(|&other| {
+            let Kind::Decider(old) = &self.net.entities[other].kind else { unreachable!() };
+            old.conds == d.conds && d.outputs.iter().all(|o| old.outputs.iter().all(|p| p.sig != o.sig))
+        });
+        let Some(other) = same else {
+            candidates.push(id);
+            return;
+        };
+        assert_eq!(id + 1, self.net.entities.len());
+        let removed = self.net.entities.pop().unwrap();
+        let Kind::Decider(d) = removed.kind else { unreachable!() };
+        let Kind::Decider(old) = &mut self.net.entities[other].kind else { unreachable!() };
+        old.outputs.extend(d.outputs);
+        if let Some(desc) = removed.description {
+            self.net.entities[other].description.get_or_insert_default().push_str(&format!("; {desc}"));
+        }
+        for (n, _) in wires {
+            self.nets[n].members.retain(|(e, _)| *e != id);
+        }
     }
 
     /// A floor group (see [`Floor`]): the decider and the divider(s).
