@@ -1,0 +1,30 @@
+input x: int @ X
+input delay: int @ D
+output counter: int @ A
+output first: int @ B
+output second: int @ C
+output shallow: int @ E
+output slow: int @ F
+output done: int @ G
+
+every 3 ticks:
+    counter += 1
+
+every 3 ticks:
+    first = (x * 2) ^ 7
+    assert x >= 0
+
+every 3 ticks:
+    second = (x * 3) ^ 9
+    assert x != 13
+
+every 3 ticks:
+    shallow = x
+
+every 6 ticks:
+    slow = first + second
+
+process worker:
+    while True:
+        wait delay
+        done += 1

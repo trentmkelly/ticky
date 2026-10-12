@@ -1,0 +1,55 @@
+# Independent tank controllers share a six-tick cadence, while the alarm panel
+# samples more slowly. Each pump has its own hysteresis and enable input.
+input water: int @ W
+input oil: int @ O
+input steam: int @ S
+input enabled: int @ E
+output water_pump: int @ A
+output oil_pump: int @ B
+output steam_pump: int @ C
+output low_tanks: int @ L
+
+every 6 ticks:
+    if enabled == 0 or water > 80:
+        water_pump = 0
+    elif water < 30:
+        water_pump = 1
+    assert water >= 0
+
+every 6 ticks:
+    if enabled == 0 or oil > 80:
+        oil_pump = 0
+    elif oil < 30:
+        oil_pump = 1
+    assert oil >= 0
+
+every 6 ticks:
+    if enabled == 0 or steam > 80:
+        steam_pump = 0
+    elif steam < 30:
+        steam_pump = 1
+    assert steam >= 0
+
+every 12 ticks:
+    low_tanks = (water < 30) + (oil < 30) + (steam < 30)
+
+test "independent pumps and common enable":
+    set enabled = 1
+    set water = 10
+    set oil = 50
+    set steam = 90
+    run 30 ticks
+    assert water_pump == 1 and oil_pump == 0 and steam_pump == 0
+    assert low_tanks == 1
+    set water = 50
+    set oil = 20
+    set steam = 20
+    run 30 ticks
+    assert water_pump == 1 and oil_pump == 1 and steam_pump == 1
+    assert low_tanks == 2
+    set water = 90
+    run 30 ticks
+    assert water_pump == 0 and oil_pump == 1 and steam_pump == 1
+    set enabled = 0
+    run 30 ticks
+    assert water_pump == 0 and oil_pump == 0 and steam_pump == 0
