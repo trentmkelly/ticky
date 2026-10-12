@@ -1176,7 +1176,7 @@ pub fn lower_draw(g: &mut crate::ir::Graph, names: &mut dyn crate::lower::Names,
     if op == 2 {
         let (x0, y0, k) = (lit(&args[6]) as i32, lit(&args[7]) as i32, lit(&args[9]));
         let mask = number_mask(g, off, nb, w, x0, y0, ints[3], k);
-        return Ok(paint(g, bank, mask, ints[0], span));
+        return Ok(paint(g, bank, mask, ints[0], nb, span));
     }
     // Shapes: (x, y, w, h) rectangles or (x, y, bits) glyphs.
     let (c, rects, glyphs): (V, Vec<[V; 4]>, Vec<[V; 3]>) = if op == 0 {
@@ -1272,15 +1272,30 @@ pub fn lower_draw(g: &mut crate::ir::Graph, names: &mut dyn crate::lower::Names,
         return Ok(bank);
     }
     let mask = g.bun(mask);
-    Ok(paint(g, bank, mask, c, span))
+    Ok(paint(g, bank, mask, c, nb, span))
 }
 
 /// `bank` with colour `c` on the pixels where `mask` is −1: `old − old·[lit] + c·[lit]`,
 /// added to the old values by one more combinator (a chain of drawings doesn't copy each
 /// earlier one's combinators). On a blank bank, just `c·[lit]`.
-fn paint(g: &mut crate::ir::Graph, bank: crate::ir::V, mask: crate::ir::V, c: crate::ir::V, span: Span) -> crate::ir::V {
+fn paint(g: &mut crate::ir::Graph, bank: crate::ir::V, mask: crate::ir::V, c: crate::ir::V, nb: usize, span: Span) -> crate::ir::V {
     use crate::ir::BTerm;
     use ticky_factorio::ArOp;
+    // A full constant background B needs just B + mask * (B - colour).
+    // Require every bank slot: sparse constants must not paint absent pixels as B.
+    let background = g.as_bconst(bank).and_then(|b| {
+        let value = b.first()?.1;
+        let slots: std::collections::HashSet<_> = b.iter().map(|(s, _)| *s).collect();
+        (b.len() == nb && b.iter().all(|(_, k)| *k == value)
+            && (0..nb).all(|i| slots.contains(&crate::ir::Graph::slot(i))))
+            .then_some(value)
+    });
+    if let Some(background) = background {
+        let value = g.konst(background);
+        let delta = g.ar(ArOp::Sub, value, c);
+        let table = g.as_bconst(bank).unwrap().to_vec();
+        return g.bun(vec![BTerm::K(table), BTerm::Map(ArOp::Mul, mask, delta)]);
+    }
     let z = g.konst(0);
     let neg_c = g.ar(ArOp::Sub, z, c);
     if g.as_bconst(bank).is_some_and(|b| b.is_empty()) {

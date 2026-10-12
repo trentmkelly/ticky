@@ -1406,3 +1406,13 @@ contents, rot-chest contents. 225 combinators, depth 16, every 60 ticks.
   arithmetic function called three times between waits: 74 → 52. Semantic tests cover wrapping
   integers, output order, changing inputs, explicit waits, global side effects and checked
   division by zero. The function cost report currently labels evaluated calls as inlined.
+
+## 2026-10-12: uniform-background drawing
+
+`display::paint` factors the first dynamic drawing over a full uniform constant bank B
+as `B + mask * (B - colour)`. This removes one arithmetic combinator per eligible bank;
+a sparse or nonuniform background keeps the general overwrite circuit. The proof checks
+all bank slots, and wrapping arithmetic, zero colours and clipped shapes are preserved.
+`backend_display_paint`: a uniform/nonuniform comparison saves exactly one combinator,
+pixel checks include zero, matching-background, negative and MIN colours, and a changing
+input trace checks that coordinates and colour stay in the same pipeline iteration.
