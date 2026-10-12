@@ -1,20 +1,58 @@
 #!/usr/bin/env bash
-# Cost of every example: combinators, main-program steps, every-tick latencies, footprint.
-# usage: tools/bench.sh > before.txt; (change things); tools/bench.sh > after.txt; diff before.txt after.txt
-T=${TICKY:-./target/release/ticky}
-printf "%-14s %6s %6s %10s %8s\n" example combs steps latency tiles
-# TOTAL: summed combinators and steps, and the summed area of the footprints.
-for f in examples/*.ticky; do
-  n=$(basename "$f" .ticky)
-  $T check "$f" 2>&1 | python3 -c "
-import sys, re
-t = sys.stdin.read()
-c = re.search(r'total: (\d+) combinators', t)
-if not c:
-    print(f'{\"$n\":<14} {\"error\":>6}'); sys.exit()
-m = re.search(r'main program +(\d+) steps', t)
-l = ','.join(re.findall(r'latency (\d+)', t)) or '-'
-w = re.search(r'(\d+)×(\d+) tiles', t)
-print(f'{\"$n\":<14} {c.group(1):>6} {m.group(1) if m else \"-\":>6} {l:>10} {w.group(1)+\"x\"+w.group(2):>8}')"
-done | awk '{ print } $2 ~ /^[0-9]+$/ { c += $2 } $3 ~ /^[0-9]+$/ { s += $3 } split($5, wh, "x") == 2 { a += wh[1] * wh[2] }
-  END { printf "%-14s %6d %6d %10s %8s\n", "TOTAL", c, s, "-", a }'
+# Compile every example and report combinators, steps, latency and footprint.
+# Builds a fresh release compiler unless TICKY names an existing binary.
+# Usage (from anywhere): tools/bench.sh [--opt=size] [other `ticky check` options]
+# Save stdout before/after a change and diff the tables; diagnostics go to stderr.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+if [[ -z ${TICKY:-} ]]; then
+  cargo build --quiet --release --locked --package ticky-cli \
+    --manifest-path "$ROOT/Cargo.toml" --target-dir "$ROOT/target"
+  TICKY="$ROOT/target/release/ticky"
+fi
+
+python3 -u - "$ROOT" "$TICKY" "$@" <<'PY'
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+root, compiler, *options = sys.argv[1:]
+files = sorted((Path(root) / "examples").glob("*.ticky"))
+if not files:
+    sys.exit("bench: no examples found")
+
+print(f"{'example':<24} {'combs':>6} {'steps':>6} {'latency':>10} {'tiles':>10}")
+total_combs = total_steps = total_tiles = 0
+failed = []
+for path in files:
+    try:
+        result = subprocess.run(
+            [compiler, "check", str(path), *options],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except OSError as error:
+        sys.exit(f"bench: cannot run {compiler}: {error}")
+    report = result.stdout
+    count = re.search(r"total: (\d+) combinators", report)
+    footprint = re.search(r"(\d+)×(\d+) tiles", report)
+    if result.returncode or not count or not footprint:
+        failed.append(path.name)
+        print(f"{path.name:<24} error")
+        print(f"bench: {path.name} failed (exit {result.returncode})\n{report}", file=sys.stderr)
+        continue
+    combs = int(count[1])
+    steps = re.search(r"main program +(\d+) steps", report)
+    latency = ",".join(re.findall(r"latency (\d+)", report)) or "-"
+    width, height = map(int, footprint.groups())
+    print(f"{path.name:<24} {combs:>6} {steps[1] if steps else '-':>6} {latency:>10} {f'{width}x{height}':>10}")
+    total_combs += combs
+    total_steps += int(steps[1]) if steps else 0
+    total_tiles += width * height
+
+label = f"SUBTOTAL ({len(files) - len(failed)}/{len(files)})" if failed else "TOTAL"
+print(f"{label:<24} {total_combs:>6} {total_steps:>6} {'-':>10} {total_tiles:>10}")
+if failed:
+    sys.exit(f"bench: {len(failed)}/{len(files)} examples failed; subtotal excludes failures")
+print(f"bench: compiled all {len(files)} examples; combinator counts exclude constants", file=sys.stderr)
+PY

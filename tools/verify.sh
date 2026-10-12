@@ -23,9 +23,8 @@ echo "== cargo test --release"
 cargo test --release || fail+=("cargo test")
 
 echo "== tools/bench.sh"
-tools/bench.sh > "$DIR/bench.txt"
+tools/bench.sh > "$DIR/bench.txt" || fail+=("bench (an example failed to compile)")
 cat "$DIR/bench.txt"
-grep -q ' error$' "$DIR/bench.txt" && fail+=("bench (an example failed to compile)")
 [ -n "${BENCH_OUT:-}" ] && cp "$DIR/bench.txt" "$BENCH_OUT"
 
 for f in tools/fuzz_*.py; do

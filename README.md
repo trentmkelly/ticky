@@ -87,6 +87,13 @@ ticky difftest prog.ticky --ticks 300 --set ...   # simulator vs. real Factorio,
 ticky decode prog.bp.txt                # any blueprint string → JSON
 ```
 
+For a combinator-count baseline across every `examples/*.ticky` file, run
+`tools/bench.sh` (speed mode) or `tools/bench.sh --opt=size`. The script builds a fresh
+release compiler and prints per-file counts plus a total; redirect stdout to save a
+before/after table. Set `TICKY=/path/to/ticky` to compare an existing compiler binary.
+Failed examples produce a nonzero exit and a labeled subtotal excluding those files.
+Counts include arithmetic, decider, and selector combinators, but not constants or poles.
+
 `--set name=value@tick` changes an input at a tick (default tick 0); bundle inputs take
 `--set stock=iron-plate:5,copper-plate:3@10`, and `Signal` inputs a signal name
 (`--set want=coal`; `iron-plate@rare` for a quality). `RUN=0@tick` and `RUN=1@tick` switch the program
