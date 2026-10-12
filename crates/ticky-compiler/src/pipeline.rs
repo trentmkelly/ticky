@@ -25,8 +25,8 @@ use crate::program::SrcKind;
 pub struct Pipe {
     /// Ticks between reading the inputs and the iteration that uses them.
     pub latency: u32,
-    /// Candidate schedules (as late as possible, then as soon as possible, if different): the
-    /// time offset of each node (by node index), `None` for constants and unused nodes.
+    /// Candidate schedules: ALAP, ASAP (if different), then bounded mixed alternatives.
+    /// Each gives node time offsets, `None` for constants and unused nodes.
     /// Codegen builds the block with each and keeps the smaller.
     pub taus: Vec<Vec<Option<i32>>>,
     /// Registers updated as accumulators.
@@ -408,6 +408,25 @@ pub fn plan(g: &mut Graph, srcs: &[SrcKind], plans: &mut Vec<(usize, WriterPlan)
     let mut taus = vec![tau];
     if asap != taus[0] {
         taus.push(asap);
+    }
+    // Explore a bounded set of mixed schedules as well. Keep the original endpoints
+    // first so equal-cost choices retain their existing timing. Moving a pure scalar
+    // node earlier within its legal window can share its delayed result across users.
+    // Folded sums must move as a group; leave them and bundle/random operations alone.
+    let late = taus[0].clone();
+    let mut candidates: Vec<V> = live.iter().copied().filter(|v| {
+        od[*v as usize].is_none() && !transparent.contains(v) && !fold.contains_key(v)
+            && matches!(g.op(*v), Op::Ar(..) | Op::Cmp(..) | Op::Dec(_) | Op::Mux { .. } | Op::Sel(_))
+    }).collect();
+    candidates.sort_by_key(|v| (std::cmp::Reverse(users[*v as usize].len()), *v));
+    for v in candidates {
+        if taus.len() >= 6 { break; }
+        let Some(cur) = late[v as usize] else { continue };
+        let Some(earliest) = g.operands(v).iter().filter_map(|u| late[*u as usize]).max().map(|t| t + lag(v)) else { continue };
+        if earliest >= cur { continue; }
+        let mut mixed = late.clone();
+        mixed[v as usize] = Some(earliest);
+        if !taus.contains(&mixed) { taus.push(mixed); }
     }
     *plans = rest;
     Some(Pipe { latency: latency as u32, taus, accs, fold, transparent })
