@@ -1706,10 +1706,12 @@ fn definite_assignment(c: &cfg::Cfg) -> Vec<BTreeSet<String>> {
     }
 }
 
-/// Register sharing (SPEC §11.2): the process's own scalar variables that are never live at
+/// Register sharing (SPEC §11.2): the process's own variables that are never live at
 /// the same time are renamed to one of them, so they share a register. The others are left
 /// as states nobody reads (codegen gives those no register). Variables any other process or
-/// `every` block mentions, ports and bundles keep their own. `TICKY_NO_REGSHARE` turns it off.
+/// `every` block mentions and ports keep their own. Bundles with element writes or method
+/// receivers are pinned by liveness; whole-bundle assignments may share storage.
+/// `TICKY_NO_REGSHARE` turns it off.
 /// Returns the renames (variable → the one whose register it shares).
 fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: &BTreeSet<&String>) -> BTreeMap<String, String> {
     use crate::liveness::Cand;
@@ -1722,6 +1724,7 @@ fn share_registers(c: &mut cfg::Cfg, owner: usize, states: &[State], elsewhere: 
         .filter_map(|s| match s.ty {
             Ty::Int => Some((s.name.clone(), Cand { class: 0, init: s.has_init })),
             Ty::Bool => Some((s.name.clone(), Cand { class: 1, init: s.has_init })),
+            Ty::Bundle => Some((s.name.clone(), Cand { class: 2, init: s.has_init })),
             _ => None,
         })
         .collect();
