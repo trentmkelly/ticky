@@ -1,0 +1,349 @@
+# Ammo generator for Cubium: endless cannon shells and piercing rounds magazines at one quality
+# (QUALITY), made from microcubes alone, for a space platform. Everything comes from cubes: the
+# metals from Cubium's ore recipes, and sulfur, carbon, ice and more iron from cube jelly left to
+# spoil into destabilized cube matter and recycled. Quality carries through every step (spoiling
+# and recycling keep it), so legendary cubes make legendary ammo. The only fluid is water,
+# melted from ice as needed, so nothing fluid ever has to be voided; surplus items (ice, dream,
+# ore and carbon over their caps) go out of the trash chute.
+#
+# Every machine keeps one recipe (set by hand, at QUALITY). A warehouse feeds a sushi belt past
+# every group and back. This controller decides which groups may take from the belt and what
+# goes onto it:
+#
+#   enables  signal-A..Q = 1 for each group that may run; wire every inserter from the belt into
+#            a group with "signal-X > 0" (the chemical plants' water comes by pipe)
+#   release  items to put on the belt, each with how many more are wanted there
+#   trash    filters for the trash chute: dream, and items over their caps
+#   lamps    one lamp per group, A on the left: green running, amber wanted but missing an
+#            input, dim idle
+#
+# Inputs: the warehouse wire (items, plus the water tank), the belt's contents ("read entire
+# belt") and the rot store's contents. Stocks count the warehouse and belt together.
+#
+#   A  cannon shell          2 steel + 2 plastic + 1 explosives -> 1 shell
+#   B  piercing rounds       2 firearm magazines + 1 steel + 2 copper -> 2 magazines
+#   C  firearm magazine      4 iron -> 1
+#   D  steel furnaces        5 iron -> 1 steel
+#   E  iron furnaces         iron ore -> iron
+#   F  copper furnaces       copper ore -> copper
+#   G  explosives (chem)     sulfur + coal + 10 water -> 2
+#   H  coal synthesis (chem) 5 carbon + sulfur + 10 water -> 1 coal
+#   I  ice melting (chem)    ice -> 20 water, into the water tank
+#   J  plastic               cube + 50 jelly + 20 carbon -> 75 plastic
+#   K  copper ore            cube + 50 jelly -> 41 copper ore            (cubes recharge)
+#   L  iron ore              cube + 50 jelly -> 41 iron ore
+#   M  matter amplification  cube + 10 jelly -> 17 jelly
+#   N  metallic aggravation  2 copper + dormant cube -> cube
+#   O  carbonic scaffolding  cube + 12 jelly + 15 carbon -> 75 jelly    (spare carbon)
+#   P  cube jelly            cube -> 2 jelly (only to start from no jelly)
+#   Q  rot store             a warehouse jelly (and stray destabilized matter) goes into; its
+#                            jelly spoils in 3 minutes, and inserters filtered to destabilized
+#                            cube matter feed the recyclers straight from it (it turns to dream
+#                            5 minutes later). The recyclers (2 matter -> 20% carbon, 5% sulfur,
+#                            30% 5 ice, 25% 2 iron ore, 20% copper ore) put their output back
+#                            on the belt and aren't switched.
+#
+# Sulfur is the scarce part: a shell needs one (half for the explosives, half for its coal),
+# which is 40 jelly rotted. The same rotting gives more than the carbon and nearly all the iron
+# the plant needs. Rates and machine counts: tools/ammo_econ.py.
+#
+# Cubes are shared: copper ore (which keeps the cubes charged) comes first, iron ore and the
+# other cube users only while copper covers recharging every dormant cube, and they leave
+# CUBE_RESERVE charged cubes for it. Copper for magazines is only what recharging doesn't need.
+
+import display
+
+QUALITY = "legendary"    # "uncommon", "rare", "epic" or "legendary": the quality of everything made
+
+SCALE = 4             # stocks below are sized for about SCALE/4 shells and magazines a second
+
+# Items, at the chosen quality.
+SHELL     = S("cannon-shell", quality=QUALITY)
+MAG       = S("piercing-rounds-magazine", quality=QUALITY)
+FIREARM   = S("firearm-magazine", quality=QUALITY)
+STEEL     = S("steel-plate", quality=QUALITY)
+PLASTIC   = S("plastic-bar", quality=QUALITY)
+EXPL      = S("explosives", quality=QUALITY)
+COAL      = S("coal", quality=QUALITY)
+SULFUR    = S("sulfur", quality=QUALITY)
+CARBON    = S("carbon", quality=QUALITY)
+ICE       = S("ice", quality=QUALITY)
+CU        = S("copper-plate", quality=QUALITY)
+CU_ORE    = S("copper-ore", quality=QUALITY)
+FE        = S("iron-plate", quality=QUALITY)
+FE_ORE    = S("iron-ore", quality=QUALITY)
+CUBE      = S("energized-microcube", quality=QUALITY)
+DORMANT   = S("dormant-microcube", quality=QUALITY)
+JELLY     = S("cube-jelly", quality=QUALITY)
+DESTAB    = S("destabilized-cube-matter", quality=QUALITY)
+DREAM     = S("dream", quality=QUALITY)
+WATER     = S("water", type="fluid")
+
+# Stocks.
+SHELL_MAX     = 20000           # stop here (the warehouse's room for them)
+MAG_MAX       = 20000
+FIREARM_GOAL  = 100 * SCALE
+STEEL_GOAL    = 200 * SCALE
+PLASTIC_GOAL  = 200 * SCALE
+EXPL_GOAL     = 100 * SCALE
+COAL_GOAL     = 50 * SCALE
+FE_GOAL       = 500 * SCALE     # iron furnaces stop here
+CU_MAX        = 2000 * SCALE    # copper furnaces stop here
+WATER_GOAL    = 10000           # melt ice up to here (a storage tank holds 25000)
+CUBE_RESERVE  = 10 * SCALE      # charged cubes only copper ore may dip into
+COPPER_FLOOR  = 200 * SCALE     # copper beyond what recharging takes, before iron ore and
+                                # magazines may have any
+JELLY_GOAL    = 100 * SCALE     # jelly for the ore crafts and plastic
+JELLY_RESERVE = 25 * SCALE      # jelly kept for amplification, the only real source of it
+AMP_MIN       = 10              # amplification needs 10 jelly; plain cube jelly below
+ROT_GOAL      = 4000 * SCALE    # jelly and matter in the rot store (spoiling takes 3 minutes,
+                                # and a shell's sulfur takes 40 jelly)
+ROT_EXTRA     = 500 * SCALE     # jelly made past its need while the rot store wants more
+SULFUR_GOAL   = 100 * SCALE     # rotting stops once there's this much sulfur
+CARBON_HIGH   = 400 * SCALE     # spare carbon above this goes to scaffolding
+
+# How many of each item to keep on the belt while a group that takes it is on (a group's
+# items add up when several are on).
+BELT_A = {STEEL: 40, PLASTIC: 40, EXPL: 20}
+BELT_B = {FIREARM: 40, STEEL: 20, CU: 40}
+BELT_C = {FE: 80}
+BELT_D = {FE: 100}
+BELT_E = {FE_ORE: 100}
+BELT_F = {CU_ORE: 100}
+BELT_G = {SULFUR: 20, COAL: 20}
+BELT_H = {CARBON: 50, SULFUR: 10}
+BELT_I = {ICE: 50}
+BELT_J = {CUBE: 5, JELLY: 100, CARBON: 40}
+BELT_ORE = {CUBE: 10, JELLY: 200}
+BELT_M = {CUBE: 20, JELLY: 100}
+BELT_N = {CU: 50, DORMANT: 20}
+BELT_O = {CUBE: 5, JELLY: 24, CARBON: 30}
+BELT_P = {CUBE: 5}
+BELT_Q = {JELLY: 400, DESTAB: 100}
+
+# Trash anything over these (dream always: -1).
+CAPS = {DREAM: -1, ICE: 2000, CARBON: 4000, FE_ORE: 2000, CU_ORE: 2000, DESTAB: 2000}
+CAPPED = {DREAM: 1, ICE: 1, CARBON: 1, FE_ORE: 1, CU_ORE: 1, DESTAB: 1}
+
+GREEN = 0x00C000
+AMBER = 0xFF9000
+DIM   = 0x181818
+
+input  warehouse: Bundle = port("Warehouse contents (items and water tank)")
+input  belt: Bundle = port("Belt contents")
+input  rotting: Bundle = port("Rot store contents")
+
+output enables: Bundle = port("Group enables, signal-A..Q")
+output release: Bundle = port("Items to put on the belt")
+output trash: Bundle = port("Trash chute filters")
+output lamps: display.Screen(17, 1) = port("Groups A..Q")
+
+def lamp(want, have):
+    return GREEN if want and have else AMBER if want else DIM
+
+every 60 ticks:
+    stock = warehouse + belt
+    shells = stock[SHELL]
+    mags = stock[MAG]
+    firearm = stock[FIREARM]
+    steel = stock[STEEL]
+    plastic = stock[PLASTIC]
+    expl = stock[EXPL]
+    coal = stock[COAL]
+    sulfur = stock[SULFUR]
+    carbon = stock[CARBON]
+    ice = stock[ICE]
+    cu = stock[CU]
+    cu_ore = stock[CU_ORE]
+    fe = stock[FE]
+    fe_ore = stock[FE_ORE]
+    cube = stock[CUBE]
+    dormant = stock[DORMANT]
+    jelly = stock[JELLY]
+    water = warehouse[WATER]
+    rot = rotting[JELLY] + rotting[DESTAB] + stock[DESTAB]
+
+    spare = cube > CUBE_RESERVE
+    owed = cu + cu_ore - 2 * dormant    # copper beyond what recharging every dormant cube takes
+    want_q = rot < ROT_GOAL and sulfur < SULFUR_GOAL
+    jelly_goal = JELLY_GOAL + (ROT_EXTRA if want_q else 0)
+
+    want_a = shells < SHELL_MAX
+    have_a = steel >= 2 and plastic >= 2 and expl >= 1
+    want_b = mags < MAG_MAX
+    have_b = firearm >= 2 and steel >= 1 and owed >= COPPER_FLOOR and cu >= 2
+    want_c = firearm < FIREARM_GOAL and want_b
+    have_c = fe >= 4
+    want_d = steel < STEEL_GOAL
+    have_d = fe >= 5
+    want_e = fe < FE_GOAL
+    have_e = fe_ore > 0
+    want_f = cu < CU_MAX
+    have_f = cu_ore > 0
+    want_g = expl < EXPL_GOAL
+    have_g = sulfur >= 1 and coal >= 1 and water >= 10
+    want_h = coal < COAL_GOAL
+    have_h = carbon >= 5 and sulfur >= 1 and water >= 10
+    want_i = water < WATER_GOAL
+    have_i = ice > 0
+    want_j = plastic < PLASTIC_GOAL
+    have_j = spare and jelly >= 50 + JELLY_RESERVE and carbon >= 20
+    want_k = owed < COPPER_FLOOR
+    have_k = cube >= 1 and jelly >= 50 + (JELLY_RESERVE if spare else 0)
+    want_l = steel + (fe + fe_ore) // 5 < STEEL_GOAL and owed >= COPPER_FLOOR
+    have_l = spare and jelly >= 50 + JELLY_RESERVE
+    want_m = jelly < jelly_goal
+    have_m = jelly >= AMP_MIN and (spare or (jelly < 50 and cube >= 1))
+    want_n = dormant > 0
+    have_n = cu >= 2
+    want_o = carbon > CARBON_HIGH and jelly < jelly_goal
+    have_o = spare and jelly >= 12
+    want_p = jelly < AMP_MIN
+    have_p = cube >= 1
+    have_q = jelly >= 50 + JELLY_RESERVE
+
+    a = want_a and have_a
+    b = want_b and have_b
+    c = want_c and have_c
+    d = want_d and have_d
+    e = want_e and have_e
+    f = want_f and have_f
+    g = want_g and have_g
+    h = want_h and have_h
+    i = want_i and have_i
+    j = want_j and have_j
+    k = want_k and have_k
+    l = want_l and have_l
+    m = want_m and have_m
+    n = want_n and have_n
+    o = want_o and have_o
+    p = want_p and have_p
+    q = want_q and have_q
+
+    enables = Bundle(A=a, B=b, C=c, D=d, E=e, F=f, G=g, H=h, I=i, J=j, K=k, L=l, M=m,
+                     N=n, O=o, P=p, Q=q)
+
+    belt_want = BELT_A * a + BELT_B * b + BELT_C * c + BELT_D * d + BELT_E * e + BELT_F * f \
+        + BELT_G * g + BELT_H * h + BELT_I * i + BELT_J * j + BELT_ORE * (k + l) + BELT_M * m \
+        + BELT_N * n + BELT_O * o + BELT_P * p + BELT_Q * q
+    short = {x: v for x, v in (belt_want - belt).items() if v > 0}
+    there = {x: 1 for x, v in warehouse.items() if v > 0}
+    release = short * there
+
+    over = (warehouse - CAPS) * CAPPED
+    trash = {x: 1 for x, v in over.items() if v > 0}
+
+    lamps[0] = lamp(want_a, have_a)
+    lamps[1] = lamp(want_b, have_b)
+    lamps[2] = lamp(want_c, have_c)
+    lamps[3] = lamp(want_d, have_d)
+    lamps[4] = lamp(want_e, have_e)
+    lamps[5] = lamp(want_f, have_f)
+    lamps[6] = lamp(want_g, have_g)
+    lamps[7] = lamp(want_h, have_h)
+    lamps[8] = lamp(want_i, have_i)
+    lamps[9] = lamp(want_j, have_j)
+    lamps[10] = lamp(want_k, have_k)
+    lamps[11] = lamp(want_l, have_l)
+    lamps[12] = lamp(want_m, have_m)
+    lamps[13] = lamp(want_n, have_n)
+    lamps[14] = lamp(want_o, have_o)
+    lamps[15] = lamp(want_p, have_p)
+    lamps[16] = lamp(want_q, have_q)
+
+test "cold start: cubes but no jelly, so plain cube jelly; nothing else":
+    set warehouse = {CUBE: 100}
+    run 120 ticks
+    assert enables["signal-P"] == 1 and not enables["signal-M"] and not enables["signal-A"]
+    assert release[CUBE] == 5
+    assert lamps[15] == GREEN and lamps[0] == AMBER
+
+test "amplify once there's jelly, while cubes are spare":
+    set warehouse = {CUBE: 100, JELLY: 30}
+    run 120 ticks
+    assert enables["signal-M"] == 1 and not enables["signal-P"]
+    assert release[JELLY] == 100 and release[CUBE] == 20
+
+test "copper first: dormant cubes owe copper, so copper ore and not iron ore":
+    set warehouse = {CUBE: 100, DORMANT: 1000, JELLY: 300}
+    run 120 ticks
+    assert enables["signal-K"] == 1 and not enables["signal-L"]
+    assert not enables["signal-N"]
+
+test "short of cubes, copper ore needn't leave jelly for amplification":
+    set warehouse = {CUBE: 20, DORMANT: 100, JELLY: 60}
+    run 120 ticks
+    assert enables["signal-K"] == 1 and not enables["signal-M"]
+
+test "iron ore and magazines once copper is covered":
+    set warehouse = {CUBE: 100, DORMANT: 20, JELLY: 300, CU: 2000, FE: 100, FIREARM: 10, STEEL: 10}
+    run 120 ticks
+    assert enables["signal-L"] == 1 and not enables["signal-K"]
+    assert enables["signal-B"] == 1 and enables["signal-C"] == 1 and enables["signal-N"] == 1
+    assert release[CU] == 90
+
+test "magazines leave the copper recharging needs":
+    set warehouse = {FIREARM: 100, STEEL: 100, CU: 500, DORMANT: 200}
+    run 120 ticks
+    assert not enables["signal-B"] and enables["signal-N"] == 1
+    assert lamps[1] == AMBER
+
+test "shells run with everything there, and the belt is topped up":
+    set warehouse = {STEEL: 400, PLASTIC: 400, EXPL: 100}
+    set belt = {STEEL: 30}
+    run 120 ticks
+    assert enables["signal-A"] == 1
+    assert release[STEEL] == 10 and release[PLASTIC] == 40 and release[EXPL] == 20
+    assert lamps[0] == GREEN
+
+test "shells stop at their cap":
+    set warehouse = {SHELL: 20000, STEEL: 400, PLASTIC: 400, EXPL: 100}
+    run 120 ticks
+    assert not enables["signal-A"] and not release[PLASTIC]
+
+test "the sulfur chain: coal, explosives and water":
+    set warehouse = {SULFUR: 50, CARBON: 100, COAL: 5, ICE: 100, WATER: 1000}
+    run 120 ticks
+    assert enables["signal-G"] == 1 and enables["signal-H"] == 1 and enables["signal-I"] == 1
+    assert release[SULFUR] == 30 and release[ICE] == 50
+
+test "no water, no chemistry; enough water, no melting":
+    set warehouse = {SULFUR: 50, CARBON: 100, COAL: 5, ICE: 100}
+    run 120 ticks
+    assert not enables["signal-G"] and not enables["signal-H"] and enables["signal-I"] == 1
+    set warehouse = {ICE: 100, WATER: 20000}
+    run 120 ticks
+    assert not enables["signal-I"]
+
+test "rotting: extra jelly made and sent to the rot store while sulfur is short":
+    set warehouse = {CUBE: 100, JELLY: 450}
+    run 120 ticks
+    assert enables["signal-Q"] == 1 and enables["signal-M"] == 1
+    assert enables["signal-K"] == 1 and release[JELLY] == 700
+    set warehouse = {CUBE: 100, JELLY: 450, SULFUR: 1000}
+    run 120 ticks
+    assert not enables["signal-Q"] and not enables["signal-M"]
+
+test "a full rot store stops rotting":
+    set warehouse = {CUBE: 100, JELLY: 450}
+    set rotting = {JELLY: 12000, DESTAB: 5000}
+    run 120 ticks
+    assert not enables["signal-Q"]
+
+test "plastic and scaffolding share the carbon":
+    set warehouse = {CUBE: 100, JELLY: 300, CARBON: 2000}
+    run 120 ticks
+    assert enables["signal-J"] == 1 and enables["signal-O"] == 1
+    set warehouse = {CUBE: 100, JELLY: 300, CARBON: 100}
+    run 120 ticks
+    assert enables["signal-J"] == 1 and not enables["signal-O"]
+
+test "trash: dream always, ice and carbon over their caps":
+    set warehouse = {DREAM: 30, ICE: 2500, CARBON: 100}
+    run 120 ticks
+    assert trash[DREAM] == 1 and trash[ICE] == 1 and not trash[CARBON]
+
+test "other qualities are ignored":
+    set warehouse = {S("energized-microcube", quality="uncommon"): 100}   # unless QUALITY is that
+    run 120 ticks
+    assert not enables["signal-P"] and not release[CUBE]

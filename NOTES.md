@@ -1440,3 +1440,22 @@ No hold-elision code was retained. `backend_peripheral_holds` records two exact 
 `s.fill(x)` retains -116 at zero-based tick 16; `s.fill(x * 3 + 1)` retains 4609 at tick
 254 of the deterministic restart sequence. Both became zero with the attempted elision.
 Future work must prove a stronger enable invariant or explicitly change restart semantics.
+
+## 2026-10-13: ammo generator (Cubium)
+
+`examples/ammo-generator.ticky`, at the user's request: endless cannon shells and piercing
+rounds magazines at one quality from microcubes alone, for a space platform (so no fluid may
+need voiding; surplus items go overboard). Fixed machines in 16 groups A–P plus a rot store
+(Q) around a warehouse-fed sushi belt; same shape as the holmium controller (`enables`,
+`release`, `trash`, lamp strip). 188 combinators, every 60 ticks.
+- No uranium anywhere in Cubium. Cubium's `angry-ammunition` needs anger and hate (light oil
+  chain, surplus hope/disgust), so piercing rounds use the vanilla recipe (2.0: 2 firearm
+  magazines + 1 steel + 2 copper → 2).
+- Sulfur, carbon, ice and most of the iron come from `destabilized-cube-matter-recycling`
+  (jelly spoils to matter in 3 min; recycled within 5, before it turns to dream). A shell needs
+  1 sulfur (explosives + coal synthesis) = 40 jelly rotted. Recyclers feed straight from the
+  rot store and aren't switched. Water is melted from ice only below WATER_GOAL.
+- `tools/ammo_econ.py`: LP over recipe rates (least machine time) with productivity modules.
+  5 shells/s + 5 magazines/s: ~12 charges/s with 4 legendary prod 2 per assembler (9.5 with 6),
+  ~124 recyclers, ~22k jelly spoiling at once, ~92 ice/s surplus.
+- Running on the user's platform with legendary cubes (2026-10-14).
