@@ -206,33 +206,46 @@ fn profiled_ticks(p: &Program) -> f64 {
         .sum()
 }
 
-/// A speed build guided by profile `p`: built without profile-guided decisions (exactly the
-/// circuit a build without a profile makes), with all of them and with each kind alone,
-/// keeping whichever has the fewest estimated ticks in the profiled run (ties: the plain one).
+/// A speed build guided by profile `p`. The program is analysed without profile-guided
+/// decisions (exactly the steps a build without a profile has), with all of them and with
+/// each kind alone; the one with the fewest estimated ticks in the profiled run (ties: the
+/// plain one) is built. (Only the analysis is repeated: codegen and layout run once.)
 fn compile_guided(module: &ticky_syntax::ast::Module, opts: &Options, p: &profile::Profile) -> Result<Compiled, Vec<Diag>> {
     use profile::Guide;
+    let off = Guide { merge: false, copy: false };
     profile::clear_warnings();
-    let mut best: Option<(f64, Compiled)> = None;
+    let mut best: Option<(f64, Guide)> = None;
     let mut plain = 0.0;
-    for guide in [Guide { merge: false, copy: false }, Guide { merge: true, copy: true }, Guide { merge: true, copy: false }, Guide { merge: false, copy: true }] {
+    for guide in [off, Guide { merge: true, copy: true }, Guide { merge: true, copy: false }, Guide { merge: false, copy: true }] {
         profile::set_current(Some(p.clone()), guide);
-        let r = compile_module(module, opts, true, &[]);
-        profile::set_current(None, Guide { merge: false, copy: false });
-        let c = match r {
-            Ok(c) => c,
-            Err(e) if !guide.merge && !guide.copy => return Err(e),
-            // A guided alternative that fails (e.g. runs out of signals) is just not taken.
-            Err(_) => continue,
+        let r = program::analyze_with_pipelines(module, true, &[]);
+        profile::set_current(None, off);
+        let Ok(prog) = r else {
+            // The plain build reports its own errors below; a guided alternative that fails
+            // is just not taken.
+            if guide == off {
+                break;
+            }
+            continue;
         };
-        let ticks = profiled_ticks(&c.program);
-        if best.is_none() {
+        let ticks = profiled_ticks(&prog);
+        if guide == off {
             plain = ticks;
         }
-        if best.as_ref().is_none_or(|(t, _)| ticks < *t) {
-            best = Some((ticks, c));
+        if best.is_none_or(|(t, _)| ticks < t) {
+            best = Some((ticks, guide));
         }
     }
-    let (ticks, mut c) = best.expect("the plain build");
+    let (ticks, guide) = best.unwrap_or((plain, off));
+    profile::set_current(Some(p.clone()), guide);
+    let r = compile_module(module, opts, true, &[]);
+    profile::set_current(None, off);
+    let mut c = match r {
+        Ok(c) => c,
+        Err(e) if guide == off => return Err(e),
+        // The winner failed later on (e.g. ran out of signals): build without the profile.
+        Err(_) => return compile_module(module, opts, true, &[]).map(|c| Compiled { profiled: Some((plain, plain)), ..c }),
+    };
     c.profiled = Some((plain, ticks));
     Ok(c)
 }
