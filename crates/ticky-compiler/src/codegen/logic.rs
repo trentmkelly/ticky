@@ -12,6 +12,7 @@ use ticky_syntax::{Diag, Span};
 
 use super::*;
 use super::selects::{self, Opd, Out};
+use crate::fuse::slp;
 use crate::ir::{BTerm, Graph, Op, V};
 
 impl Cg {
@@ -406,6 +407,56 @@ impl Cg {
                 res.push(a);
             }
         }
+        // Straight-line vectorisation (fuse/slp.rs): same-shape operations done by one `each`
+        // combinator, writing every lane's own signal where the lane's value would be (the bus
+        // or its cluster's wire). A lane is an operation emitted on its own; its input must be a
+        // combinator (or a sum of them, or a read) only it reads, which then writes the lane's
+        // signal onto the pack's private wire instead.
+        let mut lane_in: HashMap<V, BRef> = HashMap::new();
+        let mut packs: Vec<(slp::Pack, Option<usize>, BRef, Vec<Sig>)> = Vec::new();
+        if slp::enabled() {
+            let writes_into = |t: V| floors.iter().any(|f| f.div_to.map(|d| d.0) == Some(t) || f.rem_to == Some(t));
+            let placed = |v: V| {
+                transparent.contains(&v) || fold.contains_key(&v) || floor_at.contains_key(&v) || writes_into(v) || staged.contains_key(&v) || bundle_writes.contains_key(&v)
+                    || plan.stages.contains_key(&v) || pass_of.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || cond_reads.contains_key(&v)
+            };
+            let lane_ok = |v: V| !placed(v) && eff_operands(v) == g.operands(v);
+            // Reads write a private wire too (`emit_from_bundle`'s `out_net`), unless they're
+            // done by their consumer or fused into a sum.
+            let input_free = |x: V| {
+                let own = !is_root.contains(&x) && consumers.get(&x).is_some_and(|cs| cs.len() == 1);
+                let scalar = is_scalar_op(x) && !(placed(x) && !transparent.contains(&x));
+                let read = is_read(x) && !fold.contains_key(&x) && !direct_reads.contains_key(&x) && !cond_read.contains_key(&x);
+                own && (scalar || read)
+            };
+            let place = |v: V| if local(v) { Some(cluster[&v]) } else { None };
+            for p in slp::plan(g, &producers, &lane_ok, &input_free, &place) {
+                let at = place(p.lanes[0].out);
+                let input = self.bnew();
+                let mut sigs = Vec::new();
+                for l in &p.lanes {
+                    let s = match at {
+                        None => {
+                            let s = self.alloc()?;
+                            node_ref.insert(l.out, Ref::Op(Operand::Sig(s)));
+                            s
+                        }
+                        Some(k) => {
+                            let res = reserved.get(&k).cloned().unwrap_or_default();
+                            let pool = local_pools.entry(k).or_insert_with(|| SignalTable::base().internal_pool().into_iter().filter(|s| !res.contains(s)).collect());
+                            let s = pool.pop_front().ok_or_else(|| Diag::error(Span::default(), "program too large: a logic cluster ran out of signals"))?;
+                            local_sig.insert(l.out, s);
+                            s
+                        }
+                    };
+                    node_ref.insert(l.input, Ref::Op(Operand::Sig(s)));
+                    lane_in.insert(l.input, input);
+                    sigs.push(s);
+                }
+                packs.push((p, at, input, sigs));
+            }
+        }
+        let lanes: std::collections::HashSet<V> = packs.iter().flat_map(|p| p.0.lanes.iter().map(|l| l.out)).collect();
         for &v in &producers {
             if fold.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || direct_reads.contains_key(&v) || filter_totals.contains_key(&v) || cond_read.contains_key(&v) {
                 continue;
@@ -440,6 +491,13 @@ impl Cg {
         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
         let mut shared_deciders: HashMap<Vec<(usize, Conn)>, Vec<EntId>> = HashMap::new();
         let mut floor_done: std::collections::HashSet<usize> = Default::default();
+        // Packs first: reads write their lanes' inputs onto a pack's wire directly.
+        let mut lane_net: HashMap<V, usize> = HashMap::new();
+        for (p, at, input, sigs) in &packs {
+            let out = at.map(|k| self.cluster_net(&mut cluster_net, k));
+            let n = self.emit_pack(p, sigs, *input, out, what);
+            lane_net.extend(p.lanes.iter().map(|l| (l.input, n)));
+        }
 
         for v in producers {
             if filter_totals.contains_key(&v) {
@@ -471,7 +529,7 @@ impl Cg {
                         };
                         (*s, Some(ni))
                     }
-                    None => (node_ref[&t].sig(), None),
+                    None => (node_ref[&t].sig(), lane_net.get(&t).copied()),
                 };
                 if fused_total.contains(&v) {
                     self.emit_filter_total(g, v, out, m as i32, net, &locate, what);
@@ -480,7 +538,7 @@ impl Cg {
                 }
                 continue;
             }
-            if transparent.contains(&v) {
+            if transparent.contains(&v) || lanes.contains(&v) {
                 continue;
             }
             let (target, m) = fold.get(&v).copied().unwrap_or((v, 1));
@@ -490,7 +548,7 @@ impl Cg {
                 None => node_ref[&target].sig(),
             };
             let out_local = local(target);
-            let out_bundle = bundle_writes.get(&target).map(|(bun, _)| node_ref[bun].bun());
+            let out_bundle = bundle_writes.get(&target).map(|(bun, _)| node_ref[bun].bun()).or_else(|| lane_in.get(&target).copied());
             let scalar_output = if out_bundle.is_some() {
                 None
             } else if !out_local {
@@ -654,10 +712,44 @@ impl Cg {
                 }
             }
         }
-        for v in staged.keys() {
+        for v in staged.keys().chain(lane_in.keys()) {
             node_ref.remove(v);
         }
         Ok(node_ref)
+    }
+
+    /// A straight-line pack (fuse/slp.rs): each lane's input writes the lane's signal onto the
+    /// pack's private wire `input` (red); the combinator computes every lane at once onto the
+    /// bus, or the cluster wire `out`, with per-lane constants on its green input for a table.
+    /// Returns the input wire.
+    fn emit_pack(&mut self, p: &slp::Pack, sigs: &[Sig], input: BRef, out: Option<usize>, what: &str) -> usize {
+        let each = self.each;
+        let lanes = Operand::Sig(each);
+        let k = Operand::Const(p.lanes[0].k);
+        let kind = match p.op {
+            slp::PackOp::Ar { op, left: false } if !p.table => Kind::Arith(Arith { first: lanes, first_nets: Nets::RED, second: k, second_nets: Nets::BOTH, op, out: each }),
+            slp::PackOp::Ar { op, left: true } if !p.table => Kind::Arith(Arith { first: k, first_nets: Nets::BOTH, second: lanes, second_nets: Nets::RED, op, out: each }),
+            slp::PackOp::Ar { op, left } => {
+                let (red, green) = ((lanes, Nets::RED), (lanes, Nets::GREEN));
+                let ((first, first_nets), (second, second_nets)) = if left { (green, red) } else { (red, green) };
+                Kind::Arith(Arith { first, first_nets, second, second_nets, op, out: each })
+            }
+            slp::PackOp::Cmp(cmp) => dec(vec![Cond { first: each, first_nets: Nets::RED, second: k, second_nets: Nets::BOTH, cmp, and: true }], vec![out_const(each, 1)]),
+        };
+        let id = self.loose(kind, format!("{what}: {} lanes at once", p.lanes.len()));
+        self.bread(input, id, false);
+        match out {
+            None => self.nets[0].members.push((id, Conn::OutGreen)),
+            Some(n) => self.nets[n].members.push((id, Conn::OutRed)),
+        }
+        if p.table {
+            let consts = self.bnew();
+            let values = crate::ir::normalize(sigs.iter().zip(&p.lanes).map(|(s, l)| (*s, l.k)));
+            let kc = self.loose(Kind::Constant(ConstComb { values, on: true }), format!("{what}: lane constants"));
+            self.bprod(consts, kc);
+            self.bread(consts, id, true);
+        }
+        self.bred(input)
     }
 
     /// Share only constant-output scalar deciders on exactly the same physical networks.
