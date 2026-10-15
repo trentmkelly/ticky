@@ -112,7 +112,12 @@ tools/validate.py --examples -v                   # every example; -v lists what
 tools/validate.py --collect /tmp/corpus tools/fuzz_exprs.py 50 1   # keep a fuzzer's programs
 tools/validate.py --corpus /tmp/corpus            # ... and validate them
 tools/validate.py --selftest                      # the encoding vs. the compiler's operators
+tools/validate.py --rules                         # the e-graph pass's rewrite rules, for all values
 ```
+
+The e-graph pass (`crates/ticky-compiler/src/egraph.rs`, equality saturation over the scalar
+IR; `TICKY_EGRAPH=0` turns it off) adds a claim for every root it rewrites, so its results are
+checked like the constructors'.
 
 It exits non-zero on a counterexample. See the docstring at the top of the script for what is
 checked, what is assumed (input ranges, a bounded set of signals for bundles) and what isn't

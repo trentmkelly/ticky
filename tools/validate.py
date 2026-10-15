@@ -1462,6 +1462,11 @@ def check_rules(timeout, only=None):
         s.set("timeout", timeout)
         s.add(guard, lhs != rhs)
         r = s.check()
+        if r == z3.unknown:  # the plain bit-vector tactic, given longer, does the hard ones
+            s = z3.Tactic("qfbv").solver()
+            s.set("timeout", timeout * 5)
+            s.add(guard, lhs != rhs)
+            r = s.check()
         if r == z3.unsat:
             continue
         bad += 1
