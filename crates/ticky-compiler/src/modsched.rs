@@ -50,9 +50,10 @@
 //! **Whether to do it** is measured, not guessed ([`choose`]): the program is analysed
 //! without the transformation and with one more round on every candidate loop; a loop keeps
 //! a round only when its step got shorter and the predecessors' extra ticks are paid back
-//! (by the profile's counts when there is one, else within [`GUESS_ITERS`] iterations per
-//! entry). Hidden registers are `int`s: a value that turns out to be a bundle or a signal is
-//! excluded and the round tried again. `TICKY_NO_MODSCHED=1` turns the pass off,
+//! within [`GUESS_ITERS`] iterations per entry (the gain would be weighed by the profile's
+//! counts, but the pass is off in profiled builds for now, see [`enabled`]). Hidden
+//! registers are `int`s: a value that turns out to be a bundle or a signal is excluded and
+//! the round tried again. `TICKY_NO_MODSCHED=1` turns the pass off,
 //! `TICKY_DUMP_MODSCHED=1` prints the decisions, `TICKY_MODSCHED_FORCE=n` applies n rounds
 //! everywhere, paying or not (for fuzzing).
 
@@ -98,8 +99,11 @@ pub fn set_disabled(off: bool) {
     OFF.with(|c| c.set(off));
 }
 
+/// On under `--opt=speed`, but not (yet) together with a profile: on `examples/primes.ticky`
+/// it would take the profile-guided loop from 3 to 2 ticks per iteration (test 1111 → 875
+/// ticks), but `tests/profile_guided.rs` pins the profiled build's 3 ticks.
 fn enabled() -> bool {
-    !crate::opt_size() && !OFF.with(|c| c.get()) && std::env::var_os("TICKY_NO_MODSCHED").is_none()
+    !crate::opt_size() && !crate::profile::active() && !OFF.with(|c| c.get()) && std::env::var_os("TICKY_NO_MODSCHED").is_none()
 }
 
 fn dump() -> bool {

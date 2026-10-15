@@ -893,7 +893,7 @@ work and bundle/array operations scale far better.
   registers. Nothing else moves, so a program sees the same values in the same order; the
   value computed for the iteration after the last one is never used. A loop keeps this only
   if its step gets shorter and the extra ticks before the loop are paid back within about
-  four iterations (or by the profile's counts). `TICKY_NO_MODSCHED=1` turns it off.
+  four iterations. Not yet with `--profile`. `TICKY_NO_MODSCHED=1` turns it off.
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
 
 Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so
