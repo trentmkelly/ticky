@@ -122,14 +122,18 @@ ones compact.
 
 ## 7. Overlapping loop iterations (modulo scheduling) — speed
 
+**Status (2026-10-15): merged.** Sound and fuzz-clean, but no example gets faster; the real
+cases need bundle-typed pipeline registers, IR-level stages, or loop-test speculation
+(follow-ups). With a profile, primes 3 → 2 ticks/iteration. In-game difftest pending.
+
 A `while` loop in a process starts iteration i+1 while i finishes, when dependencies allow.
 
-- [ ] Dependency analysis on loop bodies: loop-carried dependences through state, memory
+- [x] Dependency analysis on loop bodies: loop-carried dependences through state, memory
       (arrays/bundles) and waits; only loops without waits or I/O in the body at first.
 - [ ] Initiation interval from the recurrence and resource bounds; emit a prologue, a
       steady-state kernel, and an epilogue in the step machine.
-- [ ] Exits mid-flight: iterations started speculatively past the exit must not commit.
-- [ ] `fuzz_procs.py` extended with loops of varying dependence distance.
+- [x] Exits mid-flight: iterations started speculatively past the exit must not commit.
+- [x] `fuzz_procs.py` extended with loops of varying dependence distance.
 
 ## 8. Retiming — speed and size
 

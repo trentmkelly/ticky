@@ -1646,3 +1646,46 @@ Bit-field packing of bools/small ints onto shared signals: no net win anywhere.
   beat packing: no extract cost or latency.
 - `tools/survey_signals.py` (per-wire signal pressure, bus bools, multi-test/multi-output
   deciders, extract cost, residual same-shape combinators) kept for future capacity work.
+
+## 2026-10-15: overlapping loop iterations (modsched.rs; PLAN.md §7)
+
+Measured first (single-step loops, depth vs. the deepest chain from a carried value back to itself):
+examples have 12 loop steps; 7 have room (calculator 4→3, collatz 4→3: the loop test reads
+the new value; production-moments 4→2: dead arithmetic; ranking ×2 4→3, signals 7→3: the
+carried value is a bundle; sorting 5→4: the index decode inside `#aget`; arrays 3→2: reads
+an input). Fuzz corpora (150 each): of the loops not reading inputs, 30/102 (procs) and 18/47
+(programs) have room. Little in real code, mostly induction-variable work.
+- `modsched.rs`, after step fusion: in a loop step, the largest *early* subexpressions (pure,
+  reading constants, names the loop doesn't assign, induction variables `v += k`, variables
+  not yet assigned at that point, and early temporaries) become hidden registers `#m…s` that
+  the predecessors set for iteration 0 (prologue) and the end of iteration i sets for i + 1,
+  from ahead registers `#m…a_d = v + d·k` and the variables' new values. The loop test is
+  taken into a temporary first. Rounds repeat it on the precomputed values' operands
+  (deeper pipeline; ahead registers shared). Nothing visible moves: no inputs, other
+  processes' state or `ticks()` are read early; the value computed past the exit only fills
+  a hidden register; under --checks nothing that can fail (division, modulo, array reads)
+  is computed early.
+- `choose` (around `analyze_expanded`) measures: plain analysis, then +1 round on every
+  candidate (≤ 3); kept if the loop step got shorter and the predecessors' extra ticks are
+  paid back within 4 iterations; values that turn out to be bundles/signals are excluded and
+  the round retried; loops long only because of pruned dead code are left alone
+  (prune_dead_stores pins that timing; tests/function_results.rs). Speed only, with or
+  without a profile: primes with --profile goes 3 → 2 ticks/iteration (1111 → 875 ticks,
+  36 → 41 combinators). tests/profile_guided.rs pins PGO's own 3-tick loop with modsched
+  off (`modsched::set_disabled`) and the combined 2 ticks separately. TICKY_NO_MODSCHED,
+  TICKY_DUMP_MODSCHED, TICKY_MODSCHED_FORCE=n (fuzzing).
+- Results: no example changes (bench 2640 → 2640). POLY test (`s += (i*i*3 + i*k) % 11`):
+  8 → 4 ticks/iteration, 30 → 34 combinators; SHAPES test: loops 6→3, 10→4, 5→2, 5→2,
+  97 → 128 combinators (predecessors 2 → 6 ticks). Fires on 34/150 fuzz_procs programs,
+  16/150 fuzz_programs, 54/100 with the new loops; ticks to last output −1.8% / −0.4%.
+- Tried and rejected: precomputing at the end of the body from the new induction values
+  (`i + 1` adds a level: production-moments stayed at 4 ticks), hence ahead registers; a
+  scalar check by state type (hidden states are all `int`; a bundle value compiled
+  silently), hence checking the written value's kind.
+- Not done: bundle-typed pipeline registers (ranking, signals), IR-level stages (sorting's
+  index decode), speculating on the loop test (collatz), loops of several steps (`break`).
+- Tests: modsched unit tests, tests/modulo_scheduling.rs (POLY win, edge shapes vs. plain build
+  on 6 inputs × checks, speculative division under --checks, no example slower). fuzz_procs:
+  `pipe_loop` (dependence distance 0–3, up/down, `while`, nested; separate random stream).
+  verify clean at FUZZ_N=20 and 200; forced rounds 1–3 over procs/programs/CHECKS/level2/
+  signals/bundles clean; combined main verify clean at FUZZ_N=60. Not difftested in game.
