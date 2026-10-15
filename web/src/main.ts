@@ -40,6 +40,9 @@ function options(): Options {
     opt: $<HTMLSelectElement>("opt").value as Options["opt"],
     place: $<HTMLSelectElement>("place").value as Options["place"],
     poles: $<HTMLInputElement>("poles").checked,
+    // `# ticky: --checks` on the first line asks for runtime checks (failed asserts and the
+    // like halt the program), as with the command line.
+    checks: view.state.doc.line(1).text.startsWith("# ticky: --checks"),
   };
 }
 

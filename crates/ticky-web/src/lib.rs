@@ -12,6 +12,25 @@ use ticky_syntax::diag::Severity;
 use ticky_syntax::Diag;
 use wasm_bindgen::prelude::wasm_bindgen;
 
+thread_local! {
+    static PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps a compiler panic's message for [`last_panic`] (a panic aborts the wasm instance, and
+/// the page only sees "unreachable").
+#[wasm_bindgen(start)]
+pub fn start() {
+    std::panic::set_hook(Box::new(|info| {
+        PANIC.with(|p| *p.borrow_mut() = Some(info.to_string()));
+    }));
+}
+
+/// The message of the panic that stopped the compiler, if any.
+#[wasm_bindgen]
+pub fn last_panic() -> Option<String> {
+    PANIC.with(|p| p.borrow().clone())
+}
+
 fn options(json: &str) -> Options {
     let o: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let opt = if o["opt"] == "size" { Opt::Size } else { Opt::Speed };

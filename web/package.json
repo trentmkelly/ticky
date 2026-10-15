@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "wasm": "bash scripts/build-wasm.sh",
+    "check": "node scripts/check-wasm.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"

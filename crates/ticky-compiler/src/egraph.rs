@@ -905,7 +905,7 @@ fn run(g: &mut Graph, roots: &[V], no_const: &[bool], what: &str, force: bool) -
     if roots.is_empty() {
         return None;
     }
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Instant::now();
     // The region: rewritable nodes reachable from the roots through rewritable nodes.
     let mut region: HashSet<V> = HashSet::new();
     let mut stack: Vec<V> = roots.iter().copied().filter(|&r| rewritable(g, r)).collect();

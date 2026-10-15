@@ -38,6 +38,7 @@ export interface Options {
   opt: "speed" | "size";
   place: "grid" | "anneal";
   poles: boolean;
+  checks: boolean;
 }
 
 const TIMEOUT_MS = 60_000;
