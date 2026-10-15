@@ -335,6 +335,87 @@ impl Pat {
         out
     }
 
+    /// The pattern as a Ticky expression over inputs `a`, `b`, `c` (for tests compiling the
+    /// rule table), and which leaves are booleans (select conditions). `None` where Ticky has
+    /// no direct spelling (truncating `/` and `%`, `**`, INT_MIN literals, holes elsewhere).
+    pub fn to_ticky(&self) -> Option<(String, Vec<usize>)> {
+        let mut bools = Vec::new();
+        let mut ints = Vec::new();
+        let e = self.ticky(&mut bools, &mut ints)?;
+        if bools.iter().any(|b| ints.contains(b)) {
+            return None;
+        }
+        bools.sort_unstable();
+        bools.dedup();
+        Some((e, bools))
+    }
+
+    fn ticky_cond(&self, bools: &mut Vec<usize>, ints: &mut Vec<usize>) -> Option<String> {
+        match self {
+            Pat::X(i) => {
+                bools.push(*i);
+                Some(["a", "b", "c"][*i].to_string())
+            }
+            Pat::Cmp(..) => self.ticky(bools, ints),
+            Pat::Dec(arms) if arms.len() == 1 && arms[0].0 == 1 => dnf_ticky(&arms[0].1, bools, ints),
+            _ => Some(format!("({} != 0)", self.ticky(bools, ints)?)),
+        }
+    }
+
+    fn ticky(&self, bools: &mut Vec<usize>, ints: &mut Vec<usize>) -> Option<String> {
+        Some(match self {
+            Pat::X(i) => {
+                ints.push(*i);
+                ["a", "b", "c"][*i].to_string()
+            }
+            Pat::K(k) if *k == i32::MIN => return None,
+            Pat::K(k) if *k < 0 => format!("({k})"),
+            Pat::K(k) => k.to_string(),
+            Pat::Hole => return None,
+            Pat::Ar(op, x, y) => {
+                let o = match op {
+                    ArOp::Add => "+",
+                    ArOp::Sub => "-",
+                    ArOp::Mul => "*",
+                    ArOp::And => "&",
+                    ArOp::Or => "|",
+                    ArOp::Xor => "^",
+                    ArOp::Shl if matches!(**y, Pat::K(0..=31)) => "<<",
+                    ArOp::Shr if matches!(**y, Pat::K(0..=31)) => ">>",
+                    _ => return None,
+                };
+                format!("({} {o} {})", x.ticky(bools, ints)?, y.ticky(bools, ints)?)
+            }
+            Pat::Cmp(op, x, y) => format!("({} {} {})", x.ticky(bools, ints)?, cmp_ticky(*op), y.ticky(bools, ints)?),
+            Pat::Mux(t, f, a, b) => match (&**t, &**f) {
+                (Pat::Hole, Pat::Hole) => "0".into(),
+                (Pat::Hole, f) => format!("({} if {} else 0)", b.ticky(bools, ints)?, f.ticky_cond(bools, ints)?),
+                (t, Pat::Hole) => format!("({} if {} else 0)", a.ticky(bools, ints)?, t.ticky_cond(bools, ints)?),
+                (t, f) => {
+                    // `f` is `not t` in the IR; a leaf `f` stays an (unused) input.
+                    if let Pat::X(j) = f {
+                        bools.push(*j);
+                    }
+                    format!("({} if {} else {})", a.ticky(bools, ints)?, t.ticky_cond(bools, ints)?, b.ticky(bools, ints)?)
+                }
+            },
+            Pat::Dec(arms) => {
+                let mut parts = Vec::new();
+                for (k, d) in arms {
+                    parts.push(format!("({} if {} else 0)", Pat::K(*k).ticky(bools, ints)?, dnf_ticky(d, bools, ints)?));
+                }
+                format!("({})", parts.join(" + "))
+            }
+            Pat::Sel(arms) => {
+                let mut parts = Vec::new();
+                for (c, x) in arms {
+                    parts.push(format!("({} if {} else 0)", x.ticky(bools, ints)?, c.ticky_cond(bools, ints)?));
+                }
+                format!("({})", parts.join(" + "))
+            }
+        })
+    }
+
     /// Pairs of leaves used as the two conditions of one select (`t`, `f`): complementary
     /// booleans in the IR, so test vectors keep them so.
     pub fn complements(&self) -> Vec<(usize, usize)> {
@@ -348,6 +429,29 @@ impl Pat {
         });
         out
     }
+}
+
+fn cmp_ticky(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "<",
+        CmpOp::Gt => ">",
+        CmpOp::Eq => "==",
+        CmpOp::Ge => ">=",
+        CmpOp::Le => "<=",
+        CmpOp::Ne => "!=",
+    }
+}
+
+fn dnf_ticky(d: &[Vec<(CmpOp, Pat, Pat)>], bools: &mut Vec<usize>, ints: &mut Vec<usize>) -> Option<String> {
+    let mut terms = Vec::new();
+    for t in d {
+        let mut lits = Vec::new();
+        for (op, a, b) in t {
+            lits.push(format!("({} {} {})", a.ticky(bools, ints)?, cmp_ticky(*op), b.ticky(bools, ints)?));
+        }
+        terms.push(if lits.is_empty() { "True".to_string() } else { format!("({})", lits.join(" and ")) });
+    }
+    Some(if terms.is_empty() { "False".to_string() } else { format!("({})", terms.join(" or ")) })
 }
 
 #[cfg(test)]
@@ -368,5 +472,8 @@ mod tests {
         assert_eq!(d.consts(), vec![20000, 16748544, 1579032]);
         assert_eq!(Pat::parse("(mux x0 _ x1 0)").unwrap().eval(&[1, 9]), 9);
         assert_eq!(Pat::parse("(sel (eq x0 0) 20 (eq x0 1) 16)").unwrap().eval(&[1]), 16);
+        assert_eq!(min.to_ticky().unwrap(), ("(a if (a < b) else b)".to_string(), vec![]));
+        assert_eq!(Pat::parse("(mux x0 _ x1 0)").unwrap().to_ticky().unwrap(), ("(b if a else 0)".to_string(), vec![0]));
+        assert!(Pat::parse("(div x0 3)").unwrap().to_ticky().is_none());
     }
 }

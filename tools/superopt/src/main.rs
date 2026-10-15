@@ -21,6 +21,13 @@
 //! (±1), equal inputs, random values, and missing (zero) signals. Winners are written with
 //! their circuits as JSON lines for `tools/superopt_confirm.py`, which proves them with z3.
 //!
+//! Checked in (tools/superopt/): `targets.tsv` (the harvest the search ran on), `search.txt`
+//! (its output: every class, winner or not), `rules.jsonl` (the winners with their circuits,
+//! proved by `tools/superopt_confirm.py --write`), read by
+//! crates/ticky-compiler/tests/superopt_rules.rs. The family the compiler implements is the
+//! pick decider (codegen/selects.rs `Out::Pick`). Deterministic for a seed, except where the
+//! serial search hits its time budget (`--budget`, per pattern).
+//!
 //! usage: superopt search --targets FILE [--top N] [--seed S] [--out RULES.jsonl]
 //!                        [--min-excess E] [--budget SECONDS]
 //!        superopt eval 'SHAPE' X0 [X1 [X2]]
@@ -347,7 +354,8 @@ fn gen_single(a: &Alpha, s: &Sigs, out: Sig, reds: &[(Red, Vec<Sig>)], to_p: boo
             // Picks: one term per table signal, `each(red) = its code ∧ a literal` (or alone),
             // copying the passing signal's bus value onto `out` (summed, so renamed).
             let codes: Vec<i32> = rsigs.iter().enumerate().map(|(i, _)| i as i32 + 1).collect();
-            let mut opts: Vec<Vec<Vec<Lit>>> = vec![vec![vec![]]];
+            // Per code: never (no term), always, a literal, one of the pattern's conditions.
+            let mut opts: Vec<Vec<Vec<Lit>>> = vec![vec![], vec![vec![]]];
             opts.extend(a.plits.iter().map(|&l| vec![vec![l]]));
             for d in &a.pdnfs {
                 if !opts.contains(d) {
@@ -364,10 +372,10 @@ fn gen_single(a: &Alpha, s: &Sigs, out: Sig, reds: &[(Red, Vec<Sig>)], to_p: boo
                         dnf.push(t);
                     }
                 }
-                for nets in [Nets::GREEN] {
-                    v.push(Cand { kind: decider(&dnf, vec![dout(out, true, 0, nets)]), red });
+                if !dnf.is_empty() {
+                    v.push(Cand { kind: decider(&dnf, vec![dout(out, true, 0, Nets::GREEN)]), red });
                     if to_p {
-                        v.push(Cand { kind: decider(&dnf, vec![dout(s.each, true, 0, nets)]), red });
+                        v.push(Cand { kind: decider(&dnf, vec![dout(s.each, true, 0, Nets::GREEN)]), red });
                     }
                 }
                 // Next combination (odometer); also the subsets with a term left out.
@@ -413,7 +421,10 @@ const QUICK: usize = 10;
 const MAX_P: usize = 4000;
 const NTESTS: usize = 64;
 
-fn make_tests(p: &Pat, ivs: &[(i64, i64)], sigs: &Sigs, rng: &mut Rng) -> Tests {
+/// The search's tests, and the wider set every winner must also pass: all combinations of
+/// each leaf's special values (0, ±1, ±2, INT_MIN, INT_MAX and neighbours, the pattern's
+/// constants and neighbours), as far as 4000 vectors.
+fn make_tests(p: &Pat, ivs: &[(i64, i64)], sigs: &Sigs, rng: &mut Rng) -> (Tests, Tests) {
     let n = p.leaves();
     let consts = p.consts();
     let mut pool: Vec<i64> = vec![0, 1, -1, 2, -2, 3, i32::MIN as i64, i32::MAX as i64, i32::MIN as i64 + 1, i32::MAX as i64 - 1, 7, -7, 100, -100];
@@ -451,6 +462,35 @@ fn make_tests(p: &Pat, ivs: &[(i64, i64)], sigs: &Sigs, rng: &mut Rng) -> Tests 
             xs.push(x);
         }
     }
+    let mut specials: Vec<Vec<i32>> = Vec::new();
+    for iv in ivs.iter().take(n) {
+        let mut sp: Vec<i32> = Vec::new();
+        for v in [0, 1, -1, 2, -2, i32::MIN as i64, i32::MAX as i64, i32::MIN as i64 + 1, i32::MAX as i64 - 1].into_iter().chain(consts.iter().flat_map(|&c| [c as i64, c as i64 + 1, c as i64 - 1, -(c as i64)])) {
+            let v = clamp(v, *iv);
+            if !sp.contains(&v) {
+                sp.push(v);
+            }
+        }
+        specials.push(sp);
+    }
+    let mut wide: Vec<Vec<i32>> = vec![vec![]];
+    for sp in &specials {
+        wide = wide.into_iter().flat_map(|w| sp.iter().map(move |&v| w.iter().copied().chain([v]).collect::<Vec<i32>>())).collect();
+        if wide.len() > 4000 {
+            wide.truncate(4000);
+        }
+    }
+    for x in &mut wide {
+        for &(t, f) in &comp {
+            x[f] = (x[t] == 0) as i32;
+        }
+    }
+    wide.extend(xs.iter().cloned());
+    (to_tests(p, &xs, sigs, rng), to_tests(p, &wide, sigs, rng))
+}
+
+fn to_tests(p: &Pat, xs: &[Vec<i32>], sigs: &Sigs, rng: &mut Rng) -> Tests {
+    let n = p.leaves();
     let f: Vec<i32> = xs.iter().map(|x| p.eval(x)).collect();
     let bus = xs
         .iter()
@@ -482,6 +522,38 @@ struct Circuit {
 }
 
 impl Circuit {
+    /// The value of O on each test (`None` if anything else reaches the output).
+    fn output(&self, eng: &mut Engine, tests: &[Bus]) -> Option<Vec<i32>> {
+        let o = Sigs::new().o;
+        let mut p: Option<Vec<Vec<(Sig, i32)>>> = None;
+        let mut total = vec![self.offset; tests.len()];
+        for (c, to_p) in &self.combs {
+            if *to_p {
+                let got = eng.contents(std::slice::from_ref(c), tests).pop().unwrap();
+                p = Some(match p {
+                    None => got,
+                    Some(old) => old.into_iter().zip(got).map(|(a, b)| {
+                        let mut m = a;
+                        for (s, v) in b {
+                            match m.iter_mut().find(|x| x.0 == s) {
+                                Some(x) => x.1 = x.1.wrapping_add(v),
+                                None => m.push((s, v)),
+                            }
+                        }
+                        m.retain(|x| x.1 != 0);
+                        m
+                    }).collect(),
+                });
+            } else {
+                let sig = eng.signatures(std::slice::from_ref(c), tests, p.as_deref(), o).pop().unwrap()?;
+                for (t, v) in total.iter_mut().zip(sig) {
+                    *t = t.wrapping_add(v);
+                }
+            }
+        }
+        Some(total)
+    }
+
     fn combinators(&self) -> usize {
         self.combs.len()
     }
@@ -641,7 +713,7 @@ fn search(t: &Target, sigs: &Sigs, seed: u64, budget: f64) -> Result<Found, Stri
         return Err(format!("{n} leaves"));
     }
     let mut rng = Rng(seed ^ hash(&t.shape));
-    let tests = make_tests(&p, &t.ivs, sigs, &mut rng);
+    let (tests, wide) = make_tests(&p, &t.ivs, sigs, &mut rng);
     let xs: Vec<Sig> = sigs.x[..n].to_vec();
     // Constants: the pattern's, their negations and neighbours, 0 and ±1.
     let mut consts: Vec<i32> = Vec::new();
@@ -702,9 +774,14 @@ fn search(t: &Target, sigs: &Sigs, seed: u64, budget: f64) -> Result<Found, Stri
         reds.push((Red::Table(i), tb.iter().map(|x| x.0).collect()));
     }
     let mut best: Option<Circuit> = None;
-    let consider = |c: Circuit, best: &mut Option<Circuit>| {
+    let mut rejected = 0usize;
+    let mut consider = |c: Circuit, best: &mut Option<Circuit>, eng: &mut Engine| {
         if best.as_ref().is_none_or(|b| c.key() < b.key()) {
-            *best = Some(c);
+            if c.output(eng, &wide.bus).as_deref() == Some(&wide.f[..]) {
+                *best = Some(c);
+            } else {
+                rejected += 1;
+            }
         }
     };
     let single = |cand: &Cand| Circuit { combs: vec![(cand.clone(), false)], tables: tables.clone(), offset: 0, depth: 1 };
@@ -728,18 +805,18 @@ fn search(t: &Target, sigs: &Sigs, seed: u64, budget: f64) -> Result<Found, Stri
     for (i, s) in a_sigs.iter().enumerate() {
         let Some(s) = s else { continue };
         if *s == tests.f {
-            consider(single(&a_cands[i]), &mut best);
+            consider(single(&a_cands[i]), &mut best, &mut eng);
         }
         let need: Vec<i32> = tests.f.iter().zip(s).map(|(f, v)| f.wrapping_sub(*v)).collect();
         if need.iter().all(|v| *v == need[0]) {
             let mut c = single(&a_cands[i]);
             c.offset = need[0];
-            consider(c, &mut best);
+            consider(c, &mut best, &mut eng);
         }
         if let Some(&j) = by_sig.get(&need[..]) {
             let mut c = single(&a_cands[i]);
             c.combs.push((a_cands[j].clone(), false));
-            consider(c, &mut best);
+            consider(c, &mut best, &mut eng);
         }
     }
     let within = |b: &Option<Circuit>, n: usize| b.as_ref().is_some_and(|c| c.combinators() <= n);
@@ -786,14 +863,14 @@ fn search(t: &Target, sigs: &Sigs, seed: u64, budget: f64) -> Result<Found, Stri
                 let Some(full) = full else { continue };
                 let serial = Circuit { combs: vec![(p_cands[*src].clone(), true), (c2[j].clone(), false)], tables: tables.clone(), offset: 0, depth: 2 };
                 if full == tests.f {
-                    consider(serial.clone(), &mut best);
+                    consider(serial.clone(), &mut best, &mut eng);
                 }
                 for &a in partner.iter().flatten() {
                     let sa = a_sigs[a].as_ref().unwrap();
                     if full.iter().zip(sa).zip(&tests.f).all(|((x, y), f)| x.wrapping_add(*y) == *f) {
                         let mut c = serial.clone();
                         c.combs.push((a_cands[a].clone(), false));
-                        consider(c, &mut best);
+                        consider(c, &mut best, &mut eng);
                     }
                 }
             }
@@ -801,6 +878,9 @@ fn search(t: &Target, sigs: &Sigs, seed: u64, budget: f64) -> Result<Found, Stri
                 break;
             }
         }
+    }
+    if rejected > 0 {
+        notes.push(format!("{rejected} candidates failed the wide tests"));
     }
     Ok(Found { circuit: best, evals: eng.evals, secs: start.elapsed().as_secs_f64(), notes: notes.join(", ") })
 }
@@ -865,7 +945,8 @@ fn main() {
                         patterns += 1;
                         today += t.cost;
                         let (n, d, consts) = f.circuit.as_ref().map_or((usize::MAX, 0, 0), |c| (c.combinators(), c.depth, c.constants()));
-                        let better = (n as f64) < avg - 1e-9;
+                        // Improved: at least half a combinator below today's average.
+                        let better = n != usize::MAX && (n as f64) + 0.5 <= avg;
                         if better {
                             improved += 1;
                             after += n * t.count;
@@ -884,8 +965,9 @@ fn main() {
                         );
                         if let Some(c) = &f.circuit {
                             println!("        {}", c.text());
+                            let ticky = Pat::parse(&t.shape).ok().and_then(|p| p.to_ticky()).map_or("null".to_string(), |(e, bools)| format!("{{\"expr\":\"{e}\",\"bools\":{bools:?}}}"));
                             lines.push(format!(
-                                "{{\"shape\":\"{}\",\"leaves\":[{}],\"count\":{},\"today\":{},\"combinators\":{n},\"constants\":{consts},\"depth\":{d},\"better\":{better},\"text\":\"{}\",\"circuit\":{}}}",
+                                "{{\"shape\":\"{}\",\"ticky\":{ticky},\"leaves\":[{}],\"count\":{},\"today\":{},\"combinators\":{n},\"constants\":{consts},\"depth\":{d},\"better\":{better},\"text\":\"{}\",\"circuit\":{}}}",
                                 t.shape,
                                 t.ivs.iter().map(|(a, b)| format!("[{a},{b}]")).collect::<Vec<_>>().join(","),
                                 t.count,
