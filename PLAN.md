@@ -160,11 +160,15 @@ If a cheap combinator feeds two distant clusters, a copy next to each beats rela
 
 ## 10. Signal packing — size
 
+**Status (2026-10-15): surveyed, dropped.** Signal pressure is far from limits for real
+programs; multi-condition/multi-output deciders already cover the savings; extracts cost
+combinators and ticks. More bus networks would beat packing if capacity ever matters.
+
 Range analysis knows when values are small; several booleans or small ints could share one
 signal as bit fields, fewer signals on wires and sometimes fewer combinators.
 
-- [ ] Find what packing actually saves: signal pressure (wires running out of signals,
+- [x] Find what packing actually saves: signal pressure (wires running out of signals,
       bundles) vs. the extract cost (shift + mask = combinators).
-- [ ] Candidates: flag sets read together (masks tested at once by one decider), state
+- [x] Candidates: flag sets read together (masks tested at once by one decider), state
       registers.
-- [ ] Probably the most speculative item: drop it if the survey shows no win.
+- [x] Probably the most speculative item: drop it if the survey shows no win.

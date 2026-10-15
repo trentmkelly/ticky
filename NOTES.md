@@ -1622,3 +1622,27 @@ varying bundle operand, n + 1 per scalar one for the rename), timing ignored.
   slack. Sketch if revived: size-only graph rewrite before `logic()`, PC as an extra source of
   depth 1, `BDec`/`Sel` muxes, kept only if no step's depth grows and a trial build of the
   process is smaller.
+
+## 2026-10-15: signal packing (PLAN §10) — surveyed, dropped
+
+Bit-field packing of bools/small ints onto shared signals: no net win anywhere.
+- Pressure: examples peak at 84 bus signals (aes128; enf 79) of 1432 (23% of the 358
+  `--no-quality` pool), busiest cluster pool 117; the most signals on one wire is
+  histogram's 400-element bundle constant (array data, already banked). 600 fuzz_level2
+  programs (seeds 75/77/3, size 200): bus median 29, p99 486, max 959; 3 "ran out of
+  signals" (12 with `--no-quality`). Even free, perfect packing (32 bools / 4 small ints per
+  signal) leaves 2 of the 3 over the limit (~2,300–2,500 needed); the third (s77-009, a
+  pathological `every` block: 1,756 bool path conditions) fits only by paying ≥1,756
+  extract combinators. With `--no-quality` it would rescue 2 of 12.
+- Combinators: Factorio 2.0 deciders already test many flags (813 of 2640 example
+  combinators test ≥2 signals) and hold/load flag sets together (278 multi-output
+  deciders, `Cg::shared`; guess's 3 bool registers share one hold). Only 7 deciders with
+  identical conditions/wires are left unmerged. Packing adds an `AND 2^k` per bit read
+  (759 bool producers, 3,579 reader pairs) and read-modify-write per field write; best case
+  found (guess's outputs) is +1.
+- Ticks: +1 per bit test, +2 per field extract (shift+mask), ≥+2 per field write, all on
+  the step/period critical paths (most bus bools are step pulses and enables).
+- If signal capacity ever matters, more bus networks (or more values on cluster wires)
+  beat packing: no extract cost or latency.
+- `tools/survey_signals.py` (per-wire signal pressure, bus bools, multi-test/multi-output
+  deciders, extract cost, residual same-shape combinators) kept for future capacity work.
