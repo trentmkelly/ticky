@@ -753,7 +753,7 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
-    let mut p = analyze_expanded(&expanded, pipeline, choices)?;
+    let mut p = analyze_expanded(&expanded, pipeline, choices, &mem)?;
     p.screens = screens;
     p.random = random;
     p.controls = controls;
@@ -763,7 +763,8 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
     Ok(p)
 }
 
-fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Program, Vec<Diag>> {
+/// `peripherals`: variables shown by screens, readouts, panels and speakers.
+fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &HashSet<String>) -> Result<Program, Vec<Diag>> {
     let t0 = std::time::Instant::now();
     let table = SignalTable::base();
     let mut errs = Vec::new();
@@ -922,7 +923,7 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Prog
     let observable = |unit: usize| {
         let unit_names = &unit_names;
         let ports = &ports;
-        move |n: &str| ports.iter().any(|p| p.name == n) || unit_names.iter().enumerate().any(|(k, m)| k != unit && m.contains(n))
+        move |n: &str| peripherals.contains(n) || ports.iter().any(|p| p.name == n) || unit_names.iter().enumerate().any(|(k, m)| k != unit && m.contains(n))
     };
     let main_cfg = if main_stmts.is_empty() {
         None

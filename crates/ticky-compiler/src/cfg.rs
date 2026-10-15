@@ -683,12 +683,20 @@ fn live_in(steps: &[Draft]) -> Vec<Option<Names>> {
 }
 
 /// Profile-guided if-conversion of hot branch targets. A step ending in a branch that goes
-/// one way most of the time (at least 2/3 of its runs, and `hot_min()` times or more) takes in the
-/// code of that side: `A; if c → H else → O` becomes `A; t = c; if t: H`, continuing where H
-/// continues (when `t`) or at O, so the hot path saves a step (two ticks or more) and the
-/// cold path runs a longer step. The cold side is taken in too when that's needed to keep
-/// two targets, if it is small. A side whose own branch condition is `d` contributes
-/// `t and d` to the merged condition. Sides that wait, call or return are left alone.
+/// one way most of the time (at least 2/3 of its runs, and `hot_min()` times or more) takes
+/// in the code of that side: `A; if c → H else → O` becomes `A; t = c; if t: H`, continuing
+/// where H continues (when `t`) or at O, so the hot path saves a step (two ticks or more)
+/// and the cold path runs a longer step. The cold side is taken in too when that's needed to
+/// keep two targets, if it is small. A side whose own branch condition is `d` computes it
+/// in its arm (`t and d` in the merged condition). Sides that wait, call or return are left
+/// alone.
+///
+/// When everything H writes is dead wherever the cold path continues, invisible outside the
+/// process (`observable`), and H has no `assert` (and the build no `--checks`), H runs
+/// unconditionally (speculatively) after the cold side's code, so its results don't pass
+/// through selects on `t` (which would cost a tick: `if not t: d += 1` becomes `d + [not t]`).
+/// Whether any of this pays off is decided by the caller ([`crate::compile`]), which costs
+/// the whole build against the profile.
 fn merge_hot_branches(steps: &mut [Draft], est: &mut Est, observable: &dyn Fn(&str) -> bool) {
     let n = steps.len();
     let mut budget = n;
@@ -987,6 +995,66 @@ mod tests {
         assert_eq!(c.steps.len(), 3);
         let Term::Branch(_, Some(t), _) = &c.steps[1].term else { panic!("{:?}", c.steps[1].term) };
         assert_eq!(*t, 1);
+    }
+
+    /// Builds `src` with a profile in which every branch went to its `else` side 100 times
+    /// (and once the other way), merging hot targets, with `observable` names.
+    fn guided(src: &str, observable: &dyn Fn(&str) -> bool) -> Cfg {
+        use crate::profile::{Guide, ProcProfile, Profile};
+        let raw = cfg(src).raw;
+        let mut edges = std::collections::BTreeMap::new();
+        for (i, r) in raw.iter().enumerate() {
+            if let Some((t, f)) = r.branch {
+                edges.insert((i, t), 1);
+                edges.insert((i, f), 100);
+            }
+        }
+        let p = ProcProfile { steps: raw.iter().map(|r| (r.span, 0)).collect(), edges };
+        let profile = Profile { source: 0, procs: [("main".to_string(), p)].into_iter().collect() };
+        crate::profile::set_current(Some(profile), Guide { merge: true, copy: false });
+        let m = ticky_syntax::parse(src).unwrap();
+        let c = build("main", &m.body, &[], &|e| match e.kind {
+            ExprKind::Int(v) => Some(v as i32),
+            _ => None,
+        }, observable);
+        crate::profile::set_current(None, Guide { merge: false, copy: false });
+        c.unwrap()
+    }
+
+    #[test]
+    fn hot_branch_targets_merge_and_speculate_only_unseen_dead_writes() {
+        // `d += 1` (the hot side) is dead after the `break` (the cold side), `probe` is not
+        // dead if something outside can see it.
+        let src = "d = 2\nwhile d < n:\n    if n % d == 0:\n        first = d\n        break\n    d += 1\n    probe = d\nx = d * 0\n";
+        let stmt_names = |s: &Stmt| -> Vec<String> {
+            let mut w = std::collections::BTreeSet::new();
+            assigned(std::slice::from_ref(s), &mut w);
+            w.into_iter().collect()
+        };
+        // The merged `if n % d == 0` step (it computes a flag `#pgo…` and assigns `first`).
+        // What it writes outside its `if` runs unconditionally.
+        let merged = |c: &Cfg| -> usize {
+            c.steps.iter().position(|d| has_temp(&d.stmts) && {
+                let mut w = std::collections::BTreeSet::new();
+                assigned(&d.stmts, &mut w);
+                w.contains("first")
+            }).expect("a merged step")
+        };
+        let top_level = |c: &Cfg| -> Vec<String> {
+            let d = &c.steps[merged(c)];
+            d.stmts.iter().filter(|s| !matches!(s.kind, StmtKind::If { .. })).flat_map(stmt_names).filter(|n| !n.starts_with('#')).collect()
+        };
+        // `x = d * 0` reads `d` after the loop: nothing can be speculated.
+        assert_eq!(top_level(&guided(src, &|_| false)), Vec::<String>::new());
+        let src = src.replace("x = d * 0", "x = 1");
+        assert_eq!(top_level(&guided(&src, &|_| false)), vec!["d".to_string(), "probe".to_string()]);
+        // `probe` visible (an output, or read by another process): the hot side stays
+        // conditional.
+        assert_eq!(top_level(&guided(&src, &|n| n == "probe")), Vec::<String>::new());
+        // The loop is one step now: the merged step branches back to itself.
+        let c = guided(&src, &|_| false);
+        let i = merged(&c);
+        assert!(targets(&c.steps[i].term).contains(&Some(i)));
     }
 
     #[test]

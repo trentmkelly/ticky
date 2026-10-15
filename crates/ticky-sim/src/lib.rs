@@ -526,6 +526,29 @@ mod tests {
     use super::*;
     use ticky_factorio::*;
 
+    /// A state trace follows a program counter driven by hand: each `any` pulse counts the
+    /// state the counter held the tick before, and halting is the transition to 0.
+    #[test]
+    fn state_trace_counts_visits_and_transitions() {
+        let t = SignalTable::base();
+        let (pc, any) = (t.resolve_ident("P").unwrap(), t.resolve_ident("A").unwrap());
+        let mut n = Netlist::default();
+        let k = n.add(Kind::Constant(ConstComb { values: vec![], on: true }), Role::Core);
+        let d = n.add(Kind::Decider(Decider { conds: vec![], outputs: vec![] }), Role::Core);
+        n.wire((k, Conn::Green), (d, Conn::InGreen));
+        let mut sim = Sim::new(&n);
+        let i = sim.trace_states(d, pc, any);
+        // (pc, any) per tick: start pulse, state 1 (2 ticks), 2, 2 again (a self-loop), 1, halt.
+        let ticks = [(0, 1), (1, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0), (0, 0)];
+        for (p, a) in ticks {
+            sim.set_constant_values(k, vec![(pc, p), (any, a)]);
+            sim.step();
+        }
+        let tr = &sim.state_traces()[i];
+        assert_eq!(tr.visits, HashMap::from([(1, 2), (2, 2)]));
+        assert_eq!(tr.edges, HashMap::from([((1, 2), 1), ((2, 2), 1), ((2, 1), 1), ((1, 0), 1)]));
+    }
+
     /// A one-combinator clock: x' = (x + 1 < 4) ? x + 1 : 0, fed by a constant 1.
     #[test]
     fn decider_clock() {

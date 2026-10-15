@@ -82,6 +82,8 @@ ticky build prog.ticky --no-quality    # for games without the Quality mod (see 
 ticky build prog.ticky --checks        # runtime checks: error lamp + `error` code output
 ticky check prog.ticky                  # errors, warnings and the cost report
 ticky test  prog.ticky                  # run the program's `test` blocks in the simulator
+ticky test  prog.ticky --profile p.json # ... and record which steps and branches they ran
+ticky build prog.ticky --profile p.json # profile-guided: faster where the tests spent their time
 ticky sim   prog.ticky --ticks 300 --set charge=10 --set charge=90@100   # print output changes
 ticky difftest prog.ticky --ticks 300 --set ...   # simulator vs. real Factorio, tick by tick
 ticky decode prog.bp.txt                # any blueprint string → JSON
@@ -98,6 +100,27 @@ Counts include arithmetic, decider, and selector combinators, but not constants 
 `--set stock=iron-plate:5,copper-plate:3@10`, and `Signal` inputs a signal name
 (`--set want=coal`; `iron-plate@rare` for a quality). `RUN=0@tick` and `RUN=1@tick` switch the program
 off and on.
+
+## Profile-guided builds
+
+`ticky test prog.ticky --profile p.json` runs the tests and records, for every process (`main`
+and each `process`), how often each step ran and which way each branch went. `ticky build
+prog.ticky --profile p.json` (also `check`, `sim` and `test --use-profile p.json`) then spends
+combinators where the tests spent ticks:
+
+- a branch that nearly always goes one way takes the code of its hot side into the branching
+  step, so that path saves a step; when what the hot side writes is dead where the cold side
+  goes (and no port, screen or other process can see it), the hot code runs unconditionally;
+- a step is copied into the predecessors that jumped to it often (larger steps than usual),
+  and never into ones that didn't jump to it at all.
+
+The build is costed against the profile with and without each kind of change, and kept only
+if the profiled run would take fewer ticks; the report says how many (`profile: …`). On
+`examples/primes.ticky` the trial-division loop goes from 5 to 3 ticks per iteration (the test
+from 1361 to 1111 ticks, with 36 combinators instead of 40). Only `--opt=speed` builds use a
+profile; one recorded from different source text, or whose steps don't match, is ignored with
+a warning. Without `--profile` the build is unchanged. The file format is described in
+`crates/ticky-compiler/src/profile.rs`.
 
 ## AES-128 example
 

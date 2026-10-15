@@ -9,29 +9,41 @@
 //! as a check: a profile whose spans don't match the program being built is ignored with a
 //! warning, as is one recorded from different source text.
 //!
-//! The file is JSON:
+//! The file is JSON (from `ticky test examples/primes.ticky --profile primes.json`, cut):
 //!
 //! ```json
 //! {
 //!   "ticky_profile": 1,
-//!   "source": "fnv1a64:5f1b0c9e2d3a4b71",
+//!   "source": "fnv1a64:e9071b505144d35a",
 //!   "processes": [
 //!     {
 //!       "name": "main",
 //!       "steps": [
-//!         {"id": 5, "span": [240, 251], "line": 11, "col": 9, "visits": 300,
-//!          "branch": {"taken": 74, "not_taken": 226}}
+//!         {"id":0,"span":[129,319],"line":7,"col":1,"visits":1,"branch":{"taken":1,"not_taken":0}},
+//!         {"id":4,"span":[190,294],"line":10,"col":5,"visits":236,"branch":{"taken":74,"not_taken":162}},
+//!         {"id":6,"span":[216,283],"line":11,"col":9,"visits":74}
 //!       ],
-//!       "edges": [{"from": 5, "to": 4, "count": 74}, {"from": 6, "to": null, "count": 1}]
+//!       "edges": [
+//!         {"from":4,"to":6,"count":74},
+//!         {"from":4,"to":7,"count":162},
+//!         {"from":2,"to":null,"count":1}
+//!       ]
 //!     }
 //!   ]
 //! }
 //! ```
 //!
-//! `steps` lists every raw step (`id` = its number, `span` = byte offsets of its source in
-//! the file, `line`/`col` for people); `visits` is how many times it ran, and `branch` (for a
-//! step ending in a two-way branch) how often the condition was true and false. `edges` are
-//! the transitions that happened, `to: null` meaning the process halted.
+//! `source` is a hash of the program text. `steps` lists every raw step (`id` = its number,
+//! `span` = byte offsets of the source that made it, `line`/`col` for people); `visits` is how
+//! many times it ran (summed over all the tests), and `branch` (for a step ending in a
+//! two-way branch) how often the condition was true and false. `edges` are the transitions
+//! that happened, `to: null` meaning the process halted. Processes are `main` and the
+//! `process` names.
+//!
+//! Recording (testrun.rs): the simulator watches each process's program counter and commit
+//! pulse ([`ticky_sim::StateTrace`]); a step of the built circuit runs one or more raw steps
+//! in a row ([`crate::program::Step::origin`]), so its visits and transitions map back to raw
+//! steps exactly (for a build without a profile).
 
 use std::collections::BTreeMap;
 
@@ -83,13 +95,6 @@ pub fn source_hash(src: &str) -> u64 {
     h
 }
 
-fn line_col(src: &str, at: usize) -> (usize, usize) {
-    let before = &src[..at.min(src.len())];
-    let line = before.matches('\n').count() + 1;
-    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-    (line, col)
-}
-
 impl Profile {
     /// The JSON file (see the module docs). `raw` gives each process's raw steps (for
     /// branch outcomes); `src` the source (for line numbers).
@@ -103,7 +108,7 @@ impl Profile {
                     .iter()
                     .enumerate()
                     .map(|(i, (span, visits))| {
-                        let (line, col) = line_col(src, span.start);
+                        let (line, col) = Diag::line_col(src, span.start);
                         let mut o = json!({"id": i, "span": [span.start, span.end], "line": line, "col": col, "visits": visits});
                         if let Some((t, f)) = raw.get(name).and_then(|r| r.get(i)).and_then(|r| r.branch) {
                             o["branch"] = json!({"taken": p.edge(i, t), "not_taken": p.edge(i, f)});
@@ -117,6 +122,22 @@ impl Profile {
             })
             .collect();
         json!({"ticky_profile": 1, "source": format!("fnv1a64:{:016x}", self.source), "processes": procs})
+    }
+
+    /// [`Profile::to_json`] as text, one step or edge per line.
+    pub fn to_text(&self, raw: &BTreeMap<String, Vec<RawStep>>, src: &str) -> String {
+        let v = self.to_json(raw, src);
+        let lines = |key: &str, p: &Value| -> String {
+            let items: Vec<String> = p[key].as_array().unwrap().iter().map(|x| format!("        {x}")).collect();
+            if items.is_empty() { "[]".into() } else { format!("[\n{}\n      ]", items.join(",\n")) }
+        };
+        let procs: Vec<String> = v["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| format!("    {{\n      \"name\": {},\n      \"steps\": {},\n      \"edges\": {}\n    }}", p["name"], lines("steps", p), lines("edges", p)))
+            .collect();
+        format!("{{\n  \"ticky_profile\": 1,\n  \"source\": {},\n  \"processes\": [\n{}\n  ]\n}}\n", v["source"], procs.join(",\n"))
     }
 
     pub fn from_json(v: &Value) -> Result<Profile, String> {

@@ -60,7 +60,8 @@ enum Cmd {
         #[arg(long)]
         space_age: bool,
         /// Record a profile while the tests run: how often each step of every process ran
-        /// and which way its branches went (JSON), for `ticky build --profile FILE`.
+        /// and which way its branches went (JSON), for `ticky build --profile FILE` (record
+        /// it with the options you build with; profiles guide `--opt=speed` builds).
         #[arg(long, value_name = "FILE")]
         profile: Option<PathBuf>,
         /// Test the circuit `build --profile FILE` makes (can't be combined with --profile).
@@ -175,8 +176,9 @@ struct Placement {
     #[arg(long = "at", value_parser = parse_at)]
     at: Vec<(String, (i64, i64))>,
     /// Profile-guided optimisation: a profile written by `ticky test --profile FILE`. Steps
-    /// and branches the tests ran often get fewer ticks (for more combinators), ones they
-    /// never ran stay compact. `--opt=speed` only; without it the build is unchanged.
+    /// and branches the tests ran often get fewer ticks (spending combinators where that pays
+    /// off), ones they never ran stay compact. `--opt=speed` only; without it the build is
+    /// unchanged.
     #[arg(long, value_name = "FILE")]
     profile: Option<PathBuf>,
 }
@@ -542,8 +544,7 @@ fn main() -> ExitCode {
                 None => run_tests(&c, &src),
                 Some(out) => {
                     let (results, prof) = run_tests_profiled(&c, &src);
-                    let json = serde_json::to_string_pretty(&prof.to_json(&raw_steps(&c), &src)).unwrap();
-                    std::fs::write(out, json + "\n").map_err(|e| {
+                    std::fs::write(out, prof.to_text(&raw_steps(&c), &src)).map_err(|e| {
                         eprintln!("error: can't write {}: {e}", out.display());
                         ExitCode::FAILURE
                     })?;
