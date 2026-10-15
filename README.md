@@ -183,6 +183,12 @@ OpenSSL answers across three keys, in both optimization modes with checks on and
 off, plus input sampling, repeated requests, output retention and RUN restart.
 The Python script rechecks the committed answers using the installed OpenSSL.
 
+## Playground
+
+Try Ticky in the browser at <https://trentmkelly.github.io/ticky/>: an editor, compile-as-you-type
+errors, tests in the simulator, the circuit drawn, and a button that copies the blueprint. It's
+the compiler built for WebAssembly (`crates/ticky-web`, `web/`; see `web/README.md`).
+
 ## Using a compiled blueprint
 
 - **Power:** the blueprint includes medium electric poles; connect one to your network. With
