@@ -119,8 +119,8 @@ pub enum Side {
     West,
 }
 
-/// An annealed placement: the slot grid and each entity's slot.
-type Placed = (crate::place::Slots, Vec<(usize, usize)>);
+/// An annealed placement: the slot grid and each entity's slot and half.
+type Placed = (crate::place::Slots, Vec<(usize, usize, usize)>);
 
 /// Why a layout attempt failed.
 enum Failure {
@@ -172,6 +172,10 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
     let gates: Vec<EntId> =
         (0..net.entities.len()).filter(|&i| matches!(net.entities[i].role, Role::OutputGate { .. })).collect();
     let gates_move = opts.anneal.is_some() && !gates.is_empty();
+    // West outputs go north of the blueprint when return lines (along the north edge) feed
+    // them; otherwise they stack under the inputs.
+    let outs_north = opts.outputs_west && !ew && !gates_move && !gates.is_empty();
+    let outs_left = opts.outputs_west && !ew && !outs_north;
     let mut core: Vec<EntId> = (0..net.entities.len()).filter(|&i| net.entities[i].role == Role::Core).collect();
     let mut nets: Vec<crate::codegen::NetSpec> = nets.to_vec();
     if gates_move {
@@ -219,19 +223,20 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
     } else {
         // Left: RUN switch above the input ports, the error lamp beside it.
         if let Some(r) = run {
-            net.entities[r].pos = (-1.5, 0.5);
+            net.entities[r].pos = (-0.5, 0.5);
         }
         if let Some(l) = lamp {
-            net.entities[l].pos = (-2.5, 0.5);
+            net.entities[l].pos = (-1.5, 0.5);
         }
         for (i, &id) in inputs.iter().enumerate() {
-            net.entities[id].pos = (-2.0, i as f64 + 1.5);
+            net.entities[id].pos = (-1.0, i as f64 + 1.5);
         }
-        // Output ports on the west edge, one row each north of the blueprint (the first
-        // output northernmost), facing west.
+        // Output ports on the west edge, facing west, the first output northernmost: one row
+        // each north of the blueprint, or under the inputs.
         if opts.outputs_west {
             for (i, &id) in outputs.iter().enumerate() {
-                net.entities[id].pos = (-2.0, -((n_out - i) as f64) + 0.5);
+                let y = if outs_north { -((n_out - i) as f64) + 0.5 } else { (inputs.len() + 1 + i) as f64 + 0.5 };
+                net.entities[id].pos = (-1.0, y);
                 net.entities[id].dir = Dir::West;
             }
         }
@@ -312,9 +317,9 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
                 let rows_h = (2 + pole_row) * (1 + south_outs as usize);
                 (0, rows_h, north_w.max(if south_outs { n_out } else { 0 }), 0)
             } else {
-                let edge_w = 4 + if east_col.is_empty() { 0 } else { 3 } + if opts.outputs_west { 1 } else { 0 };
-                let edge_h = if opts.outputs_west { n_out } else { 0 };
-                (edge_w, edge_h, 0, (inputs.len() + 1).max(east_col.len()))
+                let edge_w = 3 + if east_col.is_empty() { 0 } else { 3 } + if outs_north { 1 } else { 0 };
+                let edge_h = if outs_north { n_out } else { 0 };
+                (edge_w, edge_h, 0, (inputs.len() + 1 + if outs_left { n_out } else { 0 }).max(east_col.len()))
             };
             let objective = match a.objective {
                 Objective::MaxWidth(w) => Objective::MaxWidth(w.saturating_sub(edge_w as u32).max(1)),
@@ -346,8 +351,8 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
             let (_, (slots, placed)) = best.unwrap();
             let cols = placed.iter().map(|p| p.0 + 1).max().unwrap_or(1);
             let rows = placed.iter().map(|p| p.1 + 1).max().unwrap_or(1);
-            for (&id, &(c, r)) in core.iter().zip(&placed) {
-                let dy = if net.entities[id].kind.is_combinator() { 1.0 } else { 0.5 };
+            for (&id, &(c, r, half)) in core.iter().zip(&placed) {
+                let dy = if net.footprint(id).1 > 1 { 1.0 } else { 0.5 + half as f64 };
                 net.entities[id].pos = (slots.tile_x(c) as f64 + 0.5, 2.0 * r as f64 + dy);
             }
             let segs = cols.div_ceil(SEG);
@@ -397,7 +402,11 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
                 poles.push((7.0 * k as f64 + 3.5, y));
             }
         };
-        row(&mut poles, north_w, -2.5);
+        // One row further north when controls sit north of their inputs.
+        let controls_north = (0..net.entities.len()).any(|i| {
+            matches!(net.entities[i].role, Role::Control { .. }) && !opts.controls_at.iter().any(|c| c.0 == i)
+        });
+        row(&mut poles, north_w, if controls_north { -3.5 } else { -2.5 });
         if south_outs {
             for (i, &id) in outputs.iter().enumerate() {
                 net.entities[id].pos = (0.5 + i as f64, block_h + 1.0);
@@ -407,11 +416,11 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
         }
     } else {
         // Poles one column left of the inputs, or of their controls when any sits there.
-        let left_rows = inputs.len() + 1;
+        let left_rows = inputs.len() + 1 + if outs_left { n_out } else { 0 };
         let controls_left = (0..net.entities.len()).any(|i| {
             matches!(net.entities[i].role, Role::Control { .. }) && !opts.controls_at.iter().any(|c| c.0 == i)
         });
-        let px = if controls_left { -4.5 } else { -3.5 };
+        let px = if controls_left { -3.5 } else { -2.5 };
         // A pole powers 3 rows either side of its own.
         for k in 0..left_rows.div_ceil(7).max(1) {
             poles.push((px, 7.0 * k as f64 + 3.5));
@@ -427,16 +436,16 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
                 poles.push((px, 7.0 * k as f64 + 3.5));
             }
         }
-        if opts.outputs_west {
+        if outs_north {
             for k in 0..n_out.div_ceil(7) {
-                poles.push((-3.5, -(7.0 * k as f64) - 3.5));
+                poles.push((-2.5, -(7.0 * k as f64) - 3.5));
             }
         }
     }
 
     // Screens: lamp grids beside everything else, each with a row of poles just above and
     // just below it (lamps need power; poles inside would cost pixels).
-    let screens_at = place_screens(net, opts, &mut poles, if opts.outputs_west && !ew && !gates_move { n_out } else { 0 }, w + 3.0);
+    let screens_at = place_screens(net, opts, &mut poles, if outs_north { n_out } else { 0 }, w + 3.0);
     if !opts.poles {
         poles.clear();
     }
@@ -529,16 +538,16 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
     // lines nest without crossing. (Annealed gates are wired to their ports like any other
     // network instead.)
     let mut lines: Vec<Line> = Vec::new();
-    if opts.outputs_west && !ew && !gates_move {
+    if outs_north {
         for (i, (&gate, &port)) in gates.iter().zip(&outputs).enumerate() {
             let row = -((n_out - i) as f64) + 0.5;
             let mut pts = vec![(w + 2.5, i as f64 + 0.5), (w + 2.5, row)];
             let mut x = w + 2.5;
-            while x - 8.0 > -0.5 {
+            while x - 8.0 > 0.5 {
                 x -= 8.0;
                 pts.push((x, row));
             }
-            pts.push((-0.5, row));
+            pts.push((0.5, row));
             lines.push((gate, port, pts));
         }
     }
@@ -621,9 +630,9 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
         }
         ((x1 - x0).round() as usize, (y1 - y0).round() as usize)
     } else {
-        let left_rows = inputs.len() + 1;
-        let height = (2 * rows).max(left_rows).max(east_col.len()) + if opts.outputs_west { n_out } else { 0 };
-        let width = w as usize + 4 + if east { 3 } else { 0 } + if opts.outputs_west { 1 } else { 0 };
+        let left_rows = inputs.len() + 1 + if outs_left { n_out } else { 0 };
+        let height = (2 * rows).max(left_rows).max(east_col.len()) + if outs_north { n_out } else { 0 };
+        let width = w as usize + 3 + if east { 3 } else { 0 } + if outs_north { 1 } else { 0 };
         (width, height)
     };
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers, gap })

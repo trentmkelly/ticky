@@ -149,7 +149,9 @@ The Python script rechecks the committed answers using the installed OpenSSL.
   output ports sit at the west edge north of the blueprint, one row each (the first output
   northernmost), facing west; each is fed by its own line of poles (red wire) from a gate on the
   east edge. This costs one combinator and one tick per output; with `--place=anneal` the
-  gates are placed with everything else and the lines become ordinary (relayed) wires. With
+  gates are placed with everything else and the lines become ordinary (relayed) wires.
+  Without return lines (`--place=anneal` or `--compact-outputs`), the outputs sit under the
+  inputs instead. With
   `--ports=ew` the ports are in rows, first port westernmost: the RUN switch (above the error
   lamp) and the inputs along the north edge, wired from the north; outputs along the south
   edge, or with `--outputs=north` continuing the north row and wired from the north (no gates

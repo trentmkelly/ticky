@@ -114,7 +114,8 @@ struct Placement {
     /// Which edge the output ports are on. With `--ports=ns`: `east` (default) or `west` (north
     /// of the blueprint at the west edge, the first output northernmost, each fed by its own
     /// line of poles from a gate on the east edge; with `--place=anneal`, by a gate placed like
-    /// the other combinators). With `--ports=ew`: `south` (default) or `north` (in the north
+    /// the other combinators; without return lines, as with `--place=anneal` or
+    /// `--compact-outputs`, under the inputs instead). With `--ports=ew`: `south` (default) or `north` (in the north
     /// row, after the inputs).
     #[arg(long, value_parser = parse_side)]
     outputs: Option<Side>,

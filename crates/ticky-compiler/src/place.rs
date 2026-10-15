@@ -16,6 +16,8 @@
 //!
 //! Ports and the RUN switch stay where the grid layout puts them; their positions count for
 //! the networks they're on. Whatever is still too long afterwards gets relay poles, as usual.
+//!
+//! One-tile entities (constant combinators) take half a slot, so two can share one.
 
 use ticky_factorio::{EntId, Netlist};
 
@@ -142,9 +144,11 @@ struct State<'a> {
     slots: &'a Slots,
     opts: AnnealOpts,
     frame: Frame,
-    /// Slot of each movable entity, and the entity (if any) in each slot.
+    /// Cell of each movable entity: 2 × slot + half (0 top, 1 bottom; a two-tile entity
+    /// takes both halves and has half 0), and the entities in each slot's halves.
     at: Vec<usize>,
-    who: Vec<Option<usize>>,
+    who: Vec<[Option<usize>; 2]>,
+    tall: Vec<bool>,
     col_count: Vec<usize>,
     row_count: Vec<usize>,
     nets: Vec<Net>,
@@ -159,7 +163,8 @@ fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 impl State<'_> {
     fn pos(&self, m: usize) -> (f64, f64) {
-        self.slots.centre(self.at[m])
+        let (x, y) = self.slots.centre(self.at[m] / 2);
+        if self.tall[m] { (x, y) } else { (x, y - 0.5 + (self.at[m] % 2) as f64) }
     }
 
     fn net_cost(&self, j: usize) -> f64 {
@@ -235,39 +240,63 @@ impl State<'_> {
         }
     }
 
-    /// Moves movable `m` to slot `s`, swapping with whatever is there.
-    fn swap(&mut self, m: usize, s: usize) {
-        let from = self.at[m];
-        let other = self.who[s];
-        let cols = self.slots.cols;
-        let mv = |st: &mut Self, e: usize, a: usize, b: usize| {
-            st.col_count[a % cols] -= 1;
-            st.row_count[a / cols] -= 1;
-            st.col_count[b % cols] += 1;
-            st.row_count[b / cols] += 1;
-            st.at[e] = b;
-        };
-        mv(self, m, from, s);
-        if let Some(o) = other {
-            mv(self, o, s, from);
-        }
-        self.who[s] = Some(m);
-        self.who[from] = other;
+    /// The entities in slot `s`.
+    fn in_slot(&self, s: usize) -> impl Iterator<Item = usize> + '_ {
+        let [a, b] = self.who[s];
+        a.into_iter().chain(b.filter(|&b| Some(b) != a))
     }
 
-    /// The cost change of moving `m` to slot `s` (applied if `keep` says so).
-    fn try_move(&mut self, m: usize, s: usize, temp: f64, rng: &mut Rng) -> bool {
-        let other = self.who[s];
-        let mut touched: Vec<usize> = self.nets_of[m].clone();
-        if let Some(o) = other {
-            touched.extend(self.nets_of[o].iter().copied());
+    /// Moves entities to new cells (given as `(entity, cell)`; together they must leave no
+    /// two in one half).
+    fn apply(&mut self, moves: &[(usize, usize)]) {
+        let cols = self.slots.cols;
+        for &(e, _) in moves {
+            let c = self.at[e];
+            self.col_count[c / 2 % cols] -= 1;
+            self.row_count[c / 2 / cols] -= 1;
+            for h in 0..2 {
+                if self.who[c / 2][h] == Some(e) {
+                    self.who[c / 2][h] = None;
+                }
+            }
         }
+        for &(e, c) in moves {
+            self.col_count[c / 2 % cols] += 1;
+            self.row_count[c / 2 / cols] += 1;
+            self.at[e] = c;
+            if self.tall[e] {
+                self.who[c / 2] = [Some(e), Some(e)];
+            } else {
+                self.who[c / 2][c % 2] = Some(e);
+            }
+        }
+    }
+
+    /// The moves that swap the contents of slots `a` and `b`.
+    fn swap_slots(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
+        let to = |e: usize, s: usize| (e, 2 * s + self.at[e] % 2);
+        self.in_slot(a).map(|e| to(e, b)).chain(self.in_slot(b).map(|e| to(e, a))).collect()
+    }
+
+    /// The moves that put one-tile `m` in cell `c`, swapping with whatever is there (a
+    /// two-tile entity there swaps with `m`'s whole slot).
+    fn move_small(&self, m: usize, c: usize) -> Vec<(usize, usize)> {
+        match self.who[c / 2][c % 2] {
+            Some(o) if self.tall[o] => self.swap_slots(self.at[m] / 2, c / 2),
+            Some(o) => vec![(m, c), (o, self.at[m])],
+            None => vec![(m, c)],
+        }
+    }
+
+    /// Applies `moves` if the cost change says so.
+    fn try_moves(&mut self, moves: &[(usize, usize)], temp: f64, rng: &mut Rng) -> bool {
+        let mut touched: Vec<usize> = moves.iter().flat_map(|&(e, _)| self.nets_of[e].iter().copied()).collect();
         touched.sort_unstable();
         touched.dedup();
-        let from = self.at[m];
-        let pull = |st: &Self| st.gravity(st.at[m]) + other.map_or(0.0, |o| st.gravity(st.at[o]));
+        let pull = |st: &Self| moves.iter().map(|&(e, _)| st.gravity(st.at[e] / 2)).sum::<f64>();
         let before: f64 = touched.iter().map(|&j| self.net_cost[j]).sum::<f64>() + self.shape() + pull(self);
-        self.swap(m, s);
+        let undo: Vec<(usize, usize)> = moves.iter().map(|&(e, _)| (e, self.at[e])).collect();
+        self.apply(moves);
         let after_nets: Vec<f64> = touched.iter().map(|&j| self.net_cost(j)).collect();
         let after = after_nets.iter().sum::<f64>() + self.shape() + pull(self);
         let delta = after - before;
@@ -277,15 +306,15 @@ impl State<'_> {
             }
             true
         } else {
-            // Undo: put `m` back where it was (swapping `other` back too).
-            self.swap(m, from);
+            self.apply(&undo);
             false
         }
     }
 }
 
 /// Places `movable` (their current positions are ignored) into a slot grid; returns the grid
-/// and each entity's slot `(col, row)`. `nets` are the wire networks as member lists.
+/// and each entity's slot and half `(col, row, half)` (half 1: the bottom tile of the slot,
+/// for one-tile entities). `nets` are the wire networks as member lists.
 pub fn anneal(
     net: &Netlist,
     members: &[Vec<EntId>],
@@ -295,8 +324,11 @@ pub fn anneal(
     frame: Frame,
     cols: Option<usize>,
     blocked: &dyn Fn(usize, usize) -> bool,
-) -> (Slots, Vec<(usize, usize)>) {
-    let n = movable.len().max(1);
+) -> (Slots, Vec<(usize, usize, usize)>) {
+    let tall: Vec<bool> = movable.iter().map(|&e| net.footprint(e).1 > 1).collect();
+    // Slots needed: one per two-tile entity, one per two one-tile entities.
+    let small = tall.iter().filter(|t| !**t).count();
+    let n = (movable.len() - small + small.div_ceil(2)).max(1);
     // Grid size: room to rearrange, within any limit.
     let tile_cols = |cols: usize| Slots { cols, rows: 1, poles }.tile_x(cols.max(1) - 1) + 1;
     let slots_needed = (n as f64 * 1.05).ceil() as usize;
@@ -363,13 +395,24 @@ pub fn anneal(
         nets.push(Net { mov, fixed, small, weight: if small { 1.0 } else { 2.0 / size as f64 } });
     }
 
-    // Start from the serpentine order (codegen order keeps related entities close).
+    // Start from the serpentine order (codegen order keeps related entities close), one-tile
+    // entities in pairs.
     let mut at = vec![0usize; movable.len()];
-    let mut who = vec![None; cols * rows];
+    let mut who = vec![[None; 2]; cols * rows];
     let mut col_count = vec![0usize; cols];
     let mut row_count = vec![0usize; rows];
     let mut k_slot = 0;
+    let mut half_free: Option<usize> = None;
     for (k, a) in at.iter_mut().enumerate() {
+        if !tall[k] {
+            if let Some(s) = half_free.take() {
+                *a = 2 * s + 1;
+                who[s][1] = Some(k);
+                col_count[s % cols] += 1;
+                row_count[s / cols] += 1;
+                continue;
+            }
+        }
         let s = loop {
             let (r, j) = (k_slot / cols, k_slot % cols);
             k_slot += 1;
@@ -379,12 +422,17 @@ pub fn anneal(
             }
         };
         let (r, c) = (s / cols, s % cols);
-        *a = s;
-        who[s] = Some(k);
+        *a = 2 * s;
+        if tall[k] {
+            who[s] = [Some(k), Some(k)];
+        } else {
+            who[s][0] = Some(k);
+            half_free = Some(s);
+        }
         col_count[c] += 1;
         row_count[r] += 1;
     }
-    let mut st = State { slots: &slots, opts, frame, at, who, col_count, row_count, nets, net_cost: Vec::new(), nets_of };
+    let mut st = State { slots: &slots, opts, frame, at, who, tall, col_count, row_count, nets, net_cost: Vec::new(), nets_of };
     st.net_cost = (0..st.nets.len()).map(|j| st.net_cost(j)).collect();
 
     let mut rng = Rng(opts.seed ^ 0x5EED);
@@ -398,10 +446,11 @@ pub fn anneal(
             continue;
         }
         let before = st.shape() + st.nets_of[m].iter().map(|&j| st.net_cost[j]).sum::<f64>();
-        let from = st.at[m];
-        st.swap(m, s);
+        let moves = st.swap_slots(st.at[m] / 2, s);
+        let undo: Vec<(usize, usize)> = moves.iter().map(|&(e, _)| (e, st.at[e])).collect();
+        st.apply(&moves);
         let after = st.shape() + st.nets_of[m].iter().map(|&j| st.net_cost(j)).sum::<f64>();
-        st.swap(m, from);
+        st.apply(&undo);
         sample += (after - before).abs();
     }
     // Start fairly cool: the starting order is already decent, so refine it rather than
@@ -414,15 +463,28 @@ pub fn anneal(
         // The move window shrinks from the whole grid to the neighbourhood.
         let reach = ((1.0 - f) * 0.5 * cols.max(rows) as f64).max(2.0) as isize;
         let m = rng.below(movable.len());
-        let (c, r) = ((st.at[m] % cols) as isize, (st.at[m] / cols) as isize);
+        let from = st.at[m] / 2;
+        let (c, r) = ((from % cols) as isize, (from / cols) as isize);
         let dc = rng.below(2 * reach as usize + 1) as isize - reach;
         let dr = rng.below(2 * reach as usize + 1) as isize - reach;
         let (nc, nr) = ((c + dc).clamp(0, cols as isize - 1), (r + dr).clamp(0, rows as isize - 1));
         let s = nr as usize * cols + nc as usize;
-        if s != st.at[m] && !is_blocked[s] {
-            st.try_move(m, s, temp, &mut rng);
+        if is_blocked[s] {
+            continue;
+        }
+        // A one-tile entity moves alone half the time (to either half, its own slot's other
+        // half too); otherwise slots swap whole.
+        let moves = if !st.tall[m] && rng.unit() < 0.5 {
+            st.move_small(m, 2 * s + rng.below(2))
+        } else if s != from {
+            st.swap_slots(from, s)
+        } else {
+            continue;
+        };
+        if moves.iter().any(|&(e, c)| st.at[e] != c) {
+            st.try_moves(&moves, temp, &mut rng);
         }
     }
-    let placed = st.at.iter().map(|&s| (s % cols, s / cols)).collect();
+    let placed = st.at.iter().map(|&c| (c / 2 % cols, c / 2 / cols, c % 2)).collect();
     (slots, placed)
 }
