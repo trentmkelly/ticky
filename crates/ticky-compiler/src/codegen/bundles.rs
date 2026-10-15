@@ -321,7 +321,7 @@ impl Cg {
             let (rb, ri) = (r(b).bun(), r(ix).bun());
             self.bread(rb, id, false);
             self.bread(ri, id, true);
-            self.nets[0].members.push((id, Conn::OutGreen));
+            self.read_out(id, out_net);
             return;
         }
         if let Op::BDot(a, b) = *g.op(v) {
@@ -331,7 +331,7 @@ impl Cg {
             let (ra, rb) = (r(a).bun(), r(b).bun());
             self.bread(ra, id, false);
             self.bread(rb, id, true);
-            self.nets[0].members.push((id, Conn::OutGreen));
+            self.read_out(id, out_net);
             return;
         }
         let copy = |x: Sig| if scale == 1 { arith(Operand::Sig(x), ArOp::Add, Operand::Const(0), out) } else { arith(Operand::Sig(x), ArOp::Mul, Operand::Const(scale), out) };
@@ -345,6 +345,11 @@ impl Cg {
         let id = self.loose(kind, format!("{what}: {label}"));
         let rb = r(b).bun();
         self.bread(rb, id, false);
+        self.read_out(id, out_net);
+    }
+
+    /// A read's output: the bus, or a private wire (a cluster's, or a straight-line pack's).
+    fn read_out(&mut self, id: EntId, out_net: Option<usize>) {
         match out_net {
             Some(n) => self.nets[n].members.push((id, Conn::OutRed)),
             None => self.nets[0].members.push((id, Conn::OutGreen)),

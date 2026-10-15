@@ -13,7 +13,9 @@
 //! index wires), `counts.rs` (counting matches), `argmax.rs` (running maximum), `writes.rs`
 //! (combined bundle writes), `sortnet.rs` (sorting networks, order statistics). Add new pattern
 //! rewrites as their own file here, as an `impl Fuser<'_>` block, hooked in from
-//! [`Fuser::rebuild`] (or `Fuser::split` for register loads).
+//! [`Fuser::rebuild`] (or `Fuser::split` for register loads). `slp.rs` is not a rewrite: it
+//! plans packs of same-shape scalar operations for codegen `logic()` (straight-line
+//! vectorisation), which alone knows which operations really get a combinator.
 
 mod argmax;
 mod boolean;
@@ -21,6 +23,7 @@ pub(crate) use boolean::simplify_terms;
 mod counts;
 mod lookups;
 mod plans;
+pub mod slp;
 mod sortnet;
 mod writes;
 
