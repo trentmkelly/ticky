@@ -16,6 +16,17 @@
 //!   a wire of its own, and every other value its deciders read moves to the bus (a decider
 //!   has one red input).
 //!
+//! * **Picks** (found by the superoptimiser, PLAN.md §4, `tools/superopt`). An arm whose value
+//!   can't be passed (an input, a register, a value used elsewhere) is copied off the bus by
+//!   one decider shared by all such arms of the stage: a constant combinator on its red input
+//!   gives each arm's signal a code, and its condition is `(each(red) = code_i ∧ arm i's
+//!   literals) ∨ …`, with one output, the stage's signal, copying from green. With `each`
+//!   in the conditions that output is the sum over the passing signals, so the one passing arm
+//!   value arrives renamed. Before, each such arm cost a multiplier `x * c` and its condition
+//!   `c` a decider of its own (`min(a, b)`: 4 combinators in 2 ticks, now 1 in 1 tick).
+//!   `TICKY_NO_PICK=1` turns picks off. Not in pipelined (`every tick`) blocks, which have
+//!   their own emitter.
+//!
 //! Arms are mutually exclusive, so deciders with the same output merge (their conditions
 //! OR'd) and the stage's value is their sum.
 
@@ -51,6 +62,14 @@ pub(super) enum Out {
     /// `value * condition` (an arithmetic combinator): a top-level arm whose value is needed
     /// elsewhere too.
     Mul(V, V),
+    /// The value, copied off the bus by the stage's pick decider (see the module docs): all
+    /// of a stage's `Pick` arms are one combinator.
+    Pick(V),
+}
+
+/// Whether stages may pick values off the bus (`TICKY_NO_PICK=1`: no).
+pub(super) fn pick_enabled() -> bool {
+    std::env::var_os("TICKY_NO_PICK").is_none()
 }
 
 pub(super) struct Stage {
@@ -66,7 +85,7 @@ impl Stage {
         let mut r: Vec<V> = dnf.iter().flatten().flat_map(|l| [l.a, l.b]).filter_map(|o| if let Opd::V(v) = o { Some(v) } else { None }).collect();
         match *out {
             Out::K(_) => {}
-            Out::Pass(x) => r.push(x),
+            Out::Pass(x) | Out::Pick(x) => r.push(x),
             Out::Mul(x, c) => r.extend([x, c]),
         }
         r.sort_unstable();
@@ -106,6 +125,8 @@ enum Ban {
     Absorb(V),
     Pass(V),
     Inline(V),
+    /// No picks in this stage.
+    Pick(V),
 }
 
 /// Most arms a stage may grow to while flattening, and literals per decider.
@@ -439,14 +460,15 @@ impl Ctx<'_> {
     }
 }
 
-/// What each flattened arm writes: its constant, its value passed through (if in `ok`), or
-/// its value times its (top-level, built) condition.
-fn outputs(g: &Graph, arms: Vec<(SDnf, V, Result<V, V>)>, ok: &HashSet<V>, inl: &dyn Fn(V) -> bool) -> Result<Vec<(SDnf, Out)>, Ban> {
+/// What each flattened arm writes: its constant, its value passed through (if in `ok`), its
+/// value picked off the bus (`pick`), or its value times its (top-level, built) condition.
+fn outputs(g: &Graph, arms: Vec<(SDnf, V, Result<V, V>)>, ok: &HashSet<V>, inl: &dyn Fn(V) -> bool, pick: bool) -> Result<Vec<(SDnf, Out)>, Ban> {
     arms.into_iter()
         .map(|(d, x, from)| {
             let out = match g.as_const(x) {
                 Some(k) => Out::K(k),
                 None if ok.contains(&x) => Out::Pass(x),
+                None if pick => Out::Pick(x),
                 None => match from {
                     Err(c) if inl(c) => return Err(Ban::Inline(c)),
                     Err(c) => Out::Mul(x, c),
@@ -458,8 +480,25 @@ fn outputs(g: &Graph, arms: Vec<(SDnf, V, Result<V, V>)>, ok: &HashSet<V>, inl: 
         .collect()
 }
 
+/// A stage whose only pick is one arm guarded by a built boolean `c` (`c != 0`) is as cheap
+/// as `x * c` (one combinator either way), which needs no code table: keep the multiplier.
+fn pick_or_multiply(g: &Graph, deciders: &mut [(SDnf, Out)]) {
+    let picks: Vec<usize> = (0..deciders.len()).filter(|&i| matches!(deciders[i].1, Out::Pick(_))).collect();
+    let [i] = picks[..] else { return };
+    let (d, Out::Pick(x)) = &deciders[i] else { unreachable!() };
+    if let [t] = &d[..] {
+        if let [SLit { op: CmpOp::Ne, a: Opd::V(c), b: Opd::K(0) }] = t[..] {
+            let iv = g.iv(c);
+            if iv.lo >= 0 && iv.hi <= 1 {
+                deciders[i].1 = Out::Mul(*x, c);
+            }
+        }
+    }
+}
+
 fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, Vec<V>>, bans: &HashSet<Ban>) -> Result<Plan, Ban> {
     let cx = Ctx { g, is_root, pre, bans };
+    let pick = pick_enabled();
     // Outermost selects first (users come after their operands), so each absorbs what it can.
     let mut taken: HashMap<V, V> = HashMap::new();
     let mut roots: Vec<(V, Vec<V>, HashSet<V>)> = Vec::new();
@@ -483,7 +522,8 @@ fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, V
         let inside = |u: &V| members.contains(u) || conds.contains(u);
         let arms = cx.flatten(*m, a, &|c| conds.contains(&c))?;
         let ok: HashSet<V> = arms.iter().map(|(_, x, _)| *x).filter(|&x| cx.passable(x, &inside, &guards)).collect();
-        for (_, out) in outputs(g, arms, &ok, &|c| conds.contains(&c))? {
+        let pick = pick && !bans.contains(&Ban::Pick(*m));
+        for (_, out) in outputs(g, arms, &ok, &|c| conds.contains(&c), pick)? {
             if let Out::Mul(_, c) = out {
                 mul_guards.insert(c);
             }
@@ -510,7 +550,8 @@ fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, V
         let inl = |c: V| plan.inline_cond.contains(&c);
         let arms = cx.flatten(*m, a, &inl)?;
         let mut deciders: Vec<(SDnf, Out)> = Vec::new();
-        for (d, out) in outputs(g, arms, &pass_ok[m], &inl)? {
+        let pick = pick && !bans.contains(&Ban::Pick(*m));
+        for (d, out) in outputs(g, arms, &pass_ok[m], &inl, pick)? {
             match deciders.iter_mut().find(|(_, o)| *o == out && !matches!(o, Out::Mul(..))) {
                 Some((dd, _)) => {
                     for t in d {
@@ -531,6 +572,18 @@ fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, V
         if !a.is_empty() && deciders.iter().any(|(d, _)| d.iter().map(|t| t.len()).sum::<usize>() > MAX_LITS) {
             return Err(Ban::Absorb(*a.last().unwrap()));
         }
+        pick_or_multiply(g, &mut deciders);
+        // The pick decider reads everything from the bus (its red input is the code table).
+        let picked: Vec<V> = deciders.iter().filter(|(_, o)| matches!(o, Out::Pick(_))).flat_map(|(d, o)| Stage::reads(d, o)).collect();
+        let pick_lits: usize = deciders.iter().filter(|(_, o)| matches!(o, Out::Pick(_))).map(|(d, _)| d.iter().map(|t| t.len() + 1).sum::<usize>()).sum();
+        if pick_lits > MAX_LITS {
+            // Too big for one decider: give up the last absorbed select, else picks.
+            return Err(match a.last() {
+                Some(&n) => Ban::Absorb(n),
+                None => Ban::Pick(*m),
+            });
+        }
+        plan.force_bus.extend(picked.iter().copied());
         let mut passes: Vec<V> = Vec::new();
         for (_, o) in &deciders {
             if let Out::Pass(x) = *o {
@@ -538,6 +591,10 @@ fn try_plan(g: &Graph, producers: &[V], is_root: &HashSet<V>, pre: &HashMap<V, V
                     passes.push(x);
                 }
             }
+        }
+        // A passed value is on the stage's private wire, not on the bus the picks read.
+        if let Some(&q) = passes.iter().find(|q| picked.contains(q)) {
+            return Err(Ban::Pass(q));
         }
         // Wires: the pass on the cluster's wire is the one leaving the fewest values to move
         // to the bus; the deciders of the others may read no other pass.

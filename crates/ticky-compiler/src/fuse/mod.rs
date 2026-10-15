@@ -25,6 +25,7 @@ mod lookups;
 mod plans;
 pub mod slp;
 mod sortnet;
+pub mod superopt;
 mod writes;
 
 pub use plans::keep_of;

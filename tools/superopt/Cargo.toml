@@ -1,0 +1,14 @@
+[package]
+name = "ticky-superopt"
+version.workspace = true
+edition.workspace = true
+description = "Offline superoptimiser: fewest combinators for small IR patterns (PLAN.md §4)"
+publish = false
+
+[[bin]]
+name = "superopt"
+path = "src/main.rs"
+
+[dependencies]
+ticky-factorio.workspace = true
+ticky-sim.workspace = true
