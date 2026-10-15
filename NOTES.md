@@ -1459,3 +1459,139 @@ need voiding; surplus items go overboard). Fixed machines in 16 groups A–P plu
   5 shells/s + 5 magazines/s: ~12 charges/s with 4 legendary prod 2 per assembler (9.5 with 6),
   ~124 recyclers, ~22k jelly spoiling at once, ~92 ice/s surplus.
 - Running on the user's platform with legendary cubes (2026-10-14).
+
+## 2026-10-14: straight-line vectorisation (fuse/slp.rs; examples 2701 → 2646)
+
+PLAN.md §1. aes128 336 → 281 (−55; `--opt=size` likewise, 2644 → 2589), nothing else changes.
+- Survey first (TICKY_DUMP_IR over all examples, step/period blocks): 29 groups of the same op
+  and constant (114 ops), 29 with mixed constants (111), 9 zips (46). After codegen's own
+  choices only 78 of 252 single-constant ops can be lanes, 65 of them in aes128; the rest read
+  registers/inputs directly (a copy per lane costs what it saves) or are free already (wire
+  sums, `* k` pushed into sums, inlined/gated conditions, staged values). Elsewhere every
+  candidate is alone in its group.
+- So it lives in codegen `logic()`, which alone knows which operations get a combinator of
+  their own; `fuse/slp.rs` only plans. A lane is `x op k`, `k op x` or `x cmp k` emitted on its
+  own; its input must be a combinator (or a sum of them, or a read) only the lane reads. The
+  lane's result gets its signal where it would have been anyway (the bus, or its cluster's wire;
+  packs are per wire), the input writes that signal onto a private red wire, and one combinator
+  computes every lane there: `each op k` when a missing signal (lane value 0) gives 0, else
+  `each(red) op each(green)` with the constants on a constant combinator (the game iterates the
+  union, probes P12/P13), which covers `+ k`, `^ k`, `| k` and mixed constants (from 3 lanes);
+  deciders `each cmp k → 1` when `0 cmp k` is false. `x - k` joins the sums as `+ −k`.
+  Consumers don't change and need no reads. Lanes needn't be independent (each signal settles
+  on its own), but a lane can't be another lane's input (in any pack). Reads write a pack's
+  wire through `emit_from_bundle`'s `out_net` (AGet and BDot now honour it). Each pack sits
+  where its last lane was (aes128 wire relays 25 → 15; 7 before, footprint 41×24 → 34×26).
+- Pipelined (`every tick`) blocks are not vectorised (own emitter, values delayed per depth).
+  `TICKY_NO_SLP=1` turns the pass off.
+- Not done: comparisons true at 0 or with mixed constants; zips (aes128's 76 XORs: their inputs
+  are shared, so they'd need copies); lanes reading registers or inputs (a copy per lane).
+- Tests: `fuse::slp` unit tests, tests/straight_line_packs.rs (13 lanes in 5 packs, 62 → 54,
+  speed/size/checks/main program, 0 and INT_MIN/INT_MAX inputs; aes128 ≤ 281). New
+  tools/fuzz_slp.py (families of parallel lanes over zero-heavy inputs, `every 60 ticks` or main
+  loop, sometimes `--opt=size`; about 30% of programs get packs). It found two bugs on the way: a
+  lane whose input was a lane of the same pack, and a floor division's result sum taken as a
+  redirected input. verify.sh clean at FUZZ_N=20 and 200 (fuzz_slp 200: 1562 outputs, 0
+  mismatches). Not difftested in game.
+
+## 2026-10-14: retiming of pipelined blocks (pipeline/retime.rs)
+
+PLAN §8. Measured first (combinator descriptions, `--json`): speed mode had 132 pipeline
+delay combinators out of 2439 (57 bundle `each` chains, 27 scalar chains, 20 carry taps, 28
+carry wires; plus 39 start-up and 243 register/sample holds, which are memory, not
+alignment); size mode 50. Most are forced: a bundle input delayed to a combinational output
+that must change with the others (histogram `bins` 11, alarms `faults`). A hill climb over
+every legal schedule with real trial builds (push moves of 1–6 ticks, all 8 starting shapes,
+every carry count) found only histogram 62 → 57 and thruster 38 → 37 per block: little to win.
+- `retime::Space`: movable groups (a wire sum and its parts share a tick; own-state paths,
+  sources and random picks fixed) and bounds from the loads; `legal` checks a schedule.
+- `Space::min_delays`: Leiserson–Saxe minimum-register retiming with fanout sharing, cost =
+  Σ weight × (last read − computed tick); difference constraints, so solved exactly as the
+  min-cost-flow dual (successive shortest paths), schedule = the latest optimum (potentials).
+- `pipeline::plan` adds two retimed candidates to `Pipe::taus` (from `Pipe::retimed` on):
+  bundle 8 : scalar 1, and bundles alone (1:1, 2:1, 3:1, 4:1, 32:1 never did better on the
+  examples + 150 random bundle-reading blocks). Codegen's trial builds keep the smallest, so
+  it can't lose. `TICKY_NO_RETIME=1` turns it off; `TICKY_DUMP_PIPE` names the kept schedule.
+- The win is reading a bundle as soon as its scalar operands are ready, so one scalar rides
+  the carry wires instead of a bundle chain (histogram `far = wide[ask * 6]`: both banks of
+  `wide` were delayed 7 ticks). After it, the hill climb finds nothing more.
+- Bench (speed): 2701 → 2695 (histogram 97 → 92, thruster 113 → 112); size unchanged;
+  random corpus 9717 → 9642. Latency unchanged. Compile time unchanged on the examples.
+- Tick-exact: sim traces identical before/after for every example, both modes, random inputs
+  with RUN off/on (376 runs; histogram/thruster 100 more). In size mode a block that becomes
+  as cheap pipelined may now be kept pipelined (3 of 150 random programs; no example).
+- Tests: `tests/retiming.rs` (histogram and a fuzz-found block built with/without retimed
+  schedules: identical traces, fewer combinators, same latency; every example schedule
+  legal), solver vs brute force. fuzz_pipes: 40% of blocks read a bundle input `w` (separate
+  RNG, so old programs unchanged). verify clean at FUZZ_N=20 and 200; fuzz_pipes 4×300 and
+  fuzz_blocks 2×300 on other seeds clean. In-game difftest still to do (histogram, thruster).
+
+## 2026-10-14: duplicating cheap drivers to save relays (dup.rs; PLAN.md §9)
+
+Measured first (`TICKY_DUP_STATS=1`: relayed networks by verdict; 51 examples incl. the 5
+untracked ones): annealed, 68 relays in 15 examples, only 12 networks / 16 relays with a
+single cheap pure driver (wire sums hold 52); `--no-poles` 92 / 10. Grid: 318 relays, 141 of
+them on duplicable networks (91 on 50 constant-driven ones). The annealer already pulls
+networks together; what it leaves is mostly driver→port pairs, where a copy is a move.
+
+Rejected: copy then re-anneal. One more entity rerolls the layout, and relays vary 0–6 by
+seed alone (warehouse seeds 1–6: 3,3,2,0,2,0), so the "wins" were noise.
+
+Kept (`dup.rs`, after routing in `layout.rs`): a relayed network with one driver that is an
+internal arithmetic/decider/non-random selector/constant and doesn't feed itself (no output
+network among its input networks, either colour) gets a copy; the members across the
+longest spanning-tree hop move to a network the copy drives, and the copy reads the
+driver's input networks (same value, same tick). It goes on the free tile(s) inside the
+block's bbox (powered with poles) with the fewest estimated relays; everything is routed
+again with nothing else moved, and the copy stays only if relays drop by copies + 1 and the
+extent doesn't grow. Default with `--place=anneal` (`AnnealOpts::duplicate`);
+`--duplicate-drivers` for the grid; `TICKY_DUP=0/1` overrides; copies are described
+"… (copy, saves wire relays)".
+
+Results (47 tracked examples, footprint never larger): grid 201 → 111 relays for 39 copies
+(14 combinators, 25 constants), `--no-poles` 197 → 109; sorting 19 → 6, holmium 54 → 26,
+ammo 52 → 23, signals 12 → 4, readouts 11 → 5. Annealed: only signals `--no-poles` 5 → 3
+(+1 combinator); 0 changes with poles. Bench (default grid) unchanged. Tests: dup unit
+tests, `a_far_reader_gets_its_own_copy`, `tests/duplicate_drivers.rs` (valid layouts, example
+tests, and a tick-by-tick lockstep of every entity and copy against the build without
+copies, under random inputs). verify.sh clean; all fuzzers N=60 seed 7 with `TICKY_DUP=1`
+clean. Not difftested in game yet; the grid flag could become the default after one.
+
+## 2026-10-14: profile-guided optimisation (`test --profile`, `build --profile`)
+
+- **Recording.** ticky-sim `StateTrace` watches each process's program counter and commit
+  pulse ANY on the bus (probe: the step-timer decider, `MainStats::probe`); a pulse counts a
+  visit to the state the counter held the tick before, halting is a transition to 0.
+  Profiles are keyed by *raw steps*: cfg.rs's steps before fusion (after jump threading),
+  numbered in creation order; each built step carries `origin` (the raw steps it runs), so
+  visits/edges map back exactly. JSON (profile.rs docs): source hash, per process every raw
+  step (span, line/col, visits, branch true/false) and edges. Wrong hash or spans → warning,
+  ignored. Speed only.
+- **Decisions** (cfg.rs): `merge_hot_branches` folds a branch's hot side (≥ 2/3, ≥ 8 runs,
+  ≤ 32 statements) into the branching step behind a temp flag `#pgoN` (cold side too if
+  needed for two targets, ≤ 6 statements); side conditions computed inside their arm.
+  Speculation: if what the hot side writes is dead where the cold path continues (small
+  liveness pass), not visible outside the process (ports, screen vars, names other
+  processes/blocks mention) and there's no assert/--checks, it runs unconditionally:
+  needed because ir.rs `mux_factor` turns `if not t: d += 1` into `d + [not t]` (a value
+  increment, +1 tick). `fuse`: copy into hot predecessors up to 32 statements, never into
+  ones that didn't jump.
+- **Cost model** (lib.rs `compile_guided`): analyse with no/all/merge-only/copy-only
+  decisions, expected ticks = Σ estimated runs × step duration (waits at their shortest),
+  build the cheapest (ties: plain). Report line `profile: …`. Estimates good: primes 1108
+  estimated vs 1111 measured.
+- **Results:** primes loop 2 steps (2 + 3 ticks) → one 3-tick step, test 1361 → 1111 ticks,
+  40 → 36 combinators (--checks: 6 → 4 ticks/iteration); sorting slow_done 682 → 623,
+  110 → 117; production-moments latency 45/61/77 → 37/49/61, 38 → 42; functions, thruster
+  small estimated gains; everything else keeps the plain build. Without --profile: all
+  examples byte-identical (--json, speed and size), bench unchanged.
+- Tried and rejected: merging without speculation on primes (5 → 4 ticks/iteration but the
+  cold path 2 → 4: −14 ticks in total); deciding per merge without costing the whole build
+  (a cold path can lose more than the hot one saves).
+- Tests: tests/profile_guided.rs, cfg.rs unit test, ticky-sim `StateTrace` test. Fuzzer:
+  `PGO=1` mode in fuzz_programs/fuzz_procs, run by tools/fuzz_pgo.py (TICKY_PGO_HOT=1;
+  changes ~64% of random programs, ~80% of process programs). `FUZZ_N=200 tools/verify.sh`
+  clean. Not difftested in game (unprofiled logic unchanged). Debug: `TICKY_DUMP_CFG=1`.
+- Merged together on main (2026-10-14): one semantic clash fixed (tests/retiming.rs built a
+  `LayoutOpts` without dup's new field); combined main verified (cargo test, bench TOTAL
+  2640 = 2701 − 55 − 6, all fuzzers at N=60).

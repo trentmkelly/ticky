@@ -20,21 +20,25 @@ merged when done) and must leave every example and fuzzer passing.
 
 ## 1. Straight-line vectorisation (SLP) — size
 
+**Status (2026-10-14): merged.** aes128 336 → 281, nothing else changes (little to pack
+elsewhere). Open: comparisons true at 0 or with mixed constants; zips (`a_i op b_i`); lanes
+reading registers/inputs. In-game difftest pending.
+
 Independent scalar ops of the same shape (`a = x + 1; b = y + 1; c = z + 1`) each cost a
 combinator today. With their operands on distinct signals of one wire, one `each` combinator
 does them all. We do this for comprehensions (`expand/vectorize.rs`), not for loose code.
 
-- [ ] Survey: dump IR (`TICKY_DUMP_IR=1`) over all examples and count groups of isomorphic,
+- [x] Survey: dump IR (`TICKY_DUMP_IR=1`) over all examples and count groups of isomorphic,
       independent ops in one block (same op, same constant or same per-lane operand shape).
       Decide whether the pass lives in the IR (ir.rs) or the fuser (`fuse/`).
-- [ ] Packing rule: lanes need distinct signals on a shared wire, and outputs consumed per
+- [x] Packing rule: lanes need distinct signals on a shared wire, and outputs consumed per
       lane must be readable back (direct bundle reads already exist). Cost model: pack only
       when combinators saved > the extra reads/filters it costs.
-- [ ] Ops to cover first: `+ k`, `* k`, `/ k`, comparisons against a constant (decider
+- [x] Ops to cover first: `+ k`, `* k`, `/ k`, comparisons against a constant (decider
       `each`), then mixed constants via a constant-combinator lane table (`each op each`).
-- [ ] Pipelined (`every tick`) blocks have their own emitter: cover them or exclude them
+- [x] Pipelined (`every tick`) blocks have their own emitter: cover them or exclude them
       explicitly.
-- [ ] New fuzzer or `fuzz_exprs.py` mode generating parallel independent assignments.
+- [x] New fuzzer or `fuzz_exprs.py` mode generating parallel independent assignments.
 
 ## 2. Translation validation — enabler
 
@@ -98,16 +102,20 @@ share one set of combinators, inputs muxed by the program counter (high-level sy
 
 ## 6. Profile-guided optimisation — speed
 
+**Status (2026-10-14): merged.** Guides step merging/copying and speculation (not the
+flattening budget, which is only a blow-up guard). primes loop 5 → 3 ticks/iteration.
+In-game difftest of profiled builds pending.
+
 The real analogue of branch prediction: run the program's tests in the simulator, record
 which states and branches are hot, then flatten hot paths to fewer ticks and leave cold
 ones compact.
 
-- [ ] Profile collection: `ticky test --profile out.json` counting per-state visits and
+- [x] Profile collection: `ticky test --profile out.json` counting per-state visits and
       per-branch outcomes in ticky-sim.
-- [ ] `build --profile out.json`: feed counts to the flattening budget and select-stage
+- [x] `build --profile out.json`: feed counts to the flattening budget and select-stage
       decisions (spend combinators where ticks are hot).
-- [ ] Without a profile, behaviour is unchanged.
-- [ ] Show the win: an example whose hot loop gets measurably fewer ticks per iteration.
+- [x] Without a profile, behaviour is unchanged.
+- [x] Show the win: an example whose hot loop gets measurably fewer ticks per iteration.
 
 ## 7. Overlapping loop iterations (modulo scheduling) — speed
 
@@ -122,23 +130,30 @@ A `while` loop in a process starts iteration i+1 while i finishes, when dependen
 
 ## 8. Retiming — speed and size
 
+**Status (2026-10-14): merged.** Little to win: −6 combinators (histogram, thruster); most
+delays are forced by output alignment. In-game difftest pending (histogram, thruster).
+
 Move delay combinators across logic so paths line up with fewer of them, cutting the holds
 that keep pipelined blocks in step.
 
-- [ ] Measure first: count hold/delay combinators per example (combinator descriptions say
+- [x] Measure first: count hold/delay combinators per example (combinator descriptions say
       what made them) to see whether there's enough to win.
-- [ ] Leiserson–Saxe retiming over the pipelined block's graph (`codegen/pipelined.rs`
+- [x] Leiserson–Saxe retiming over the pipelined block's graph (`codegen/pipelined.rs`
       `at_ref` delays): minimise registers subject to the block's latency.
 - [ ] Must keep tick-exact behaviour: difftest-critical.
 
 ## 9. Duplicating logic to save wire — layout
 
+**Status (2026-10-14): merged.** Copies placed into the existing layout and re-routed
+(re-annealing rejected: seed noise). Annealed: ~no effect. Grid: relays 201 → 111 behind
+`--duplicate-drivers`; could become the default after an in-game difftest.
+
 If a cheap combinator feeds two distant clusters, a copy next to each beats relay poles.
 
-- [ ] After placement, find networks needing relays whose driver is cheap (one combinator,
+- [x] After placement, find networks needing relays whose driver is cheap (one combinator,
       inputs nearby both ends).
-- [ ] Duplicate, re-place (annealer), keep if relays + combinators drop.
-- [ ] Ties into today's layout objective (area, max width/height).
+- [x] Duplicate, re-place (annealer), keep if relays + combinators drop.
+- [x] Ties into today's layout objective (area, max width/height).
 
 ## 10. Signal packing — size
 
