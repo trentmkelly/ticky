@@ -99,6 +99,40 @@ Counts include arithmetic, decider, and selector combinators, but not constants 
 (`--set want=coal`; `iron-plate@rare` for a quality). `RUN=0@tick` and `RUN=1@tick` switch the program
 off and on.
 
+## AES-128 example
+
+`examples/aes128.ticky` encrypts one 128-bit block with an editable, fixed 128-bit
+key. It implements the ten AES rounds from [FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1);
+the compiler evaluates the key expansion at compile time. This is the block
+encryption operation itself, without padding or a multi-block mode.
+
+```bash
+target/release/ticky test examples/aes128.ticky
+target/release/ticky build examples/aes128.ticky -o target/aes128.bp.txt
+python3 tools/verify-aes-vectors.py
+cargo test --release --locked -p ticky-compiler --test aes128
+```
+
+Wait for `ready`, supply `p0`–`p3`, then hold `start` high until `done`.
+Inputs must stay stable until `ready` goes low; `c0`–`c3` hold the completed
+ciphertext. Lower `start` and wait for `ready` before the next block. Turning RUN
+off resets the machine, including any encryption in progress.
+
+Words are big-endian, with `p0` holding the first four bytes. Factorio and Ticky
+use signed 32-bit integers: represent words with the high bit set by subtracting
+4294967296. For the included key `000102030405060708090a0b0c0d0e0f`, the FIPS
+known-answer example is:
+
+```text
+plaintext:  00112233 44556677 8899aabb ccddeeff
+ciphertext: 69c4e0d8 6a7b0430 d8cdb780 70b4c55a
+```
+
+The Rust tests exercise the actual compiled circuits against 48 independent
+OpenSSL answers across three keys, in both optimization modes with checks on and
+off, plus input sampling, repeated requests, output retention and RUN restart.
+The Python script rechecks the committed answers using the installed OpenSSL.
+
 ## Using a compiled blueprint
 
 - **Power:** the blueprint includes medium electric poles; connect one to your network. With

@@ -1,0 +1,209 @@
+[
+  {
+    "key": "000102030405060708090a0b0c0d0e0f",
+    "vectors": [
+      {
+        "plaintext": "00112233445566778899aabbccddeeff",
+        "ciphertext": "69c4e0d86a7b0430d8cdb78070b4c55a"
+      },
+      {
+        "plaintext": "00000000000000000000000000000000",
+        "ciphertext": "c6a13b37878f5b826f4f8162a1c8d879"
+      },
+      {
+        "plaintext": "ffffffffffffffffffffffffffffffff",
+        "ciphertext": "3c441f32ce07822364d7a2990e50bb13"
+      },
+      {
+        "plaintext": "80000000000000000000000000000000",
+        "ciphertext": "4399572cd6ea5341b8d35876a7098af7"
+      },
+      {
+        "plaintext": "00000000000000000000000000000001",
+        "ciphertext": "7346139595c0b41e497bbde365f42d0a"
+      },
+      {
+        "plaintext": "000102030405060708090a0b0c0d0e0f",
+        "ciphertext": "0a940bb5416ef045f1c39458c653ea5a"
+      },
+      {
+        "plaintext": "f25a358a4b46ed03408bed214636cf29",
+        "ciphertext": "f85a9215e3930ba6641949038967f3eb"
+      },
+      {
+        "plaintext": "a0f369050c66e5b0fd960730e2214995",
+        "ciphertext": "1260e188e57f4f11d02d9eb10056b291"
+      },
+      {
+        "plaintext": "b72e071ef1ab000aa761db94c6550f7c",
+        "ciphertext": "7b2b910c400a1d5f77b11e044426b267"
+      },
+      {
+        "plaintext": "4e13bb74775b4e196f08a5efa4514c34",
+        "ciphertext": "0c96f19bdfe6752cd47c5d12a45707e4"
+      },
+      {
+        "plaintext": "094b8cf4814cd59421ecd1d9e2677f6a",
+        "ciphertext": "2b986f053a01bb609231ce9f63b0f25b"
+      },
+      {
+        "plaintext": "c28141ce712f0239963888acf28fd49f",
+        "ciphertext": "9320b1b411c36c0b51c50e68cffc14c1"
+      },
+      {
+        "plaintext": "a9794b2b648d01271636cb95276084b4",
+        "ciphertext": "3664e26ee8725dcffbaf10c995f9e8d4"
+      },
+      {
+        "plaintext": "f637717d68aae3693ebd4f7e3d50d78a",
+        "ciphertext": "1e432490fcb2b59647c9f76621ce4b7f"
+      },
+      {
+        "plaintext": "07d6258d7b11414d6e4d4098529993fc",
+        "ciphertext": "31788fe9140305ce992b8035a24b047a"
+      },
+      {
+        "plaintext": "4acf217b646b424c75f67db75577c913",
+        "ciphertext": "f39c58364c723dc34816dad5e79fb941"
+      }
+    ]
+  },
+  {
+    "key": "00000000000000000000000000000000",
+    "vectors": [
+      {
+        "plaintext": "00112233445566778899aabbccddeeff",
+        "ciphertext": "c8a331ff8edd3db175e1545dbefb760b"
+      },
+      {
+        "plaintext": "00000000000000000000000000000000",
+        "ciphertext": "66e94bd4ef8a2c3b884cfa59ca342b2e"
+      },
+      {
+        "plaintext": "ffffffffffffffffffffffffffffffff",
+        "ciphertext": "3f5b8cc9ea855a0afa7347d23e8d664e"
+      },
+      {
+        "plaintext": "80000000000000000000000000000000",
+        "ciphertext": "3ad78e726c1ec02b7ebfe92b23d9ec34"
+      },
+      {
+        "plaintext": "00000000000000000000000000000001",
+        "ciphertext": "58e2fccefa7e3061367f1d57a4e7455a"
+      },
+      {
+        "plaintext": "000102030405060708090a0b0c0d0e0f",
+        "ciphertext": "7aca0fd9bcd6ec7c9f97466616e6a282"
+      },
+      {
+        "plaintext": "f25a358a4b46ed03408bed214636cf29",
+        "ciphertext": "62ebaf73ea10f1132ed7b9a4b15a8640"
+      },
+      {
+        "plaintext": "a0f369050c66e5b0fd960730e2214995",
+        "ciphertext": "1200959e50584b7c0afcb7207ce2d4af"
+      },
+      {
+        "plaintext": "b72e071ef1ab000aa761db94c6550f7c",
+        "ciphertext": "31f615fc3a5ade2d39e83e96273122d5"
+      },
+      {
+        "plaintext": "4e13bb74775b4e196f08a5efa4514c34",
+        "ciphertext": "8eb3556ee1dc3067111683f00aed7f45"
+      },
+      {
+        "plaintext": "094b8cf4814cd59421ecd1d9e2677f6a",
+        "ciphertext": "2040396e5bd33cbd12c933f55b64e821"
+      },
+      {
+        "plaintext": "c28141ce712f0239963888acf28fd49f",
+        "ciphertext": "0978e82fdd8f36b3e0efba3479afae84"
+      },
+      {
+        "plaintext": "a9794b2b648d01271636cb95276084b4",
+        "ciphertext": "fea01f01c95c8e01255f74e3acc6cc16"
+      },
+      {
+        "plaintext": "f637717d68aae3693ebd4f7e3d50d78a",
+        "ciphertext": "80ba054e428f839f7f44ac06d0f12965"
+      },
+      {
+        "plaintext": "07d6258d7b11414d6e4d4098529993fc",
+        "ciphertext": "2fc290a0648f9a7b2e4a7d6293405ba3"
+      },
+      {
+        "plaintext": "4acf217b646b424c75f67db75577c913",
+        "ciphertext": "7e56b77d24d1cdf43928820b67d45e96"
+      }
+    ]
+  },
+  {
+    "key": "ffffffffffffffffffffffffffffffff",
+    "vectors": [
+      {
+        "plaintext": "00112233445566778899aabbccddeeff",
+        "ciphertext": "0a90e5b74d2807a651f69ac0896a09f6"
+      },
+      {
+        "plaintext": "00000000000000000000000000000000",
+        "ciphertext": "a1f6258c877d5fcd8964484538bfc92c"
+      },
+      {
+        "plaintext": "ffffffffffffffffffffffffffffffff",
+        "ciphertext": "bcbf217cb280cf30b2517052193ab979"
+      },
+      {
+        "plaintext": "80000000000000000000000000000000",
+        "ciphertext": "973925ce42e3f5f74dca39d9052449ef"
+      },
+      {
+        "plaintext": "00000000000000000000000000000001",
+        "ciphertext": "5c9fb551ac5c263fafb1df78b066ed02"
+      },
+      {
+        "plaintext": "000102030405060708090a0b0c0d0e0f",
+        "ciphertext": "66e644bfe76c6375f27b3a88fddc13cb"
+      },
+      {
+        "plaintext": "f25a358a4b46ed03408bed214636cf29",
+        "ciphertext": "caad7cfdb2ec98833df7044383ec0ecf"
+      },
+      {
+        "plaintext": "a0f369050c66e5b0fd960730e2214995",
+        "ciphertext": "f07ec467702d5182149028e1207bdec1"
+      },
+      {
+        "plaintext": "b72e071ef1ab000aa761db94c6550f7c",
+        "ciphertext": "ded51f6b8b402f64c7206a31b0e121ac"
+      },
+      {
+        "plaintext": "4e13bb74775b4e196f08a5efa4514c34",
+        "ciphertext": "6ccaf61fa504e2798ca8208a29fd9d27"
+      },
+      {
+        "plaintext": "094b8cf4814cd59421ecd1d9e2677f6a",
+        "ciphertext": "94af6fb9185fd0e2814a6c9f1f1b6c45"
+      },
+      {
+        "plaintext": "c28141ce712f0239963888acf28fd49f",
+        "ciphertext": "4a938343bd447279a9d3c2e1ce4d9bb5"
+      },
+      {
+        "plaintext": "a9794b2b648d01271636cb95276084b4",
+        "ciphertext": "89c56ca66cc3691feb405524e3f02771"
+      },
+      {
+        "plaintext": "f637717d68aae3693ebd4f7e3d50d78a",
+        "ciphertext": "41307ea02b65d2aa5f3351c4be1f56eb"
+      },
+      {
+        "plaintext": "07d6258d7b11414d6e4d4098529993fc",
+        "ciphertext": "3adb995834be34377f030053a90a5d7b"
+      },
+      {
+        "plaintext": "4acf217b646b424c75f67db75577c913",
+        "ciphertext": "4f595b89bc14aa5aefbbb5dcbce5ec66"
+      }
+    ]
+  }
+]
