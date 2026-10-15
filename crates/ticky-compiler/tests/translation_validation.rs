@@ -2,6 +2,36 @@
 use ticky_compiler::testrun::{Harness, PVal};
 use ticky_compiler::{compile, Options};
 
+fn settle(src: &str, inputs: &[(&str, i32)], output: &str) -> Vec<PVal> {
+    let mut out = Vec::new();
+    for checks in [false, true] {
+        let c = compile(src, &Options { checks, ..Default::default() }).unwrap();
+        let mut h = Harness::new(&c);
+        for (n, v) in inputs {
+            h.set(c.program.port_index(n).unwrap(), PVal::Int(*v));
+        }
+        for _ in 0..40 {
+            h.sim.step();
+        }
+        out.push(h.get(c.program.port_index(output).unwrap()));
+    }
+    out
+}
+
+/// Found as a failed element-range obligation on examples/dashboard.ticky (digit drawing
+/// divides a temperature input by a table of digit weights); minimised, a failed `cmp` claim. The interval of
+/// a truncating division by a non-constant left out MIN (`MIN / 1` is MIN), so comparing the
+/// quotient with MIN folded to a constant (ir.rs `ar_interval`, fixed).
+#[test]
+fn quotient_interval_includes_min() {
+    let src = "input x: int @ X\ninput y: int @ Y\noutput o: bool @ A\noutput p: int @ B\nevery tick:\n    o = tdiv(x, y) == -2147483648\n    p = 1 if tdiv(x, y) < -2147483647 else 2\n";
+    let min = i32::MIN;
+    assert_eq!(settle(src, &[("x", min), ("y", 1)], "o"), vec![PVal::Int(1); 2]);
+    assert_eq!(settle(src, &[("x", min), ("y", 1)], "p"), vec![PVal::Int(1); 2]);
+    assert_eq!(settle(src, &[("x", min), ("y", -1)], "o"), vec![PVal::Int(0); 2]);
+    assert_eq!(settle(src, &[("x", 7), ("y", 2)], "p"), vec![PVal::Int(2); 2]);
+}
+
 /// Found as a failed element-range obligation on a `fuzz_elemranges` program: a comprehension
 /// condition on a value of `v` that isn't `v` itself (`t + 7 > -40` inside `min(t + 7, -40)`)
 /// is lowered as "the difference with 0 on every signal" (bundle.rs `Conv::restrict`:

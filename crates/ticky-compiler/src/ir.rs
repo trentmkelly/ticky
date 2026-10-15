@@ -404,8 +404,9 @@ fn ar_interval(op: ArOp, x: Iv, y: Iv, k: Option<i32>) -> Iv {
             }
             None if x.nonneg() && y.nonneg() => Iv { lo: 0, hi: x.hi },
             None => {
+                // |x / y| <= |x|, but MIN / 1 is MIN itself (-MIN doesn't fit).
                 let m = x.max_abs().min(MAX);
-                Iv { lo: -m, hi: m }
+                Iv { lo: if x.lo == MIN { MIN } else { -m }, hi: m }
             }
         },
         ArOp::Mod => {
