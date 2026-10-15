@@ -57,11 +57,22 @@ test "behaviour":
 
 #[test]
 fn rewrites_save_combinators() {
+    let depth = |c: &Compiled| c.program.blocks.iter().map(|b| b.period).collect::<Vec<_>>();
+    // The pass's own win, without select picks (fuse/superopt.rs), which make some of the
+    // same selects cheaper already.
+    ticky_compiler::fuse::superopt::set_picks_disabled(true);
     for opt in [Opt::Speed, Opt::Size] {
         let (with, without) = (build(SRC, opt, true), build(SRC, opt, false));
         let (w, p) = (combinators(&with), combinators(&without));
         assert!(w + 2 <= p, "{opt:?}: {w} combinators with the e-graph pass, {p} without");
-        let depth = |c: &Compiled| c.program.blocks.iter().map(|b| b.period).collect::<Vec<_>>();
+        assert!(depth(&with).iter().zip(depth(&without)).all(|(a, b)| *a <= b));
+    }
+    ticky_compiler::fuse::superopt::set_picks_disabled(false);
+    // With picks: still never larger or slower.
+    for opt in [Opt::Speed, Opt::Size] {
+        let (with, without) = (build(SRC, opt, true), build(SRC, opt, false));
+        let (w, p) = (combinators(&with), combinators(&without));
+        assert!(w <= p, "{opt:?} with picks: {w} combinators with the e-graph pass, {p} without");
         assert!(depth(&with).iter().zip(depth(&without)).all(|(a, b)| *a <= b));
     }
 }
