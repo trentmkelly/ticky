@@ -217,3 +217,41 @@ fn every_tick_blocks_are_unchanged() {
     assert_eq!(picks(&on), 0);
     assert_eq!(combinators(&on), combinators(&off));
 }
+
+#[test]
+fn picks_read_packed_lanes_and_wire_sums() {
+    // `p`, `q`, `r`, `t` are lanes of one `* 3` pack (straight-line vectorisation) that picks
+    // read off the bus; `s` is a wire sum (its operands write its signal), read by a pick too.
+    // (A select is never a lane's input: SLP leaves select stages alone. Selects are wrapped in
+    // `^`: an output's own select becomes guarded register loads, not a stage.)
+    let src = "\
+input x: int @ X
+input y: int @ Y
+input z: int @ Z
+output o0: int @ A
+output o1: int @ B
+output o2: int @ C
+output o3: int @ D
+output o4: int @ E
+every 20 ticks:
+    p = (x ^ y) * 3
+    q = (y ^ z) * 3
+    r = (x & z) * 3
+    t = (x | y) * 3
+    s = x * 2 + y * 3
+    o0 = (p if z > 0 else q) ^ x
+    o1 = max(r, t) ^ y
+    o2 = p ^ t
+    o3 = (s if z > 0 else y) ^ z
+    o4 = s ^ 7
+";
+    for opt in [Opt::Speed, Opt::Size] {
+        let opts = Options { opt, ..Default::default() };
+        let (on, off) = (build(src, &opts, true), build(src, &opts, false));
+        let packs = on.cg.netlist.entities.iter().filter(|e| e.description.as_deref().is_some_and(|d| d.contains("lanes at once"))).count();
+        assert_eq!(packs, 1, "{opt:?}");
+        assert_eq!(picks(&on), 3, "{opt:?}");
+        assert!(combinators(&on) < combinators(&off));
+        lockstep(&on, &off, 5, 45);
+    }
+}
