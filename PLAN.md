@@ -78,15 +78,19 @@ combinator cost.
 
 ## 4. Superoptimisation — size
 
+**Status (2026-10-15): merged.** Select picks: one decider for min/max/abs/ternaries with
+runtime arms. Bench 2640 → 2621 (size 2589 → 2548), fuzz programs −10.4%. In-game probe of
+OR'd each-terms with green copies pending.
+
 Search offline for the fewest combinators computing small patterns, using the odd features
 (multi-condition deciders, selector modes, `each`, wire sums). Results become rewrite rules.
 
-- [ ] Define the search space: 1–3 combinators of every kind and mode over up to 2–3 input
+- [x] Define the search space: 1–3 combinators of every kind and mode over up to 2–3 input
       signals and constants, with Factorio's exact semantics (reuse ticky-sim's evaluator).
-- [ ] Target patterns: harvest the most frequent small IR subgraphs from the examples and
+- [x] Target patterns: harvest the most frequent small IR subgraphs from the examples and
       fuzz corpora (with their combinator cost today).
-- [ ] Search: enumerate + test on random vectors, confirm candidates with the solver (item 2).
-- [ ] Emit the winners as rules (into the e-graph from item 3, or as fuse patterns), with
+- [x] Search: enumerate + test on random vectors, confirm candidates with the solver (item 2).
+- [x] Emit the winners as rules (into the e-graph from item 3, or as fuse patterns), with
       a generated table checked into the repo and the tool under `tools/`.
 
 ## 5. Operator sharing across process states — size

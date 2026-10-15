@@ -1727,3 +1727,43 @@ honoured). `--collect DIR fuzz_X.py N SEED` keeps a fuzzer's programs via a TICK
   fuzzers/difftests.
 - Open: comprehension conditions with `v` on both sides, or against a runtime scalar, still
   compare a wrapping difference with 0.
+
+## 2026-10-15: superoptimisation (tools/superopt; select picks in codegen, PLAN §4)
+
+- Harvest (`TICKY_SUPEROPT_HARVEST=file`, fuse/superopt.rs, `logic()` only;
+  `tools/superopt_harvest.py --abstract`): maximal trees of ≤4 scalar ops and ≤3 leaves, with
+  the combinators codegen spent on them. Examples plus 687 fuzz programs: 7315 patterns, 918
+  classes, 12085 combinators, excess over one per pattern 5028 (examples: 284 patterns, 438
+  combinators; most combinators aren't in small patterns). Top: min/max (360 × ~3.9), runtime
+  `%` (223 × 3), abs (47 × 4), `x1 if c else x2` (4), clamps (~2.7).
+- Search (`tools/superopt`, Rust bin over ticky-sim, seed 1): 1–3 arithmetic/decider/selector
+  combinators, constant tables and private red wires, wire sums; one, two parallel, two
+  serial, three. Bus noise signals; winners must also pass every combination of special values
+  (0, ±1, ±2, INT_MIN/INT_MAX and neighbours, the pattern's constants).
+  `tools/superopt_confirm.py` proves them with z3 (validate.py's encoding). Top 40 classes: 25
+  found ≤3, all proved; 21 improved; 11.5 min, 1 GB. z3 caught 2 false positives in an earlier
+  run (hence the wide tests). Selectors never win (they read the bus too). Checked in:
+  tools/superopt/{targets.tsv, search.txt, rules.jsonl}; tests/superopt_rules.rs compiles the
+  table's patterns with and without picks.
+- The find, now in codegen (selects.rs `Out::Pick`, logic.rs `emit_picks`): a select's runtime
+  arms in one decider with a code table on red, `(each(red)=code_i ∧ arm i's literals on
+  green) ∨ …`, one output copying green, so the passing value arrives summed and renamed.
+  Replaces `x * c` multipliers and their condition deciders: min(a,b) 4 → 1 combinators,
+  2 → 1 ticks. A shared value added to a pick (`x + s`) joins as an always-on term: Python
+  `a % b` 4 → 2, `min(a,b) + c` 5 → 1. A lone pick on an already-built boolean keeps `x * c`
+  (same cost, no constant). Pick reads are forced onto the bus; passes conflicting with picks
+  are banned. Not in `every tick` blocks (own emitter). `TICKY_NO_PICK=1` /
+  `fuse::superopt::set_picks_disabled`.
+- Bench: speed 2640 → 2621, size 2589 → 2548; entities incl. constants 3951 → 3944 /
+  3896 → 3880 (constants +15/+23). Fuzz corpus −10.4% (45461 → 40750). Latency never worse
+  (schedules are made before codegen, so no example gets faster).
+- Verification: tests/select_picks.rs (picks on/off in lockstep on edge values: periodic, main,
+  --checks, size, register arms named like the result, packed-lane and wire-sum arms,
+  every-tick unchanged); tools/fuzz_selects.py (500 programs, 16258 outputs, 0 mismatches;
+  reviewer rerun on merged main, seed 9: 300 programs, 9472 outputs, 0); verify clean at N=20,
+  200, and combined main at 60. validate.py: examples 0 counterexamples (picks are codegen,
+  outside the IR). Relies on probed P2/P3b/L1; OR across each-terms with green copies not
+  probed as such. Not difftested in game.
+- Not done: `pick + k` as a constant combinator, sums as pick arms (1 combinator found),
+  2-decider floor-division forms, one shared code table per wire, selects that fusion turns
+  into guarded register loads.
