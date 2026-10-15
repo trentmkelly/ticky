@@ -73,6 +73,8 @@ fn lane_of(g: &Graph, v: V) -> Option<(PackOp, Lane)> {
     let lane = |input, k| Lane { out: v, input, k };
     match *g.op(v) {
         Op::Ar(op, a, b) => match (g.as_const(a), g.as_const(b)) {
+            // `x - k` is `x + -k` (wrapping, so k = INT_MIN too): one family with the sums.
+            (None, Some(k)) if op == ArOp::Sub => Some((PackOp::Ar { op: ArOp::Add, left: false }, lane(a, k.wrapping_neg()))),
             (None, Some(k)) => Some((PackOp::Ar { op, left: false }, lane(a, k))),
             (Some(k), None) => Some((PackOp::Ar { op, left: true }, lane(b, k))),
             _ => None,
@@ -146,20 +148,27 @@ pub fn plan(g: &Graph, producers: &[V], lane_ok: &dyn Fn(V) -> bool, input_free:
         let lanes = rest.remove(&key).unwrap();
         cands.push(Pack { op: key.0, lanes, table: true });
     }
-    // Most combinators saved first. A node can't be both a lane (its result on the bus) and
-    // another lane's redirected input.
+    // Most combinators saved first. A node can't be both a lane (its result where its value
+    // goes) and a lane's redirected input, in another pack or the same one (`(x << 3) << 3`).
     cands.sort_by_key(|p| std::cmp::Reverse(p.lanes.len() - usize::from(p.table)));
     let (mut outs, mut ins): (HashSet<V>, HashSet<V>) = Default::default();
     let mut packs = Vec::new();
     for mut p in cands {
-        p.lanes.retain(|l| !ins.contains(&l.out) && !outs.contains(&l.input));
+        let (mut o, mut i) = (outs.clone(), ins.clone());
+        p.lanes.retain(|l| {
+            let ok = !i.contains(&l.out) && !o.contains(&l.input);
+            if ok {
+                o.insert(l.out);
+                i.insert(l.input);
+            }
+            ok
+        });
         let min = if p.table { MIN_TABLE_LANES } else { MIN_LANES };
         if p.lanes.len() < min {
             continue;
         }
         p.lanes.sort_by_key(|l| l.out);
-        outs.extend(p.lanes.iter().map(|l| l.out));
-        ins.extend(p.lanes.iter().map(|l| l.input));
+        (outs, ins) = (o, i);
         packs.push(p);
     }
     packs
@@ -246,5 +255,34 @@ mod tests {
         let ins: HashSet<V> = packs.iter().flat_map(|p| p.lanes.iter().map(|l| l.input)).collect();
         assert!(outs.is_disjoint(&ins));
         assert_eq!(outs.len(), 4);
+    }
+
+    #[test]
+    fn a_lane_is_never_an_input_of_its_own_pack() {
+        // `(x << 3) << 3`: both shifts are lanes of one family, but the inner one's result
+        // would have to be on the pack's input wire and where its value goes at once.
+        let (mut g, xs) = graph();
+        let three = g.konst(3);
+        let inner: Vec<V> = xs.iter().map(|&x| g.ar(ArOp::Shl, x, three)).collect();
+        let outer: Vec<V> = inner.iter().map(|&y| g.ar(ArOp::Shl, y, three)).collect();
+        let prods: Vec<V> = xs.iter().chain(&inner).chain(&outer).copied().collect();
+        let packs = plan(&g, &prods, &|v| inner.contains(&v) || outer.contains(&v), &|x| xs.contains(&x) || inner.contains(&x), &|_| None);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].lanes.iter().map(|l| l.out).collect::<Vec<_>>(), inner);
+    }
+
+    #[test]
+    fn subtraction_joins_the_sums_and_places_split_packs() {
+        let (mut g, xs) = graph();
+        let (five, seven) = (g.konst(5), g.konst(7));
+        let ys = vec![g.ar(ArOp::Add, xs[0], five), g.ar(ArOp::Sub, xs[1], seven), g.ar(ArOp::Add, xs[2], seven), g.ar(ArOp::Sub, xs[3], five)];
+        let prods: Vec<V> = xs.iter().chain(&ys).copied().collect();
+        let packs = plan(&g, &prods, &|v| ys.contains(&v), &|x| xs.contains(&x), &|_| None);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].op, PackOp::Ar { op: ArOp::Add, left: false });
+        assert_eq!(packs[0].lanes.iter().map(|l| l.k).collect::<Vec<_>>(), vec![5, -7, 7, -5]);
+        // Lanes on two different wires: two lanes each, too few for a table.
+        let packs = plan(&g, &prods, &|v| ys.contains(&v), &|x| xs.contains(&x), &|v| Some((v % 2) as usize));
+        assert!(packs.is_empty());
     }
 }

@@ -417,15 +417,15 @@ impl Cg {
         if slp::enabled() {
             let writes_into = |t: V| floors.iter().any(|f| f.div_to.map(|d| d.0) == Some(t) || f.rem_to == Some(t));
             let placed = |v: V| {
-                transparent.contains(&v) || fold.contains_key(&v) || floor_at.contains_key(&v) || writes_into(v) || staged.contains_key(&v) || bundle_writes.contains_key(&v)
+                fold.contains_key(&v) || floor_at.contains_key(&v) || writes_into(v) || staged.contains_key(&v) || bundle_writes.contains_key(&v)
                     || plan.stages.contains_key(&v) || pass_of.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || cond_reads.contains_key(&v)
             };
-            let lane_ok = |v: V| !placed(v) && eff_operands(v) == g.operands(v);
+            let lane_ok = |v: V| !placed(v) && !transparent.contains(&v) && eff_operands(v) == g.operands(v);
             // Reads write a private wire too (`emit_from_bundle`'s `out_net`), unless they're
             // done by their consumer or fused into a sum.
             let input_free = |x: V| {
                 let own = !is_root.contains(&x) && consumers.get(&x).is_some_and(|cs| cs.len() == 1);
-                let scalar = is_scalar_op(x) && !(placed(x) && !transparent.contains(&x));
+                let scalar = is_scalar_op(x) && !placed(x);
                 let read = is_read(x) && !fold.contains_key(&x) && !direct_reads.contains_key(&x) && !cond_read.contains_key(&x);
                 own && (scalar || read)
             };
