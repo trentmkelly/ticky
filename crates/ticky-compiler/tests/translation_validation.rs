@@ -38,8 +38,8 @@ fn quotient_interval_includes_min() {
 /// `(t + 7) - (-40) > 0`, i.e. `t + 47 > 0`), which is wrong when the difference wraps even
 /// though nothing in the source overflows: with `t = 2147483620`, `t + 7 = 2147483627` and
 /// `min(...)` is -40, but `t + 47` wraps negative and the element came out as `t + 7`. Fixed
-/// for conditions with one side free of `v` (compared directly); the difference remains for
-/// conditions with `v` on both sides.
+/// for conditions with a constant side (compared directly); the difference remains for
+/// other conditions (`v` on both sides, or a runtime scalar: domain filters need constants).
 #[test]
 fn comprehension_condition_with_a_runtime_scalar_compiles() {
     // Domain filters compare with constants only: a first version of the fix above compared
