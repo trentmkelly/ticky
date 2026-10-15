@@ -99,11 +99,10 @@ pub fn set_disabled(off: bool) {
     OFF.with(|c| c.set(off));
 }
 
-/// On under `--opt=speed`, but not (yet) together with a profile: on `examples/primes.ticky`
-/// it would take the profile-guided loop from 3 to 2 ticks per iteration (test 1111 → 875
-/// ticks), but `tests/profile_guided.rs` pins the profiled build's 3 ticks.
+/// On under `--opt=speed` (with a profile too: on `examples/primes.ticky` it takes the
+/// profile-guided loop from 3 to 2 ticks per iteration, test 1111 → 875 ticks).
 fn enabled() -> bool {
-    !crate::opt_size() && !crate::profile::active() && !OFF.with(|c| c.get()) && std::env::var_os("TICKY_NO_MODSCHED").is_none()
+    !crate::opt_size() && !OFF.with(|c| c.get()) && std::env::var_os("TICKY_NO_MODSCHED").is_none()
 }
 
 fn dump() -> bool {

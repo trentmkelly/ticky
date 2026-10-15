@@ -64,9 +64,12 @@ fn profile_counts_steps_and_branches() {
 
 #[test]
 fn hot_loop_gets_fewer_ticks_per_iteration() {
+    // PGO's own decisions, without overlapping loop iterations (modsched; see below).
+    ticky_compiler::modsched::set_disabled(true);
     let profile = profile_of(PRIMES, false);
     let plain = build(PRIMES, false, None);
     let guided = build(PRIMES, false, Some(&profile));
+    ticky_compiler::modsched::set_disabled(false);
     // Without the profile the trial-division loop is two steps (2 + 3 ticks); with it, the
     // hot side (no divisor: `d += 1`) is merged into the test, run speculatively (`d` is
     // dead when a divisor is found): one 3-tick step.
@@ -82,6 +85,21 @@ fn hot_loop_gets_fewer_ticks_per_iteration() {
     let (est_plain, est_guided) = guided.profiled.unwrap();
     assert!(est_guided < est_plain);
     assert!(plain.profiled.is_none());
+}
+
+/// With overlapping loop iterations on top, the merged loop pipelines further: one 2-tick step
+/// (spending combinators for ticks, as `--opt=speed` may).
+#[test]
+fn hot_loop_with_overlapped_iterations() {
+    let profile = profile_of(PRIMES, false);
+    let plain = build(PRIMES, false, None);
+    let guided = build(PRIMES, false, Some(&profile));
+    let loop_ticks = |c: &Compiled| -> Vec<String> {
+        c.cg.procs[0].steps.iter().filter(|s| s.self_loop).map(|s| s.duration.clone()).collect()
+    };
+    assert_eq!(loop_ticks(&guided), vec!["2 ticks".to_string()]);
+    let (before, after) = (passes(&plain, PRIMES, "plain"), passes(&guided, PRIMES, "guided"));
+    assert!(after * 100 <= before * 70, "{before} → {after} ticks");
 }
 
 /// Every example: its profiled build passes its tests, and when the profile doesn't pay
