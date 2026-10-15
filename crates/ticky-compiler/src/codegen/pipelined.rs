@@ -9,8 +9,9 @@
 //! one `each + 0` per wire). A combinator whose delayed operands all have the same delay
 //! reads the bus on green and that carry wire on red, so the delay costs it nothing;
 //! anything else that needs a value `d` ticks old gets a tap (`s + 0` from wire `d - 1`
-//! onto the bus). Each block is built with 0, 1, 2, … carry wires and both schedules from
-//! [`crate::pipeline`], keeping the smallest.
+//! onto the bus). Each block is built with 0, 1, 2, … carry wires and every candidate
+//! schedule from [`crate::pipeline`] (late, early, mixed, and retimed to need the fewest
+//! delays), keeping the smallest.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -39,6 +40,7 @@ pub(super) fn pipelined_block(
 ) -> Result<Built, Diag> {
     let first = cg.net.entities.len();
     let mut best: Option<(usize, Cg, Built)> = None;
+    let mut best_ti = 0;
     let mut err = None;
     for (ti, tau) in pipe.taus.iter().enumerate() {
         for (inline, economical) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -49,10 +51,12 @@ pub(super) fn pipelined_block(
                     Ok((r, used)) => {
                         let n = trial.combinators_since(first);
                         if std::env::var_os("TICKY_DUMP_PIPE").is_some() {
-                            eprintln!("block {}: schedule {ti}, inline {inline}, economical {economical}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
+                            let retimed = if ti >= pipe.retimed { " (retimed)" } else { "" };
+                            eprintln!("block {}: schedule {ti}{retimed}, inline {inline}, economical {economical}, {stages} carry wires: {n} combinators ({used} built)", bi + 1);
                         }
                         if best.as_ref().is_none_or(|(m, _, _)| n < *m) {
                             best = Some((n, trial, r));
+                            best_ti = ti;
                         }
                         used
                     }
@@ -69,6 +73,10 @@ pub(super) fn pipelined_block(
         }
     }
     let (_, built, r) = best.ok_or_else(|| err.unwrap())?;
+    if std::env::var_os("TICKY_DUMP_PIPE").is_some() {
+        let retimed = if best_ti >= pipe.retimed { " (retimed)" } else { "" };
+        eprintln!("block {}: schedule {best_ti}{retimed} kept, {} combinators", bi + 1, built.combinators_since(first));
+    }
     *cg = built;
     Ok(r)
 }

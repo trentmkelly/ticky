@@ -22,10 +22,13 @@ use crate::fuse::{is_true, LoadVal, WriterPlan};
 use crate::ir::{dnf_operands, Dnf, Graph, Iv, Op, V};
 use crate::program::SrcKind;
 
+pub mod retime;
+
 pub struct Pipe {
     /// Ticks between reading the inputs and the iteration that uses them.
     pub latency: u32,
-    /// Candidate schedules: ALAP, ASAP (if different), then bounded mixed alternatives.
+    /// Candidate schedules: ALAP, ASAP (if different), then bounded mixed alternatives, then
+    /// retimed ones from `retimed` on ([`retime::Space::min_delays`]).
     /// Each gives node time offsets, `None` for constants and unused nodes.
     /// Codegen builds the block with each and keeps the smaller.
     pub taus: Vec<Vec<Option<i32>>>,
@@ -35,6 +38,10 @@ pub struct Pipe {
     /// their factor, and the sums (and `* k`) built that way, which have no combinator.
     pub fold: HashMap<V, (V, i32)>,
     pub transparent: HashSet<V>,
+    /// The legal schedules, for retiming ([`retime`]).
+    pub space: retime::Space,
+    /// `taus[retimed..]` are the retimed schedules ([`retime::Space::min_delays`]).
+    pub retimed: usize,
 }
 
 /// Depth through own-state paths only; `None` for values that don't depend on own state.
@@ -428,6 +435,29 @@ pub fn plan(g: &mut Graph, srcs: &[SrcKind], plans: &mut Vec<(usize, WriterPlan)
         mixed[v as usize] = Some(earliest);
         if !taus.contains(&mixed) { taus.push(mixed); }
     }
+    let movable = |v: V| od[v as usize].is_none() && retime::movable_op(g, v);
+    let mut last: Vec<Option<i32>> = vec![None; g.nodes.len()];
+    for &(v, at) in &need {
+        let l = &mut last[v as usize];
+        *l = Some(l.map_or(at, |x| x.max(at)));
+    }
+    let space = retime::Space::new(g, &live, &movable, &transparent, latest, last);
+    // Retimed schedules (Leiserson–Saxe): the fewest delays, weighing a bundle's delay
+    // chain against scalars, which share carry wires. Bundles 8 : scalars 1, and bundles
+    // alone, were as good as any mix tried (1:1, 2:1, 3:1, 4:1, 32:1) over the examples
+    // and 150 random bundle-reading blocks; the trial builds keep whichever is smallest.
+    // `TICKY_NO_RETIME=1` leaves them out.
+    let retimed = taus.len();
+    if std::env::var_os("TICKY_NO_RETIME").is_none() {
+        let part = |v: V| fold.get(&v).is_some_and(|&(s, _)| s != v);
+        for w in [retime::Weights { bundle: 8, scalar: 1 }, retime::Weights { bundle: 1, scalar: 0 }] {
+            if let Some(t) = space.min_delays(g, &transparent, &part, &taus[0], w) {
+                if !taus.contains(&t) {
+                    taus.push(t);
+                }
+            }
+        }
+    }
     *plans = rest;
-    Some(Pipe { latency: latency as u32, taus, accs, fold, transparent })
+    Some(Pipe { latency: latency as u32, taus, accs, fold, transparent, space, retimed })
 }
