@@ -1689,3 +1689,41 @@ an input). Fuzz corpora (150 each): of the loops not reading inputs, 30/102 (pro
   `pipe_loop` (dependence distance 0–3, up/down, `while`, nested; separate random stream).
   verify clean at FUZZ_N=20 and 200; forced rounds 1–3 over procs/programs/CHECKS/level2/
   signals/bundles clean; combined main verify clean at FUZZ_N=60. Not difftested in game.
+
+## 2026-10-15: translation validation (tools/validate.py, ir_export.rs)
+
+PLAN §2. `TICKY_EXPORT_IR=file` makes the compiler append one JSON line per block/process:
+the graph (nodes with intervals), sources (with assumed intervals and initial values), and
+the *rewrite claims*: every simplifying constructor call (`ar`, `cmp`, `mux_tf`, `bun`,
+`aset`, …, and `lower::floor_div`/`floor_mod` with the path conditions) logs what it was
+asked for and the node it returned (`tv_hook!`, one line per constructor; nested calls are
+covered by the outer claim), plus each writer's values before and after fusion (plans,
+accumulators, checks, branch/wait conditions). Without the variable nothing changes (all
+examples byte-identical under --json, --opt=size --checks, --place=anneal, with and without).
+`tools/validate.py` (z3 from a venv, `tools/.venv`) encodes both sides as 32-bit bitvectors
+with Factorio's semantics (selftest against `ArOp::apply`'s table) and proves: claims,
+fusion equivalence, the fixpoint's state intervals (initial + every write), which signals
+bundle registers can hold, one-hot Signal registers, and bundle element intervals (the
+comprehension placeholder `Each` trusts them). Bundles are maps over the obligation's
+signals plus two anonymous ones (bounded). Solving: multiplication/division as
+uninterpreted functions first, then exact; bundle goals per signal behind assumption
+switches (no push: it was 7x slower); a watchdog interrupts z3 (its timeout isn't always
+honoured). `--collect DIR fuzz_X.py N SEED` keeps a fuzzer's programs via a TICKY shim.
+- Found two miscompilations, both fixed (no example blueprint changes): `ar_interval` for
+  `x / y` (y not constant) left out MIN, so `tdiv(x, y) == MIN` folded to False; comprehension
+  conditions compared `a - b` with 0 (bundle.rs `Conv::restrict`), wrong where that wraps:
+  `[min(t + 7, -40) for t in xs]` gave 2147483627 for t = 2147483620. Now compared directly
+  with a constant side; conditions with `v` on both sides or a runtime scalar still subtract
+  (domain filters only take constants — the first fix tried a scalar and codegen panicked,
+  caught by validating the fuzz corpus). Tests in tests/translation_validation.rs.
+- Results: examples 135 units equivalent, 8 unknown (timeouts: histogram's BSelect ranks,
+  sorting networks, stats' median, a /3600 divider proved at 120 s), 0 counterexamples;
+  fuzz corpus (928 programs, 12 fuzzers, 2 modes) 1913 equivalent, 162 unknown (380 of
+  223k obligations, 3 s timeout), 0 counterexamples. Mutations (no-wrap check in `cmp`,
+  `floor_div` sign, a fusion guard) are each caught.
+- Not encoded: selector modes (stack sizes, quality, random: free values in their interval,
+  reported `equivalent*`) and `**` by a non-constant. Codegen (wire sums, inlined
+  conditions, the pipelined emitter, SLP packs) is outside the IR and still relies on
+  fuzzers/difftests.
+- Open: comprehension conditions with `v` on both sides, or against a runtime scalar, still
+  compare a wrapping difference with 0.

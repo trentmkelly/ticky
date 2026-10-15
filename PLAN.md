@@ -42,18 +42,21 @@ does them all. We do this for comprehensions (`expand/vectorize.rs`), not for lo
 
 ## 2. Translation validation — enabler
 
+**Status (2026-10-15): merged.** Found and fixed two miscompilations. Open: comprehension
+conditions with `v` on both sides / a runtime scalar still subtract (can wrap).
+
 Prove rewrites correct with a solver on 32-bit wrapping arithmetic instead of trusting
 fuzzers alone, so the aggressive passes below (3, 4) are safe.
 
-- [ ] Pick the solver route: z3 via the `z3` crate (build dependency weight?) or emitting
+- [x] Pick the solver route: z3 via the `z3` crate (build dependency weight?) or emitting
       SMT-LIB to an external `z3`/`cvc5` in a test-only tool. Prefer test-only: the compiler
       binary shouldn't need a solver.
-- [ ] Encode the IR expression language (wrapping add/mul, Factorio's division and modulo
+- [x] Encode the IR expression language (wrapping add/mul, Factorio's division and modulo
       semantics, shifts, comparisons, selects) as bitvector terms.
-- [ ] Check mode: for each block, the IR before and after optimisation are equivalent for all
+- [x] Check mode: for each block, the IR before and after optimisation are equivalent for all
       inputs (within the range facts the passes assume). A `TICKY_VALIDATE=1` or a test
       harness over the examples.
-- [ ] Run it over every example and fuzzer corpus; any counterexample becomes a regression test.
+- [x] Run it over every example and fuzzer corpus; any counterexample becomes a regression test.
 
 ## 3. Equality saturation (e-graphs) — size
 
