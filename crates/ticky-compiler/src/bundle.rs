@@ -637,8 +637,18 @@ impl Conv {
                         return Err(self.unsupported());
                     }
                 }
-                // Compare the difference with 0, on every signal of the domain.
                 let op = if neg { op.negate() } else { op };
+                // One side without `v`: compare the other side's values with it directly
+                // (`a - b op 0` is wrong where the difference wraps: `max(t + 40, 560)` with
+                // `t + 40 - 560` overflowing; found by tools/validate.py).
+                for (x, y, op) in [(a, b, op), (b, a, op.flip())] {
+                    if !uses_each(g, y) {
+                        let xb = self.bundle(g, x)?;
+                        let d = vec![vec![BLit { op, a: BOp::Each, b: BOp::Val(y) }]];
+                        return Ok(g.bun(vec![BTerm::DFilter(self.dom, xb, d, FOut::Copy)]));
+                    }
+                }
+                // Compare the difference with 0, on every signal of the domain.
                 let diff = g.ar(ArOp::Sub, a, b);
                 let db = self.bundle(g, diff)?;
                 let z = g.konst(0);

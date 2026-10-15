@@ -37,9 +37,10 @@ fn quotient_interval_includes_min() {
 /// is lowered as "the difference with 0 on every signal" (bundle.rs `Conv::restrict`:
 /// `(t + 7) - (-40) > 0`, i.e. `t + 47 > 0`), which is wrong when the difference wraps even
 /// though nothing in the source overflows: with `t = 2147483620`, `t + 7 = 2147483627` and
-/// `min(...)` is -40, but `t + 47` wraps negative and the element comes out as `t + 7`.
+/// `min(...)` is -40, but `t + 47` wraps negative and the element came out as `t + 7`. Fixed
+/// for conditions with one side free of `v` (compared directly); the difference remains for
+/// conditions with `v` on both sides.
 #[test]
-#[ignore = "known bug in comprehension conditions (bundle.rs Conv::restrict), not fixed yet"]
 fn comprehension_condition_difference_must_not_wrap() {
     let src = "input x: int @ X\ninput i: int @ I\noutput o: int @ A\nxs = [0, 0]\nevery tick:\n    xs[i] = x\n    ys = [min(t + 7, -40) for t in xs]\n    o = ys[i]\n";
     for checks in [false, true] {
