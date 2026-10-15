@@ -7,6 +7,7 @@ pub mod display;
 pub mod codegen;
 pub mod consteval;
 pub mod dup;
+pub mod egraph;
 pub mod expand;
 pub mod fuse;
 pub mod ir;
@@ -132,6 +133,40 @@ pub struct Compiled {
 }
 
 pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
+    // The e-graph pass (egraph.rs) chooses by an estimate of codegen's cost, so a program it
+    // changed is also built without it; its build is kept only if no larger and no slower.
+    egraph::reset_changed();
+    let with = compile_once(src, opts);
+    if egraph::changed() == 0 || !egraph::enabled() {
+        return with;
+    }
+    egraph::set_enabled(false);
+    let without = compile_once(src, opts);
+    egraph::set_enabled(true);
+    match (with, without) {
+        (Ok(w), Ok(p)) => Ok(if egraph_pays(&w, &p) { w } else { p }),
+        (Ok(w), Err(_)) => Ok(w),
+        (Err(_), p) => p,
+    }
+}
+
+/// Whether build `w` (with the e-graph pass) beats `p` (without): no more combinators, no
+/// block or step slower, and better in one of them.
+fn egraph_pays(w: &Compiled, p: &Compiled) -> bool {
+    let count = |c: &Compiled| c.cg.netlist.entities.iter().filter(|e| e.kind.is_combinator()).count();
+    let timing = |c: &Compiled| -> Vec<u32> {
+        let mut t: Vec<u32> = c.cg.blocks.iter().flat_map(|b| [b.period, b.depth, b.latency.unwrap_or(0)]).collect();
+        for m in &c.program.procs {
+            t.push(m.steps.len() as u32);
+            t.extend(m.steps.iter().flat_map(|s| [s.depth, s.wait_ready]));
+        }
+        t
+    };
+    let (cw, cp, tw, tp) = (count(w), count(p), timing(w), timing(p));
+    tw.len() == tp.len() && tw.iter().zip(&tp).all(|(a, b)| a <= b) && cw <= cp && (cw < cp || tw != tp)
+}
+
+fn compile_once(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     ticky_factorio::set_quality_pool(opts.quality);
     ticky_factorio::items::set_space_age(opts.space_age);
     set_checks(opts.checks);

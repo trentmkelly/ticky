@@ -1094,9 +1094,18 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &
         };
         let ctx = Ctx { owner: bi, ports: &ports, states: &states, consts: &consts };
         match lower_block(&ctx, body) {
-            Ok((srcs, mut graph, next)) => {
+            Ok((srcs, mut graph, mut next)) => {
                 let mut plans = Vec::new();
-                let raw = std::mem::take(&mut graph.checks);
+                let mut raw = std::mem::take(&mut graph.checks);
+                {
+                    let roots: Vec<V> = next.iter().map(|(_, v)| *v).chain(raw.iter().map(|c| c.0)).collect();
+                    let no_const: Vec<bool> = next.iter().map(|_| false).chain(raw.iter().map(|_| true)).collect();
+                    if let Some(new) = crate::egraph::optimize(&mut graph, &roots, &no_const, &format!("every block {bi}")) {
+                        let (w, c) = new.split_at(next.len());
+                        next.iter_mut().zip(w).for_each(|(x, v)| x.1 = *v);
+                        raw.iter_mut().zip(c).for_each(|(x, v)| x.0 = *v);
+                    }
+                }
                 let mut fz = Fuser::new(&mut graph);
                 let roots: Vec<V> = next.iter().map(|(_, v)| *v).chain(raw.iter().map(|c| c.0)).collect();
                 fz.plan_order_stats(&roots, pipeline && requested.is_none() && raw.is_empty() && !natural);
@@ -1923,6 +1932,44 @@ fn prune_dead_stores(ctx: &Ctx, elsewhere: &BTreeSet<&String>, g: &Graph, srcs: 
     }
 }
 
+/// Runs the e-graph pass (`egraph.rs`) over a process's lowered steps: their writes, checks,
+/// and branch/wait conditions.
+fn egraph_steps(g: &mut Graph, steps: &mut [Step], owner: usize) {
+    let (mut roots, mut no_const): (Vec<V>, Vec<bool>) = (Vec::new(), Vec::new());
+    for s in steps.iter() {
+        for (_, v) in &s.writes {
+            roots.push(*v);
+            no_const.push(false);
+        }
+        for c in &s.checks {
+            roots.push(c.fail);
+            no_const.push(true);
+        }
+        match &s.kind {
+            StepKind::Run(Next::Branch(c, ..)) | StepKind::WaitUntil(c, _) => roots.push(c.node),
+            StepKind::WaitTicks(WaitN::Dyn(m), _) => roots.push(*m),
+            _ => continue,
+        }
+        no_const.push(true);
+    }
+    let what = if owner == MAIN { "main".to_string() } else { format!("process {}", MAIN - 1 - owner) };
+    let Some(new) = crate::egraph::optimize(g, &roots, &no_const, &what) else { return };
+    let mut it = new.into_iter();
+    for s in steps.iter_mut() {
+        for w in s.writes.iter_mut() {
+            w.1 = it.next().unwrap();
+        }
+        for c in s.checks.iter_mut() {
+            c.fail = it.next().unwrap();
+        }
+        match &mut s.kind {
+            StepKind::Run(Next::Branch(c, ..)) | StepKind::WaitUntil(c, _) => c.node = it.next().unwrap(),
+            StepKind::WaitTicks(WaitN::Dyn(m), _) => *m = it.next().unwrap(),
+            _ => {}
+        }
+    }
+}
+
 fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<MainProc, Diag> {
     let defined = definite_assignment(c);
     let mut fp = Fixpoint::new(ctx);
@@ -1992,6 +2039,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
         if fp.again(ivs, round) {
             continue;
         }
+        egraph_steps(&mut g, &mut steps, ctx.owner);
         // Fusion: plans for every write, condition lists for branches and waits.
         {
             let mut fz = Fuser::new(&mut g);

@@ -11,7 +11,8 @@ table by --selftest) and asks z3 whether they can differ.
 Obligations, per unit (an `every` block or a process):
   claim     `res` == `req` for every logged constructor call (`//` and `%`: under their path
             conditions; `mux_tf`/`bmux_tf`: given complementary conditions, which are checked
-            separately as `pre`).
+            separately as `pre`), and for every root the e-graph pass replaced (`egraph`:
+            the old root's value, `Same`).
   fusion    each state's next value as lowered == its fused plan of guarded loads (or its
             accumulator form); runtime-check conditions, branch/wait conditions and dynamic
             wait counts agree before and after fusion; a plan's hold condition is the
@@ -40,6 +41,9 @@ usage:
                                                  copies every program it compiles into DIR
   tools/validate.py --selftest                   check the encoding against the compiler's
                                                  own operator table
+  tools/validate.py --rules [NAME]               prove the e-graph pass's rewrite rules
+                                                 (egraph.rs) as schemas, for all values
+                                                 (only those whose name contains NAME)
 options:
   --ticky PATH     compiler (default $TICKY, else target/release/ticky)
   --modes LIST     comma list of speed, size, checks, size-checks (default speed,size-checks)
@@ -214,7 +218,7 @@ def operands(op):
         return [x for t in op[1] for x in term_operands(t)]
     if tag == "BDec":
         return [y for d, x in op[1] for y in dnf_nodes(d) + [x]]
-    if tag in ("BSelect", "BGet", "BTotal", "BCount", "SigOf", "BSel", "Not", "Truth"):
+    if tag in ("BSelect", "BGet", "BTotal", "BCount", "SigOf", "BSel", "Not", "Truth", "Same"):
         return [op[1]]
     if tag in ("AGet", "BDot", "FloorDiv", "FloorMod"):
         return [op[1], op[2]]
@@ -731,6 +735,8 @@ class Unit:
             return floor_div(self.scalar(r[1]), self.scalar(r[2]), self.ar)
         if tag == "FloorMod":
             return floor_mod(self.scalar(r[1]), self.scalar(r[2]), self.ar)
+        if tag == "Same":  # an e-graph rewrite: the replaced node's own value
+            return self.value_of(r[1])
         return self.enc(r)
 
 
@@ -896,6 +902,8 @@ def pretty_op(ex, op, depth=3, v=None):
         return f"({p(op[1])} mod {p(op[2])})"
     if tag in ("Not", "Truth"):
         return f"{tag.lower()}({p(op[1])})"
+    if tag == "Same":
+        return p(op[1])
     if tag == "Each":
         return "each"
     if tag == "BGet":
@@ -1267,6 +1275,210 @@ def selftest(ticky):
     return bad == 0
 
 
+# ------------------------------------------------------------------ e-graph rules
+
+
+# Constant divisors and factors the remainder and scaled-comparison schemas are proved for.
+DIVISORS = [d for d in range(-17, 18) if d != 0] + [100, -100, 1000, 65536, -65536, MAX, MIN, MIN + 1]
+FACTORS = list(range(1, 18)) + [24, 32, 60, 64, 100, 1000, 1024, 3600, 65536, 1000000, 2**30, MAX]
+
+
+def egraph_rules():
+    """The e-graph pass's rewrite rules (crates/ticky-compiler/src/egraph.rs), restated here
+    independently as schemas: (name, guard, lhs, rhs) over symbolic 32-bit values. A rule's
+    guard is what the pass checks, made pointwise (it tests intervals of the operands' classes;
+    an interval guard implies the pointwise one for every value in it). Selects are
+    `(t ? a : 0) + (f ? b : 0)` with complementary `t`, `f` (assumed in every select rule)."""
+    x, y, a, b, p, q, k, c, j, d, t, f = (z3.BitVec(n, W) for n in "x y a b p q k c j d t f".split())
+    z = ZERO
+    s64 = lambda v: z3.SignExt(32, v)  # noqa: E731  (the mathematical value, in 64 bits)
+    fits = lambda e: z3.And(e >= z3.BitVecVal(MIN, 64), e <= z3.BitVecVal(MAX, 64))  # noqa: E731
+    boolv = lambda v: z3.Or(v == 0, v == 1)  # noqa: E731
+    comp = z3.Xor(t != 0, f != 0)
+
+    def A(op, u, v, kb=None):
+        return ar(op, u, v, kb)
+
+    def C(op, u, v):
+        return b2i(cmpb(op, u, v))
+
+    def M(tt, ff, u, v):
+        return z3.If(tt != 0, u, ZERO) + z3.If(ff != 0, v, ZERO)
+
+    rules = []
+
+    def rule(name, lhs, rhs, *guard):
+        rules.append((name, z3.And(*guard) if guard else z3.BoolVal(True), lhs, rhs))
+
+    flip = {"Lt": "Gt", "Gt": "Lt", "Ge": "Le", "Le": "Ge", "Eq": "Eq", "Ne": "Ne"}
+    neg = {"Lt": "Ge", "Gt": "Le", "Eq": "Ne", "Ge": "Lt", "Le": "Gt", "Ne": "Eq"}
+    # identities
+    for op in ("Add", "Sub", "Or", "Xor"):
+        rule(f"identity: x {op} 0", A(op, x, z), x)
+    for op in ("Add", "Or", "Xor"):
+        rule(f"identity: 0 {op} x", A(op, z, x), x)
+    for op in ("Shl", "Shr"):
+        rule(f"identity: x {op} k, k & 31 == 0", A(op, x, k), x, k & 31 == 0)
+    rule("identity: x * 1", A("Mul", x, ONE), x)
+    rule("identity: 1 * x", A("Mul", ONE, x), x)
+    rule("identity: x / 1", A("Div", x, ONE), x)
+    rule("identity: x ** 1", A("Pow", x, ONE, 1), x)
+    for op in ("Mul", "And"):
+        rule(f"identity: x {op} 0", A(op, x, z), z)
+        rule(f"identity: 0 {op} x", A(op, z, x), z)
+    rule("identity: x % 1", A("Mod", x, ONE), z)
+    rule("identity: x % -1", A("Mod", x, bv(-1)), z)
+    rule("identity: x ** 0", A("Pow", x, z, 0), ONE)
+    rule("identity: x & -1", A("And", x, bv(-1)), x)
+    rule("identity: -1 & x", A("And", bv(-1), x), x)
+    rule("identity: bool & 1", A("And", x, ONE), x, boolv(x))
+    rule("identity: 1 & bool", A("And", ONE, x), x, boolv(x))
+    for op in ("Div", "Mod", "Shl", "Shr"):
+        rule(f"identity: 0 {op} x", A(op, z, x), z)
+    rule("identity: x - x", A("Sub", x, x), z)
+    rule("identity: x ^ x", A("Xor", x, x), z)
+    rule("identity: x & x", A("And", x, x), x)
+    rule("identity: x | x", A("Or", x, x), x)
+    rule("distribute: x + x", A("Add", x, x), A("Mul", x, bv(2)))
+    # constant chains
+    rule("constants: (x + c) + k", A("Add", A("Add", x, c), k), A("Add", x, c + k))
+    rule("constants: (c + x) + k", A("Add", A("Add", c, x), k), A("Add", x, c + k))
+    rule("constants: (x - c) + k", A("Add", A("Sub", x, c), k), A("Add", x, -c + k))
+    rule("constants: (x + c) - k", A("Sub", A("Add", x, c), k), A("Add", x, c - k))
+    rule("constants: (x - c) - k", A("Sub", A("Sub", x, c), k), A("Add", x, -c - k))
+    for op in ("Mul", "And", "Or", "Xor"):
+        rule(f"constants: (x {op} c) {op} k", A(op, A(op, x, c), k), A(op, x, A(op, c, k)))
+        rule(f"constants: (c {op} x) {op} k", A(op, A(op, c, x), k), A(op, x, A(op, c, k)))
+    rule("shifts: (x >> j) >> k", A("Shr", A("Shr", x, j), k), A("Shr", x, (j & 31) + (k & 31)),
+         z3.ULT((j & 31) + (k & 31), 32))
+    rule("constants: x - k", A("Sub", x, k), A("Add", x, -k))
+    rule("negation: (0 - x) * k", A("Mul", A("Sub", z, x), k), A("Mul", x, -k))
+    rule("negation: k * (0 - x)", A("Mul", k, A("Sub", z, x)), A("Mul", x, -k))
+    # With a symbolic divisor this is a 32-bit divider circuit z3 doesn't finish; the divisor
+    # is a constant wherever the pass meets this shape in practice, so every small one and
+    # some large ones (the per-instance claims cover the rest).
+    for dk in DIVISORS:
+        nodiv = z3.Or(dk != -1, a != bv(MIN))
+        rule(f"remainder: a - (a / {dk}) * {dk}", A("Sub", a, A("Mul", A("Div", a, bv(dk)), bv(dk))), A("Mod", a, bv(dk)), nodiv)
+        rule(f"remainder: a - {dk} * (a / {dk})", A("Sub", a, A("Mul", bv(dk), A("Div", a, bv(dk)))), A("Mod", a, bv(dk)), nodiv)
+    # sums
+    rule("negation: a + (0 - y)", A("Add", a, A("Sub", z, y)), A("Sub", a, y))
+    rule("negation: a - (0 - y)", A("Sub", a, A("Sub", z, y)), A("Add", a, y))
+    rule("negation: (0 - y) + b", A("Add", A("Sub", z, y), b), A("Sub", b, y))
+    rule("distribute: x * p + x * q", A("Add", A("Mul", x, p), A("Mul", x, q)), A("Mul", x, p + q))
+    rule("distribute: x * p - x * q", A("Sub", A("Mul", x, p), A("Mul", x, q)), A("Mul", x, p - q))
+    rule("distribute: x * p + x", A("Add", A("Mul", x, p), x), A("Mul", x, p + 1))
+    rule("distribute: x + x * q", A("Add", x, A("Mul", x, q)), A("Mul", x, 1 + q))
+    rule("distribute: x * p - x", A("Sub", A("Mul", x, p), x), A("Mul", x, p - 1))
+    rule("distribute: x - x * q", A("Sub", x, A("Mul", x, q)), A("Mul", x, 1 - q))
+    rule("constants: (x + c) + y", A("Add", A("Add", x, c), y), A("Add", A("Add", x, y), c))
+    rule("constants: (x + c) - y", A("Sub", A("Add", x, c), y), A("Add", A("Sub", x, y), c))
+    rule("constants: a + (x + c)", A("Add", a, A("Add", x, c)), A("Add", A("Add", a, x), c))
+    rule("constants: a - (x + c)", A("Sub", a, A("Add", x, c)), A("Add", A("Sub", a, x), -c))
+    # comparisons
+    for op in flip:
+        rule(f"flip: k {op} b", C(op, k, b), C(flip[op], b, k))
+        rule(f"self: x {op} x", C(op, x, x), ONE if op in ("Eq", "Ge", "Le") else z)
+    for op in ("Eq", "Ne"):
+        rule(f"flip: a {op} b", C(op, a, b), C(op, b, a))
+    for op, kk in (("Ne", 0), ("Eq", 1), ("Gt", 0), ("Ge", 1)):
+        rule(f"boolean: bool {op} {kk}", C(op, x, bv(kk)), x, boolv(x))
+    for op2 in flip:
+        for op, kk in (("Eq", 0), ("Le", 0), ("Lt", 1), ("Ne", 1)):
+            rule(f"boolean: (x {op2} y) {op} {kk}", C(op, C(op2, x, y), bv(kk)), C(neg[op2], x, y))
+    for op in flip:
+        sx, sk, sc = s64(x), s64(k), s64(c)
+        if op in ("Eq", "Ne"):
+            rule(f"offset: (x + k) {op} c", C(op, A("Add", x, k), c), C(op, x, c - k))
+            rule(f"offset: (x - k) {op} c", C(op, A("Sub", x, k), c), C(op, x, c - (-k)))
+            rule(f"negation: (k - x) {op} c", C(op, A("Sub", k, x), c), C(op, x, k - c))
+            rule(f"difference: (x - y) {op} 0", C(op, A("Sub", x, y), z), C(op, x, y))
+            rule(f"difference: (x ^ y) {op} 0", C(op, A("Xor", x, y), z), C(op, x, y))
+        else:
+            rule(f"offset: (x + k) {op} c", C(op, A("Add", x, k), c), C(op, x, c - k), fits(sx + sk), fits(sc - sk))
+            nk = s64(-k)
+            rule(f"offset: (x - k) {op} c", C(op, A("Sub", x, k), c), C(op, x, c - (-k)), fits(sx + nk), fits(sc - nk))
+            rule(f"negation: (k - x) {op} c", C(op, A("Sub", k, x), c), C(flip[op], x, k - c), fits(sk - sx), fits(sk - sc))
+            rule(f"difference: (x - y) {op} 0", C(op, A("Sub", x, y), z), C(op, x, y), fits(sx - s64(y)))
+    # `x * k op c`, k > 0, `x * k` not wrapping. Symbolic in x and c; the factor k (a
+    # constant in the program) one at a time, as a symbolic factor makes it nonlinear.
+    # The floors are characterised without division (z3 doesn't finish 64-bit dividers for
+    # some factors): `fl` is the integer with fl·k ≤ c < fl·k + k (bounded, so the 64-bit
+    # products can't wrap; the true floor is within the bound).
+    c64 = s64(c)
+    lo32 = lambda e: z3.Extract(31, 0, e)  # noqa: E731
+    fl, fl1 = z3.BitVec("floor_c_k", 64), z3.BitVec("floor_c1_k", 64)
+    small = lambda e: z3.And(e >= -(2**31) - 1, e <= 2**31 + 1)  # noqa: E731
+    for kk in FACTORS:
+        k64 = z3.BitVecVal(kk, 64)
+        floors = [small(fl), small(fl1), fl * k64 <= c64, c64 < fl * k64 + k64, fl1 * k64 <= c64 - 1, c64 - 1 < fl1 * k64 + k64]
+        xk = A("Mul", x, bv(kk))
+        # Proved first on its own, then assumed by the comparisons (z3 is faster that way).
+        rule(f"scaled: x * {kk} without wrapping", s64(xk), s64(x) * k64, fits(s64(x) * k64))
+        sg = [fits(s64(x) * k64), fits(fl), fits(fl1), s64(xk) == s64(x) * k64] + floors
+        rule(f"scaled: x * {kk} < c", C("Lt", xk, c), C("Le", x, lo32(fl1)), *sg)
+        rule(f"scaled: x * {kk} <= c", C("Le", xk, c), C("Le", x, lo32(fl)), *sg)
+        rule(f"scaled: x * {kk} > c", C("Gt", xk, c), C("Gt", x, lo32(fl)), *sg)
+        rule(f"scaled: x * {kk} >= c", C("Ge", xk, c), C("Gt", x, lo32(fl1)), *sg)
+        divisible = fl * k64 == c64  # then c / k is fl
+        rule(f"scaled: x * {kk} == c", C("Eq", xk, c), z3.If(divisible, C("Eq", x, lo32(fl)), z), *sg)
+        rule(f"scaled: x * {kk} != c", C("Ne", xk, c), z3.If(divisible, C("Ne", x, lo32(fl)), ONE), *sg)
+    # selects
+    rule("select: same arms", M(t, f, a, a), a, comp)
+    rule("select: t holds", M(t, f, a, b), a, comp, t != 0)
+    rule("select: t fails", M(t, f, a, b), b, comp, t == 0)
+    rule("select: f holds", M(t, f, a, b), b, comp, f != 0)
+    rule("select: f fails", M(t, f, a, b), a, comp, f == 0)
+    rule("select: 1 if t else 0", M(t, f, ONE, z), t, comp, boolv(t))
+    rule("select: 0 if t else 1", M(t, f, z, ONE), f, comp, boolv(f))
+    rule("nested select: (x if t else y) if t else b", M(t, f, M(t, f, x, y), b), M(t, f, x, b), comp)
+    rule("nested select: (x if f else y) if t else b", M(t, f, M(f, t, x, y), b), M(t, f, y, b), comp)
+    rule("nested select: a if t else (x if t else y)", M(t, f, a, M(t, f, x, y)), M(t, f, a, y), comp)
+    rule("nested select: a if t else (x if f else y)", M(t, f, a, M(f, t, x, y)), M(t, f, a, x), comp)
+    # Common operands, for any binary operation (an uninterpreted function).
+    F = z3.Function("op", z3.BitVecSort(W), z3.BitVecSort(W), z3.BitVecSort(W))
+    rule("factor select: op(x, p) if t else op(x, q)", M(t, f, F(x, p), F(x, q)), F(x, M(t, f, p, q)), comp)
+    rule("factor select: op(p, x) if t else op(q, x)", M(t, f, F(p, x), F(q, x)), F(M(t, f, p, q), x), comp)
+    # Crossed common operands (`(x op p) if t else (q op x)`) are the two rules above once
+    # the operation commutes.
+    for op in ("Add", "Mul", "And", "Or", "Xor"):
+        rule(f"commutative: x {op} q", A(op, x, q), A(op, q, x))
+    rule("factor select: (x + y) if t else x", M(t, f, A("Add", x, y), x), A("Add", x, M(t, f, y, z)), comp)
+    rule("factor select: (y + x) if t else x", M(t, f, A("Add", y, x), x), A("Add", x, M(t, f, y, z)), comp)
+    rule("factor select: (x - y) if t else x", M(t, f, A("Sub", x, y), x), A("Sub", x, M(t, f, y, z)), comp)
+    rule("factor select: x if t else (x + y)", M(t, f, x, A("Add", x, y)), A("Add", x, M(t, f, z, y)), comp)
+    rule("factor select: x if t else (y + x)", M(t, f, x, A("Add", y, x)), A("Add", x, M(t, f, z, y)), comp)
+    rule("factor select: x if t else (x - y)", M(t, f, x, A("Sub", x, y)), A("Sub", x, M(t, f, z, y)), comp)
+    return rules
+
+
+def check_rules(timeout, only=None):
+    """Proves every e-graph rule schema (those whose name contains `only`); returns the number
+    not proved."""
+    bad = 0
+    rules = [r for r in egraph_rules() if only is None or only in r[0]]
+    for name, guard, lhs, rhs in rules:
+        s = z3.Solver()
+        s.set("timeout", timeout)
+        s.add(guard, lhs != rhs)
+        r = s.check()
+        if r == z3.unknown:  # the plain bit-vector tactic, given longer, does the hard ones
+            s = z3.Tactic("qfbv").solver()
+            s.set("timeout", timeout * 5)
+            s.add(guard, lhs != rhs)
+            r = s.check()
+        if r == z3.unsat:
+            continue
+        bad += 1
+        detail = ""
+        if r == z3.sat:
+            m = s.model()
+            detail = ", ".join(sorted(f"{dd.name()}={signed(m[dd])}" for dd in m.decls() if z3.is_bv_value(m[dd])))
+        print(f"{'COUNTEREXAMPLE' if r == z3.sat else 'UNKNOWN'} {name} {detail}")
+    print(f"e-graph rules: {len(rules)} schemas, {len(rules) - bad} proved, {bad} not")
+    return bad
+
+
 SHIM = """#!/usr/bin/env bash
 # validate.py --collect: keep every program a fuzzer compiles, then run the real compiler.
 for a in "$@"; do
@@ -1332,6 +1544,9 @@ def main():  # pylint: disable=too-many-statements,too-many-locals
             i += 1
         elif a == "--selftest":
             sys.exit(0 if selftest(ticky) else 1)
+        elif a == "--rules":
+            only = argv[i + 1] if i + 1 < len(argv) else None
+            sys.exit(1 if check_rules(args["timeout"] * 6, only) else 0)
         elif a == "--collect":
             rest = argv[i + 1:]
             collect(rest[0], rest[1], rest[2] if len(rest) > 2 else 20, rest[3] if len(rest) > 3 else 1, ticky)

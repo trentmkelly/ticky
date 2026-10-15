@@ -385,7 +385,7 @@ fn bun_interval(terms: &[BTerm], iv: &impl Fn(V) -> Iv, konst: &impl Fn(V) -> Op
 }
 
 /// The interval of `x op y` (`k`: `y`'s value, if constant).
-fn ar_interval(op: ArOp, x: Iv, y: Iv, k: Option<i32>) -> Iv {
+pub(crate) fn ar_interval(op: ArOp, x: Iv, y: Iv, k: Option<i32>) -> Iv {
     match op {
         ArOp::Add => Iv::checked(x.lo + y.lo, x.hi + y.hi),
         ArOp::Sub => Iv::checked(x.lo - y.hi, x.hi - y.lo),
@@ -451,7 +451,7 @@ fn ar_interval(op: ArOp, x: Iv, y: Iv, k: Option<i32>) -> Iv {
 }
 
 /// `x op y` for every pair of values in the intervals, if it's the same for all of them.
-fn decide(op: CmpOp, x: Iv, y: Iv) -> Option<bool> {
+pub(crate) fn decide(op: CmpOp, x: Iv, y: Iv) -> Option<bool> {
     match op {
         CmpOp::Lt if x.hi < y.lo => Some(true),
         CmpOp::Lt if x.lo >= y.hi => Some(false),
@@ -736,6 +736,11 @@ impl Graph {
         result.zero |= !lo & prefix;
         result.one |= lo & prefix;
         result
+    }
+
+    /// The node already computing exactly `op`, if there is one.
+    pub fn lookup(&self, op: &Op) -> Option<V> {
+        self.memo.get(op).copied()
     }
 
     /// Interns `op` as it is (for rebuilding nodes without simplification).

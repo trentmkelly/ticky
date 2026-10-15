@@ -13,7 +13,9 @@
 //! Each claim says "`res` computes `req`" (under the path conditions for `//` and `%`); the
 //! validator proves it with a solver. Calls nested inside a logged call aren't logged
 //! separately: the outer claim covers them. Claims whose result is exactly the operation
-//! asked for are only counted (`trivial`).
+//! asked for are only counted (`trivial`). The e-graph pass (`egraph.rs`) adds a claim per
+//! root it replaces (`Same`: the old root's value), besides the constructor calls it
+//! rebuilds with.
 //!
 //! The fusion part pairs what lowering produced with what fusion made of it: each state's
 //! next value with its plan of guarded loads (and accumulator form, for pipelined blocks),
@@ -67,6 +69,9 @@ pub enum Req {
     FloorDiv(V, V, Vec<V>),
     /// Python `a % b` (`lower::floor_mod`), under the path conditions.
     FloorMod(V, V, Vec<V>),
+    /// The value of an existing node: an e-graph rewrite of a root (`egraph.rs`), which
+    /// replaced node `v` by the claim's result.
+    Same(V),
 }
 
 /// The rewrite log of one graph.
@@ -214,6 +219,7 @@ impl J {
             Req::AZeros(b, x, n) => json!(["AZeros", b, x, n]),
             Req::FloorDiv(a, b, _) => json!(["FloorDiv", a, b]),
             Req::FloorMod(a, b, _) => json!(["FloorMod", a, b]),
+            Req::Same(v) => json!(["Same", v]),
         }
     }
 
