@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ticky playground</title>
+    <meta name="description" content="Ticky: a Python-like language that compiles to Factorio circuits. Write, test and compile it in your browser." />
+  </head>
+  <body>
+    <header>
+      <h1>Ticky <small>playground</small></h1>
+      <label>Example <select id="examples"></select></label>
+      <label title="speed: fewest ticks; size: fewest combinators">Optimise
+        <select id="opt"><option value="speed">for speed</option><option value="size">for size</option></select>
+      </label>
+      <label title="grid: fast and simple; anneal: a smaller footprint">Layout
+        <select id="place"><option value="grid">grid</option><option value="anneal">compact (anneal)</option></select>
+      </label>
+      <label title="Include medium electric poles to power the combinators"><input type="checkbox" id="poles" checked /> poles</label>
+      <span class="spacer"></span>
+      <button id="run-tests">Run tests</button>
+      <button id="copy" disabled>Copy blueprint</button>
+    </header>
+    <main>
+      <section id="editor"></section>
+      <section id="side">
+        <nav id="tabs">
+          <button data-tab="problems" class="active">Problems</button>
+          <button data-tab="tests">Tests</button>
+          <button data-tab="summary">Summary</button>
+          <button data-tab="circuit">Circuit</button>
+          <button data-tab="about">About</button>
+        </nav>
+        <div class="pane active" id="pane-problems"></div>
+        <div class="pane" id="pane-tests"><p class="muted">Press <b>Run tests</b> to run the program's <code>test</code> blocks in the simulator.</p></div>
+        <div class="pane" id="pane-summary"></div>
+        <div class="pane" id="pane-circuit">
+          <div id="legend"></div>
+          <div id="canvas-wrap"><canvas id="circuit"></canvas><div id="tip" hidden></div></div>
+        </div>
+        <div class="pane" id="pane-about">
+          <h2>What is this?</h2>
+          <p><b>Ticky</b> is a small Python-like language whose compiler doesn't produce machine code: it
+          produces a <em>circuit</em> for the game <a href="https://factorio.com" target="_blank" rel="noopener">Factorio</a>,
+          built out of the game's combinators (little boxes that add, compare and pick numbers, wired
+          together with red and green wires). Every program becomes a blueprint you can paste into the game.</p>
+          <p>You don't need the game to play with it here. Write a program on the left, and the playground
+          compiles it as you type:</p>
+          <ul>
+            <li><b>Problems</b>: errors and warnings, also underlined in the editor.</li>
+            <li><b>Tests</b>: <code>test "…":</code> blocks run in a tick-by-tick simulator of the game's circuits.</li>
+            <li><b>Summary</b>: what the compiler built, and how big and fast it is.</li>
+            <li><b>Circuit</b>: the actual layout: every box is a combinator, every line a wire. Hover for what each one does.</li>
+          </ul>
+          <p>Things that look like Python mostly work like Python, with a twist: time is measured in game
+          ticks (60 a second), <code>every 30 ticks:</code> runs a block periodically, <code>wait until x</code> pauses,
+          and <code>input</code>/<code>output</code> declare the wires your circuit reads and writes.
+          Pick an example from the menu to see more.</p>
+          <p>The source lives at <a href="https://github.com/trentmkelly/ticky" target="_blank" rel="noopener">github.com/trentmkelly/ticky</a>;
+          the language is described in its <code>SPEC.md</code>.</p>
+        </div>
+      </section>
+    </main>
+    <footer id="status">Loading the compiler…</footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

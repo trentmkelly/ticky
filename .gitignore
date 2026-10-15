@@ -3,3 +3,7 @@
 __pycache__/
 .knowledge-graph/
 tools/.venv/
+web/src/pkg/
+web/node_modules/
+web/dist/
+.claude/worktrees/
