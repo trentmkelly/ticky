@@ -88,6 +88,9 @@ Search offline for the fewest combinators computing small patterns, using the od
 
 ## 5. Operator sharing across process states — size
 
+**Status (2026-10-14): measured, rejected.** 0 on examples, ~0.4% on fuzz corpora (every
+shareable shape is a one-combinator op). See NOTES.md for when it would pay.
+
 In a multi-cycle process, two expensive operations that never run in the same state could
 share one set of combinators, inputs muxed by the program counter (high-level synthesis
 "binding"). We share registers (liveness) but not logic.

@@ -1,0 +1,245 @@
+diff --git a/crates/ticky-compiler/src/codegen/logic.rs b/crates/ticky-compiler/src/codegen/logic.rs
+index 0c39477..01eba24 100644
+--- a/crates/ticky-compiler/src/codegen/logic.rs
++++ b/crates/ticky-compiler/src/codegen/logic.rs
+@@ -494,8 +494,10 @@ impl Cg {
+         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
+         let mut shared_deciders: HashMap<Vec<(usize, Conn)>, Vec<EntId>> = HashMap::new();
+         let mut floor_done: std::collections::HashSet<usize> = Default::default();
++        let mut cost_marks: Vec<(V, usize)> = Vec::new();
+ 
+         for v in producers {
++            cost_marks.push((v, self.net.entities.len()));
+             if filter_totals.contains_key(&v) {
+                 continue;
+             }
+@@ -718,6 +720,16 @@ impl Cg {
+         for v in staged.keys().chain(lane_in.keys()) {
+             node_ref.remove(v);
+         }
++        NODE_COST.with(|c| {
++            if let Some(m) = c.borrow_mut().as_mut() {
++                let end = self.net.entities.len();
++                for (i, &(v, from)) in cost_marks.iter().enumerate() {
++                    let to = cost_marks.get(i + 1).map_or(end, |x| x.1).min(end);
++                    let n = self.net.entities[from.min(to)..to].iter().filter(|e| e.kind.is_combinator()).count();
++                    *m.entry(v).or_default() += n;
++                }
++            }
++        });
+         Ok(node_ref)
+     }
+ 
+@@ -904,3 +916,9 @@ fn floor_groups(g: &Graph, producers: &[V], users: &dyn Fn(V) -> Vec<V>) -> Vec<
+     }
+     out
+ }
++
++thread_local! {
++    /// Combinators emitted per node by the last `logic()` calls (for operator-sharing stats).
++    pub(super) static NODE_COST: std::cell::RefCell<Option<HashMap<V, usize>>> = const { std::cell::RefCell::new(None) };
++}
++
+diff --git a/crates/ticky-compiler/src/codegen/mod.rs b/crates/ticky-compiler/src/codegen/mod.rs
+index 92baf48..927c245 100644
+--- a/crates/ticky-compiler/src/codegen/mod.rs
++++ b/crates/ticky-compiler/src/codegen/mod.rs
+@@ -30,6 +30,7 @@ mod ports;
+ mod procs;
+ mod registers;
+ mod selects;
++mod share;
+ 
+ use std::collections::{HashMap, VecDeque};
+ 
+diff --git a/crates/ticky-compiler/src/codegen/procs.rs b/crates/ticky-compiler/src/codegen/procs.rs
+index 396c340..2f6c400 100644
+--- a/crates/ticky-compiler/src/codegen/procs.rs
++++ b/crates/ticky-compiler/src/codegen/procs.rs
+@@ -91,7 +91,16 @@ pub(super) fn main_proc(
+     let mut staging = cg.stage_loads(g, &before, ins);
+     let mut vals = staging.vals();
+     let roots: Vec<V> = steps.iter().flat_map(|s| s.roots()).collect();
++    let share_stats = std::env::var_os("TICKY_SHARE_STATS").is_some();
++    if share_stats {
++        super::logic::NODE_COST.with(|c| *c.borrow_mut() = Some(HashMap::new()));
++    }
+     let nodes = cg.logic(g, &roots, &src, &mut vals, &m.name)?;
++    if share_stats {
++        let cost = super::logic::NODE_COST.with(|c| c.borrow_mut().take()).unwrap_or_default();
++        let per_step: Vec<Vec<V>> = steps.iter().map(|s| s.roots()).collect();
++        super::share::stats(g, &per_step, &cost, &m.name);
++    }
+     staging.settle(&vals);
+     let loc = |v: V| locate(g, v, &src, &nodes);
+     let opnd = |v: V| loc(v).op();
+diff --git a/crates/ticky-compiler/src/codegen/share.rs b/crates/ticky-compiler/src/codegen/share.rs
+new file mode 100644
+index 0000000..177e5d8
+--- /dev/null
++++ b/crates/ticky-compiler/src/codegen/share.rs
+@@ -0,0 +1,164 @@
++//! Operator sharing across the states of a process (`--opt=size`, PLAN.md §5).
++
++use std::collections::{BTreeMap, HashMap, HashSet};
++
++use crate::ir::{BLit, BOp, BTerm, Graph, Lit, Op, V};
++
++/// `op` with every operand replaced by `f(operand)`.
++pub(super) fn map_op(op: &Op, f: &mut dyn FnMut(V) -> V) -> Op {
++    let lit = |l: &Lit, f: &mut dyn FnMut(V) -> V| Lit { op: l.op, a: f(l.a), b: f(l.b) };
++    let dnf = |d: &crate::ir::Dnf, f: &mut dyn FnMut(V) -> V| -> crate::ir::Dnf { d.iter().map(|t| t.iter().map(|l| lit(l, f)).collect()).collect() };
++    match op {
++        Op::Const(_) | Op::Src(_) | Op::BConst(_) | Op::Each(_) | Op::SigK(_) => op.clone(),
++        Op::Ar(o, a, b) => Op::Ar(*o, f(*a), f(*b)),
++        Op::Cmp(o, a, b) => Op::Cmp(*o, f(*a), f(*b)),
++        Op::Mux { t, f: ff, a, b } => Op::Mux { t: f(*t), f: f(*ff), a: f(*a), b: f(*b) },
++        Op::Dec(arms) => Op::Dec(arms.iter().map(|(d, k)| (dnf(d, f), *k)).collect()),
++        Op::Sel(arms) => Op::Sel(arms.iter().map(|(c, x)| (f(*c), f(*x))).collect()),
++        Op::Bun(terms) => Op::Bun(terms.iter().map(|t| map_term(t, f)).collect()),
++        Op::BMux { t, f: ff, a, b } => Op::BMux { t: f(*t), f: f(*ff), a: f(*a), b: f(*b) },
++        Op::BDec(arms) => Op::BDec(arms.iter().map(|(d, x)| (dnf(d, f), f(*x))).collect()),
++        Op::BSelect(b, m, i) => Op::BSelect(f(*b), *m, *i),
++        Op::BGet(b, s) => Op::BGet(f(*b), *s),
++        Op::BTotal(b) => Op::BTotal(f(*b)),
++        Op::BCount(b) => Op::BCount(f(*b)),
++        Op::AGet(b, ix) => Op::AGet(f(*b), f(*ix)),
++        Op::SigOf(b) => Op::SigOf(f(*b)),
++        Op::BSelectAt(b, m, ix) => Op::BSelectAt(f(*b), *m, f(*ix)),
++        Op::BDot(a, b) => Op::BDot(f(*a), f(*b)),
++        Op::BSel(b, m, n) => Op::BSel(f(*b), m.clone(), *n),
++    }
++}
++
++fn map_term(t: &BTerm, f: &mut dyn FnMut(V) -> V) -> BTerm {
++    let bop = |o: BOp, f: &mut dyn FnMut(V) -> V| match o {
++        BOp::Each => BOp::Each,
++        BOp::Val(v) => BOp::Val(f(v)),
++    };
++    match t {
++        BTerm::Map(o, a, b) => BTerm::Map(*o, f(*a), f(*b)),
++        BTerm::RMap(o, a, b) => BTerm::RMap(*o, f(*a), f(*b)),
++        BTerm::Zip(o, a, b) => BTerm::Zip(*o, f(*a), f(*b)),
++        BTerm::One(s, x) => BTerm::One(*s, f(*x)),
++        BTerm::Set(b, s, x) => BTerm::Set(f(*b), *s, f(*x)),
++        BTerm::Filter(b, d, out) => {
++            let b = f(*b);
++            BTerm::Filter(b, d.iter().map(|t| t.iter().map(|l| BLit { op: l.op, a: bop(l.a, f), b: bop(l.b, f) }).collect()).collect(), *out)
++        }
++        BTerm::DFilter(dm, b, d, out) => {
++            let (dm, b) = (f(*dm), f(*b));
++            BTerm::DFilter(dm, b, d.iter().map(|t| t.iter().map(|l| BLit { op: l.op, a: bop(l.a, f), b: bop(l.b, f) }).collect()).collect(), *out)
++        }
++        BTerm::K(vals) => BTerm::K(vals.clone()),
++        BTerm::Shift(s, x, c) => BTerm::Shift(*s, f(*x), *c),
++        BTerm::Ar(o, a, b, s) => BTerm::Ar(*o, f(*a), f(*b), *s),
++        BTerm::Dec(arms) => BTerm::Dec(arms.iter().map(|(d, k)| (d.iter().map(|t| t.iter().map(|l| Lit { op: l.op, a: f(l.a), b: f(l.b) }).collect()).collect(), k.clone())).collect()),
++        BTerm::Hot(t, ix, c) => BTerm::Hot(f(*t), f(*ix), *c),
++        BTerm::HotEq(t, x, c) => BTerm::HotEq(f(*t), f(*x), *c),
++        BTerm::Fold(b, o, c, s) => BTerm::Fold(f(*b), *o, *c, *s),
++    }
++}
++
++/// A tree of nodes all used by the same states, each (but the root) read only by its parent
++/// in the tree: what a shared unit would replace.
++struct Tree {
++    root: V,
++    shape: String,
++    cost: usize,
++    /// Operands from outside the tree, in shape order (constants excluded).
++    leaves: Vec<V>,
++    states: Vec<usize>,
++}
++
++/// Measurement: same-shape trees of combinators used in disjoint sets of states
++/// (`TICKY_SHARE_STATS=1`).
++pub(super) fn stats(g: &Graph, step_roots: &[Vec<V>], cost: &HashMap<V, usize>, what: &str) {
++    let mut states: HashMap<V, Vec<usize>> = HashMap::new();
++    for (i, roots) in step_roots.iter().enumerate() {
++        for v in g.reachable(roots) {
++            states.entry(v).or_default().push(i);
++        }
++    }
++    let mut users: HashMap<V, HashSet<V>> = HashMap::new();
++    for &v in states.keys() {
++        for o in g.operands(v) {
++            users.entry(o).or_default().insert(v);
++        }
++    }
++    let roots_all: HashSet<V> = step_roots.iter().flatten().copied().collect();
++    let produced = |v: V| !matches!(g.op(v), Op::Const(_) | Op::Src(_) | Op::BConst(_) | Op::Each(_) | Op::SigK(_));
++    // Inside a parent's tree: produced, same states, the parent its only user, not a root.
++    let inner = |o: V, parent: V| produced(o) && states.get(&o) == states.get(&parent) && !roots_all.contains(&o) && users.get(&o).is_some_and(|u| u.len() == 1);
++    fn shape(g: &Graph, v: V, inner: &dyn Fn(V, V) -> bool, cost: &HashMap<V, usize>, leaves: &mut Vec<V>, total: &mut usize) -> String {
++        *total += cost.get(&v).copied().unwrap_or(0);
++        let mut kids = Vec::new();
++        let mut n = 0;
++        let op = map_op(g.op(v), &mut |o| {
++            n += 1;
++            kids.push(o);
++            n - 1
++        });
++        let mut s = format!("{op:?}[");
++        for o in kids {
++            if let Some(k) = g.as_const(o) {
++                s += &format!("K{k},");
++            } else if inner(o, v) {
++                s += &shape(g, o, inner, cost, leaves, total);
++                s += ",";
++            } else {
++                leaves.push(o);
++                s += "_,";
++            }
++        }
++        s + "]"
++    }
++    let mut trees: Vec<Tree> = Vec::new();
++    let mut vs: Vec<V> = states.keys().copied().filter(|&v| produced(v)).collect();
++    vs.sort();
++    for v in vs {
++        // A tree root: not inside its user's tree (TICKY_SHARE_STATS=all: every subtree).
++        let all = std::env::var("TICKY_SHARE_STATS").is_ok_and(|x| x == "all");
++        if !all && users.get(&v).is_some_and(|u| u.len() == 1 && inner(v, *u.iter().next().unwrap())) {
++            continue;
++        }
++        let (mut leaves, mut total) = (Vec::new(), 0);
++        let s = shape(g, v, &inner, cost, &mut leaves, &mut total);
++        if total >= 1 {
++            trees.push(Tree { root: v, shape: s, cost: total, leaves, states: states[&v].clone() });
++        }
++    }
++    let mut groups: BTreeMap<&str, Vec<&Tree>> = BTreeMap::new();
++    for t in &trees {
++        groups.entry(&t.shape).or_default().push(t);
++    }
++    let (mut cand, mut net_total) = (0usize, 0i64);
++    for (s, ts) in groups {
++        if ts.len() < 2 {
++            continue;
++        }
++        // Greedy: members with pairwise disjoint states.
++        let mut pick: Vec<&Tree> = Vec::new();
++        for t in &ts {
++            if pick.iter().all(|p| p.states.iter().all(|x| !t.states.contains(x))) {
++                pick.push(t);
++            }
++        }
++        if pick.len() < 2 {
++            continue;
++        }
++        let n = pick.len();
++        let unit = pick.iter().map(|t| t.cost).max().unwrap();
++        // One mux leg per member per leaf position where the members differ.
++        // (A scalar needs renaming onto the unit's signal too: one more combinator.)
++        let differ: Vec<usize> = (0..pick[0].leaves.len()).filter(|&i| pick.iter().any(|t| t.leaves.get(i) != pick[0].leaves.get(i))).collect();
++        let legs: usize = differ.iter().map(|&i| if g.is_bundle(pick[0].leaves[i]) { n } else { n + 1 }).sum();
++        let saved: usize = pick.iter().map(|t| t.cost).sum::<usize>() - unit;
++        let net = saved as i64 - legs as i64;
++        cand += pick.iter().map(|t| t.cost).sum::<usize>();
++        net_total += net.max(0);
++        let short: String = s.chars().take(110).collect();
++        eprintln!("share-stats {what}: {n}× cost {unit} legs {legs} net {net:+} roots {:?} states {:?}  {short}", pick.iter().map(|t| t.root).collect::<Vec<_>>(), pick.iter().map(|t| t.states.clone()).collect::<Vec<_>>());
++    }
++    let logic: usize = cost.values().sum();
++    eprintln!("share-stats {what}: TOTAL steps {} logic {logic} candidates {cand} combinators, net saving ≥ {net_total}", step_roots.len());
++}

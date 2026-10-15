@@ -1595,3 +1595,30 @@ clean. Not difftested in game yet; the grid flag could become the default after 
 - Merged together on main (2026-10-14): one semantic clash fixed (tests/retiming.rs built a
   `LayoutOpts` without dup's new field); combined main verified (cargo test, bench TOTAL
   2640 = 2701 − 55 − 6, all fuzzers at N=60).
+
+## 2026-10-14: operator sharing across process states (PLAN §5) — measured, rejected
+
+Survey only, no compiler change. Instrumentation (`TICKY_SHARE_STATS`, combinators per IR node
+recorded by `logic()`, per-step reachability in `procs.rs`) kept out of tree as a patch,
+`tools/share-stats.patch` (applies to 61d19dc). Per
+process: maximal trees of nodes used by the same set of states (inner nodes read only by their
+parent), grouped by shape (ops and constants, outside operands as placeholders); members with
+disjoint states would share one unit. Optimistic net = saved combinators − mux legs (n gates per
+varying bundle operand, n + 1 per scalar one for the rename), timing ignored.
+- Examples (`--opt=size`): process logic 475 combinators; 34 in shareable same-shape trees, all
+  cost-1 ops (`x + 1`, `BTotal`, `BCount`, one zip): net 0.
+- Fuzz corpora (10 fuzzers × 60, seed 3, 409 process builds): 16289 logic combinators, 3986 in
+  shareable trees, optimistic net 72 (0.44%) in 8 processes, 38 of it one level2 program
+  (five runtime array writes, 14 combinators each); the rest AGet reads (+16), BTotal of an
+  argmax (+9), one comparison (+5), one arithmetic op (+1).
+- Why so little: codegen already makes almost every operation one combinator, and a mux costs a
+  gate decider per state per operand. Scalars also need a rename onto the unit's signal (a
+  decider can't change a signal's name), and folding the rename into the unit (`each op K`)
+  is wrong when the active value is 0 and `0 op K ≠ 0`. The mux adds a tick, and the PC it
+  reads settles a tick after the registers on taken branches and returns, so it needs 1–2
+  ticks of depth slack.
+- Would pay only for units of 3–4+ combinators (sorting networks, multi-term bundle pipelines,
+  runtime array writes) repeated in several states, with bundle or staged operands and depth
+  slack. Sketch if revived: size-only graph rewrite before `logic()`, PC as an extra source of
+  depth 1, `BDec`/`Sel` muxes, kept only if no step's depth grows and a trial build of the
+  process is smaller.
