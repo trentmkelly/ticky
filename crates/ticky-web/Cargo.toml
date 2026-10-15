@@ -1,0 +1,16 @@
+[package]
+name = "ticky-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ticky in the browser: the compiler and test runner for wasm-bindgen"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ticky-syntax.workspace = true
+ticky-factorio.workspace = true
+ticky-compiler.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "=0.2.100"

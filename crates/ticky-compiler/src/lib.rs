@@ -1,6 +1,7 @@
 //! The Ticky compiler: source → analysis → IR → combinators → layout → blueprint.
 
 pub mod bundle;
+pub mod clock;
 pub mod cfg;
 pub mod display;
 pub mod codegen;
@@ -257,7 +258,7 @@ fn compile_guided(module: &ticky_syntax::ast::Module, opts: &Options, p: &profil
 }
 
 fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool, choices: &[bool]) -> Result<Compiled, Vec<Diag>> {
-    let t = std::time::Instant::now();
+    let t = crate::clock::Instant::now();
     let mut program = program::analyze_with_pipelines(module, pipeline, choices)?;
     // Gates and return lines only for N-S ports with the outputs on the west.
     if opts.compact_outputs && (!opts.outputs_west || opts.ports_ew) {

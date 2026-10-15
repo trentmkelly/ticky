@@ -733,7 +733,7 @@ fn parse_port(table: &SignalTable, s: &Stmt, consts: &HashMap<String, Cv>) -> Re
 }
 
 /// With `TICKY_TIMING` set, prints how long each compiler phase takes.
-pub fn timing(what: &str, since: std::time::Instant) {
+pub fn timing(what: &str, since: crate::clock::Instant) {
     if std::env::var_os("TICKY_TIMING").is_some() {
         eprintln!("[timing] {what}: {:.1} ms", since.elapsed().as_secs_f64() * 1000.0);
     }
@@ -745,7 +745,7 @@ pub fn analyze(m: &Module, pipeline: bool) -> Result<Program, Vec<Diag>> {
 
 /// Optional per-block choices; omitted entries use `pipeline`.
 pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Program, Vec<Diag>> {
-    let t = std::time::Instant::now();
+    let t = crate::clock::Instant::now();
     let mut m = m.clone();
     crate::strconst::substitute(&mut m)?;
     let imported = crate::stdlib::imports(&m)?;
@@ -768,7 +768,7 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
 
 /// `peripherals`: variables shown by screens, readouts, panels and speakers.
 fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &HashSet<String>) -> Result<Program, Vec<Diag>> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Instant::now();
     let table = SignalTable::base();
     let mut errs = Vec::new();
     let mut ports: Vec<Port> = Vec::new();
@@ -1928,7 +1928,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
     let mut fp = Fixpoint::new(ctx);
     for round in 0.. {
         let iv = &fp.iv;
-        timing(&format!("main round {round} ({} steps)", c.steps.len()), std::time::Instant::now());
+        timing(&format!("main round {round} ({} steps)", c.steps.len()), crate::clock::Instant::now());
         let mut g = Graph::default();
         let mut srcs = Vec::new();
         let mut steps = Vec::new();
