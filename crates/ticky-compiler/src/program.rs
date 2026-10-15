@@ -1100,11 +1100,15 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &
                 let mut fz = Fuser::new(&mut graph);
                 let roots: Vec<V> = next.iter().map(|(_, v)| *v).chain(raw.iter().map(|c| c.0)).collect();
                 fz.plan_order_stats(&roots, pipeline && requested.is_none() && raw.is_empty() && !natural);
+                let mut tv = crate::ir_export::Writer { name: "iteration".into(), writes: next.clone(), ..Default::default() };
                 for (si, v) in next {
                     let own = srcs.iter().position(|k| *k == SrcKind::Own(si)).map(|id| fz.g.src(id as u32));
                     if let Some(p) = fz.writer_plan(v, own) {
                         plans.push((si, p));
                     }
+                }
+                if crate::ir_export::on() {
+                    tv.checks = raw.iter().map(|c| (c.0, fz.rebuild(c.0))).collect(); // memoised: fused_checks gets the same
                 }
                 let checks = fused_checks(&mut fz, raw);
                 // A block with runtime checks runs multi-cycle, so a check is read on the
@@ -1137,6 +1141,11 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &
                         needed
                     }
                 };
+                if crate::ir_export::on() {
+                    tv.plans = plans.clone();
+                    tv.accs = pipe.as_ref().map(|p| p.accs.clone()).unwrap_or_default();
+                    crate::ir_export::unit(&format!("every block {bi}"), &graph, &srcs, &states, &ports, &[tv]);
+                }
                 blocks.push(Block { span: stmt.span, checks, requested, srcs, graph, plans, depth, period, pipe });
             }
             Err(d) => errs.push(d),
@@ -1996,14 +2005,21 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
                 }
             }
             fz.plan_order_stats(&roots, false);
+            let mut tv: Vec<crate::ir_export::Writer> = Vec::new();
             for s in &mut steps {
+                if crate::ir_export::on() {
+                    tv.push(crate::ir_export::Writer { name: format!("step {}", tv.len()), writes: s.writes.clone(), pre_kind: Some(s.kind.clone()), ..Default::default() });
+                }
                 for &(si, v) in &s.writes {
                     let own = srcs.iter().position(|k| *k == SrcKind::Own(si)).map(|id| fz.g.src(id as u32));
                     if let Some(p) = fz.writer_plan(v, own) {
                         s.plans.push((si, p));
                     }
                 }
-                let raw = s.checks.iter().map(|c| (c.fail, c.span, c.what)).collect();
+                let raw: Vec<(V, Span, &'static str)> = s.checks.iter().map(|c| (c.fail, c.span, c.what)).collect();
+                if let Some(w) = tv.last_mut() {
+                    w.checks = raw.iter().map(|c| (c.0, fz.rebuild(c.0))).collect(); // memoised: fused_checks gets the same
+                }
                 s.checks = fused_checks(&mut fz, raw);
                 s.kind = match s.kind.clone() {
                     StepKind::Run(Next::Branch(c, a, b)) => StepKind::Run(Next::Branch(fz.cond(c.node), a, b)),
@@ -2011,6 +2027,10 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
                     StepKind::WaitTicks(WaitN::Dyn(m), t) => StepKind::WaitTicks(WaitN::Dyn(fz.rebuild(m)), t),
                     k => k,
                 };
+            }
+            if crate::ir_export::on() {
+                crate::ir_export::steps(&mut tv, &steps);
+                crate::ir_export::unit(&if ctx.owner == MAIN { "main".to_string() } else { format!("process {}", MAIN - 1 - ctx.owner) }, fz.g, &srcs, ctx.states, ctx.ports, &tv);
             }
         }
         let entry = simplify_steps(&mut steps, c.entry);

@@ -2,3 +2,4 @@
 *.bp.txt
 __pycache__/
 .knowledge-graph/
+tools/.venv/
