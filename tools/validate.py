@@ -792,31 +792,51 @@ def solve(u, goal, extra_assume, timeout):
              if not (z3.is_true(g) or (z3.is_eq(g) and g.arg(0).eq(g.arg(1))))]
     if not goals:
         return "equivalent", None
-    s = z3.Solver()
-    s.set("timeout", timeout)
-    s.add(*u.assume)
-    s.add(*extra_assume)
-    # One budget for all the goals (a bundle's signals): the first one not proved in time
-    # makes the obligation unknown.
-    deadline = time.time() + timeout / 1000 * 2
-    for g in goals:
+    # Several goals (a bundle's signals) share one budget; the first one not proved in time
+    # makes the obligation unknown. Two ways, as neither always wins: each goal's negation
+    # behind its own switch in one solver (shared terms are bit-blasted once), then each
+    # remaining goal on its own.
+    budget = time.time() + timeout / 1000 * 2
+
+    def solver():
+        s = z3.Solver()
+        s.add(*u.assume)
+        s.add(*extra_assume)
+        return s
+
+    def check(s, deadline, *assumptions):
         left = int((deadline - time.time()) * 1000)
         if left <= 0:
-            return "unknown", None
+            return z3.unknown
         s.set("timeout", left)
-        s.push()
-        s.add(z3.Not(g))
         dog = threading.Timer(left / 1000 * 2 + 1, z3.main_ctx().interrupt)
         dog.start()
         try:
-            r = s.check()
+            return s.check(*assumptions)
         finally:
             dog.cancel()
+    todo = list(goals)
+    if len(goals) > 1:
+        s = solver()
+        switches = [z3.FreshBool("goal") for _ in goals]
+        for sw, g in zip(switches, goals):
+            s.add(z3.Implies(sw, z3.Not(g)))
+        half = time.time() + (budget - time.time()) / 2
+        for sw, g in zip(switches, goals):
+            r = check(s, half, sw)
+            if r == z3.sat:
+                return "counterexample", s.model()
+            if r != z3.unsat:
+                break
+            todo.remove(g)
+    for g in todo:
+        s = solver()
+        s.add(z3.Not(g))
+        r = check(s, budget)
         if r == z3.sat:
             return "counterexample", s.model()
         if r != z3.unsat:
             return "unknown", None
-        s.pop()
     return "equivalent", None
 
 
@@ -1074,12 +1094,32 @@ def check_ranges(pool, scalars, timeout):
     only matters for what codegen reads off intervals)."""
     ex = pool.ex
     out = []
+    proved = set()
+
+    def holds(b):
+        """Node `b`'s element interval is known to hold (checked, or assumed and checked)."""
+        op = ex.nodes[b][0]
+        return b in proved or ex.nodes[b][1:3] == [MIN, MAX] or op[0] in ("Src", "BConst", "SigK")
+
     for v, (op, lo, hi, is_bun) in enumerate(ex.nodes):
         if (lo, hi) == (MIN, MAX) or op[0] in ("Const", "Src", "Each", "SigK", "BConst"):
             continue
         if not is_bun and not scalars:
             continue
         what = f"n{v} {pretty(ex, v)} in [{lo}, {hi}]"
+        # A ranked pick or a copying filter only passes some of its input's values: its
+        # interval holds if its input's does and contains it (no solver needed).
+        inner = None
+        if op[0] in ("BSelect", "BSelectAt"):
+            inner = op[1]
+        elif op[0] == "Bun" and len(op[1]) == 1 and op[1][0][0] == "Filter" and op[1][0][3] is None:
+            inner = op[1][0][1]
+        elif op[0] == "Bun" and len(op[1]) == 1 and op[1][0][0] == "DFilter" and op[1][0][4] is None:
+            inner = op[1][0][1]
+        if inner is not None and holds(inner) and lo <= ex.nodes[inner][1] and ex.nodes[inner][2] <= hi:
+            proved.add(v)
+            out.append(Result(ex.name, "range", what + f" (contained in n{inner}'s)", "equivalent"))
+            continue
         u = pool.unit([v])
         try:
             x = u.value_of(v)
@@ -1093,6 +1133,8 @@ def check_ranges(pool, scalars, timeout):
             continue
         if st == "equivalent" and u.opaque & ex.cone([v]):
             st = "equivalent*"
+        if st == "equivalent":
+            proved.add(v)
         out.append(Result(u.name, "range", what, st, show_model(u, m, [("value", x)]) if m else ""))
     return out
 
