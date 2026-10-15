@@ -60,21 +60,25 @@ fuzzers alone, so the aggressive passes below (3, 4) are safe.
 
 ## 3. Equality saturation (e-graphs) — size
 
+**Status (2026-10-15): merged.** Hand-rolled e-graph with a never-worse guard; examples
+unchanged, fuzz programs −0.2% typical. Follow-up: the compiler is nondeterministic on some
+programs (seen on a level2 fuzz program) — worth a look.
+
 The IR rewrites (ir.rs algebra, fuse patterns) are hand-ordered passes that can block each
 other. An e-graph holds every equivalent form at once and extracts the cheapest by real
 combinator cost.
 
-- [ ] Prototype with the `egg` crate on the scalar expression language: port the existing
+- [x] Prototype with the `egg` crate on the scalar expression language: port the existing
       algebraic rewrites as rules; extraction cost = combinators (wire sums free, inlined
       conditions free, etc., mirroring `logic()`).
-- [ ] Compare against the current pipeline on all examples: must never be worse; find
+- [x] Compare against the current pipeline on all examples: must never be worse; find
       where it's better.
-- [ ] Range facts: rules guarded by facts (floor corrections, overflow) need a conditional
+- [x] Range facts: rules guarded by facts (floor corrections, overflow) need a conditional
       rule mechanism or an analysis in the e-graph.
-- [ ] Decide what stays as dedicated passes (fuse patterns over bundles are probably too big
+- [x] Decide what stays as dedicated passes (fuse patterns over bundles are probably too big
       for the e-graph at first).
-- [ ] Validate with item 2 on every rewrite rule.
-- [ ] Compile-time budget: node/iteration limits so big programs stay fast.
+- [x] Validate with item 2 on every rewrite rule.
+- [x] Compile-time budget: node/iteration limits so big programs stay fast.
 
 ## 4. Superoptimisation — size
 

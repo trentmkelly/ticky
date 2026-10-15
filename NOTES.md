@@ -1767,3 +1767,35 @@ honoured). `--collect DIR fuzz_X.py N SEED` keeps a fuzzer's programs via a TICK
 - Not done: `pick + k` as a constant combinator, sums as pick arms (1 combinator found),
   2-decider floor-division forms, one shared code table per wire, selects that fusion turns
   into guarded register loads.
+
+## 2026-10-15: equality saturation over the scalar IR (egraph.rs; PLAN.md §3)
+
+Measured first: an IR scan (TICKY_EXPORT_IR) of all examples found ~30 of 1308 live post-fusion
+scalar nodes in shapes a rule could improve beyond what the constructors already do (14 `K - x`,
+8 bool-op == 0, 4 `(K - x)`/`(a - b)` ordered compares); the 11 `x + k < c` left are FULL-range
+inputs that can wrap, so unrewritable. Fuzz corpora: ~150 of 27,239 (<1%). Expected ~0 on examples.
+- `egraph.rs`, hand-rolled (egg not vendored; we need ir.rs's interval analysis per class and a
+  rebuild through the ir.rs constructors, which simplify further and log their claims). Runs per
+  unit after lowering, before fusion (program.rs hooks), on scalar Ar/Cmp/Mux reachable from the
+  roots; everything else (bundles, Dec/Sel, sources, comprehension nodes) is a leaf.
+- Rules: ir.rs's identities, constant chains, shift chains, remainder recovery, cmp offsets,
+  bool compares, mux_tf/mux_factor; new: `x + x`, `x*p ± x*q`, negations, `(a - b)`/`(a ^ b)
+  ==/!= 0` → `a ==/!= b`, ordered `a - b op 0` and `(K - x) op c` and `x * k op c` when nothing
+  wraps, constants moved outwards, nested selects on the same condition, selects whose arms
+  share an operand (any op).
+- Facts: each e-class carries the meet of its members' intervals; guarded rules test class
+  intervals only, never path conditions, so every union is an equality for all inputs.
+- Cost mirrors logic(); a unit is kept if strictly cheaper and no root deeper; lib.rs then builds
+  the program without the pass too and keeps the e-graph build only if no larger, no block/step
+  slower, and better in one. Limits: 8 rounds, 4n+256 e-nodes (≤ 60k), units > 20k nodes skipped.
+  TICKY_EGRAPH=0 off, TICKY_EGRAPH_STATS=1 per-unit report.
+- Results: examples byte-identical (speed and size). Fuzz corpora: 161 programs 18930 → 18578
+  (−1.9%, mostly one level2 program by same-condition nested selects; −0.16% without it), 368
+  programs 27333 → 27269 (−0.23%); 0 worse, timing never slower.
+- Validation: an `egraph` claim (`Same`) per replaced root; `tools/validate.py --rules` proves the
+  442 rule schemas. --examples: 0 counterexamples; changed corpus programs: 0 counterexamples.
+- Merged after select picks (superopt): picks already make one of the test's selects cheaper,
+  so tests/equality_saturation.rs pins the pass's own 2-combinator win with picks off and
+  "never larger or slower" with them on (speed saves 1 there). Combined main verified.
+- Found on the way: the compiler is nondeterministic on some programs (a level2 program gives
+  133–135 combinators across runs with the baseline binary); not investigated.
