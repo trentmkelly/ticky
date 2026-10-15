@@ -202,3 +202,19 @@ fn show(g: &Graph, v: V, inner: &dyn Fn(V) -> bool, leaves: &mut Vec<V>, cost: &
         _ => unreachable!("not a scalar op"),
     }
 }
+
+thread_local! {
+    static NO_PICKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether codegen may pick select arms off the bus with one decider (`codegen/selects.rs`,
+/// `Out::Pick`): the superoptimiser's main find. Off with `TICKY_NO_PICK=1` or
+/// [`set_picks_disabled`].
+pub fn picks_enabled() -> bool {
+    !NO_PICKS.with(|c| c.get()) && std::env::var_os("TICKY_NO_PICK").is_none()
+}
+
+/// Turns picks off (or back on) for compilations on this thread (tests compare both).
+pub fn set_picks_disabled(off: bool) {
+    NO_PICKS.with(|c| c.set(off));
+}

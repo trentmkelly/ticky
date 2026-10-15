@@ -67,9 +67,9 @@ pub(super) enum Out {
     Pick(V),
 }
 
-/// Whether stages may pick values off the bus (`TICKY_NO_PICK=1`: no).
+/// Whether stages may pick values off the bus (`fuse::superopt::picks_enabled`).
 pub(super) fn pick_enabled() -> bool {
-    std::env::var_os("TICKY_NO_PICK").is_none()
+    crate::fuse::superopt::picks_enabled()
 }
 
 pub(super) struct Stage {
