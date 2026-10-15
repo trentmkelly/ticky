@@ -638,11 +638,12 @@ impl Conv {
                     }
                 }
                 let op = if neg { op.negate() } else { op };
-                // One side without `v`: compare the other side's values with it directly
+                // One side a constant: compare the other side's values with it directly
                 // (`a - b op 0` is wrong where the difference wraps: `max(t + 40, 560)` with
-                // `t + 40 - 560` overflowing; found by tools/validate.py).
+                // `t + 40 - 560` overflowing; found by tools/validate.py). Domain filters
+                // only compare with constants, so other comparisons still subtract.
                 for (x, y, op) in [(a, b, op), (b, a, op.flip())] {
-                    if !uses_each(g, y) {
+                    if g.as_const(y).is_some() {
                         let xb = self.bundle(g, x)?;
                         let d = vec![vec![BLit { op, a: BOp::Each, b: BOp::Val(y) }]];
                         return Ok(g.bun(vec![BTerm::DFilter(self.dom, xb, d, FOut::Copy)]));

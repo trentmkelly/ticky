@@ -41,6 +41,16 @@ fn quotient_interval_includes_min() {
 /// for conditions with one side free of `v` (compared directly); the difference remains for
 /// conditions with `v` on both sides.
 #[test]
+fn comprehension_condition_with_a_runtime_scalar_compiles() {
+    // Domain filters compare with constants only: a first version of the fix above compared
+    // `v // x` with `x` directly and codegen panicked (a fuzz_bundles program).
+    let src = "input a: Bundle\ninput b: Bundle\ninput x: int @ X\noutput o: Bundle\noutput t: int @ T\nwhile True:\n    o = {s: max((v // x), x) for s, v in (b + b).items() if v != x}\n    t = len(o) * 1000 + o.total()\n    wait 3\n";
+    for checks in [false, true] {
+        compile(src, &Options { checks, ..Default::default() }).unwrap();
+    }
+}
+
+#[test]
 fn comprehension_condition_difference_must_not_wrap() {
     let src = "input x: int @ X\ninput i: int @ I\noutput o: int @ A\nxs = [0, 0]\nevery tick:\n    xs[i] = x\n    ys = [min(t + 7, -40) for t in xs]\n    o = ys[i]\n";
     for checks in [false, true] {
