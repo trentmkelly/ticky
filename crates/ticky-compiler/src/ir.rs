@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use ticky_factorio::{ArOp, CmpOp, Selector, Sig, SignalTable};
 
+use crate::ir_export::{tv_hook, Req};
+
 pub type V = u32;
 
 /// A constant bundle: signals with nonzero values, sorted by signal.
@@ -509,6 +511,8 @@ pub struct Graph {
     pub vector_candidate: u32,
     /// Random picks made so far (`Op::BSel` numbers).
     pub nonce: u32,
+    /// Rewrite log for translation validation (`TICKY_EXPORT_IR`, `ir_export.rs`).
+    pub tv: crate::ir_export::Log,
 }
 
 impl Graph {
@@ -735,6 +739,7 @@ impl Graph {
 
     /// Interns `op` as it is (for rebuilding nodes without simplification).
     pub fn intern_op(&mut self, op: Op) -> V {
+        tv_hook!(self, "intern_op", Req::Op(op.clone()), self.intern_op(op));
         self.intern(op)
     }
 
@@ -779,6 +784,7 @@ impl Graph {
     }
 
     pub fn ar(&mut self, op: ArOp, a: V, b: V) -> V {
+        tv_hook!(self, "ar", Req::Op(Op::Ar(op, a, b)), self.ar(op, a, b));
         let (ka, kb) = (self.as_const(a), self.as_const(b));
         if let (Some(x), Some(y)) = (ka, kb) {
             return self.konst(op.apply(x, y));
@@ -871,6 +877,7 @@ impl Graph {
     }
 
     pub fn cmp(&mut self, op: CmpOp, a: V, b: V) -> V {
+        tv_hook!(self, "cmp", Req::Op(Op::Cmp(op, a, b)), self.cmp(op, a, b));
         if let (Some(x), Some(y)) = (self.as_const(a), self.as_const(b)) {
             return self.konst(op.apply(x, y) as i32);
         }
@@ -959,6 +966,7 @@ impl Graph {
     /// Python truthiness as a 0/1 value (a bundle is true when it has any signal; a runtime
     /// signal when it is one, i.e. not "no signal").
     pub fn truth(&mut self, v: V) -> V {
+        tv_hook!(self, "truth", Req::Truth(v), self.truth(v));
         // A signal is true unless it's "no signal": the one-hot bundle is non-empty. (Signal
         // state and ports are already that bundle, so `unsig` leaves them as they are.)
         let v = if self.is_sigval(v) { self.unsig(v) } else { v };
@@ -977,6 +985,7 @@ impl Graph {
 
     /// Logical not as a 0/1 value.
     pub fn not(&mut self, v: V) -> V {
+        tv_hook!(self, "not", Req::Not(v), self.not(v));
         if let Op::Cmp(op, a, b) = *self.op(v) {
             return self.cmp(op.negate(), a, b);
         }
@@ -986,6 +995,7 @@ impl Graph {
 
     /// A mux from precomputed complementary conditions.
     pub fn mux_tf(&mut self, t: V, f: V, a: V, b: V) -> V {
+        tv_hook!(self, "mux_tf", Req::Op(Op::Mux { t, f, a, b }), self.mux_tf(t, f, a, b));
         if a == b {
             return a;
         }
@@ -1057,6 +1067,7 @@ impl Graph {
 
     /// A decider node; simplifies trivial cases. `hint` bounds its value.
     pub fn dec(&mut self, arms: Vec<(Dnf, i32)>, hint: Iv) -> V {
+        tv_hook!(self, "dec", Req::Op(Op::Dec(arms.clone())), self.dec(arms, hint));
         let mut arms: Vec<(Dnf, i32)> = arms.into_iter().filter(|(d, k)| *k != 0 && !d.is_empty()).collect();
         // Scalar operand canonicalization can change conjunction construction order.
         // Conditions are sets: normalize their ordering before hash-consing so checks
@@ -1084,6 +1095,7 @@ impl Graph {
 
     /// `Σ cond ? val : 0`; conditions must be booleans that are never true together.
     pub fn sel(&mut self, arms: Vec<(V, V)>) -> V {
+        tv_hook!(self, "sel", Req::Op(Op::Sel(arms.clone())), self.sel(arms));
         let arms: Vec<(V, V)> = arms
             .into_iter()
             .filter(|(c, v)| self.as_const(*c) != Some(0) && self.as_const(*v) != Some(0))
@@ -1102,6 +1114,7 @@ impl Graph {
 
     /// `a if c else b`, with `c` interpreted by truthiness.
     pub fn mux(&mut self, c: V, a: V, b: V) -> V {
+        tv_hook!(self, "mux", Req::PyMux(c, a, b), self.mux(c, a, b));
         let t = self.truth(c);
         if let Some(k) = self.as_const(t) {
             return if k != 0 { a } else { b };
@@ -1255,6 +1268,7 @@ impl Graph {
 
     /// A bundle made of terms; constant terms are folded together.
     pub fn bun(&mut self, terms: Vec<BTerm>) -> V {
+        tv_hook!(self, "bun", Req::Op(Op::Bun(terms.clone())), self.bun(terms));
         let mut konst: BVals = Vec::new();
         let mut rest = Vec::new();
         for t in self.simplify_maps(terms) {
@@ -1437,6 +1451,7 @@ impl Graph {
     }
 
     pub fn bget(&mut self, b: V, s: Sig) -> V {
+        tv_hook!(self, "bget", Req::Op(Op::BGet(b, s)), self.bget(b, s));
         if let Some(parts) = self.singles(b) {
             let mine = parts.into_iter().filter(|(x, _)| *x == s).map(|(_, p)| p).collect();
             return self.sum_parts(mine);
@@ -1445,6 +1460,7 @@ impl Graph {
     }
 
     pub fn btotal(&mut self, b: V) -> V {
+        tv_hook!(self, "btotal", Req::Op(Op::BTotal(b)), self.btotal(b));
         if let Some(parts) = self.singles(b) {
             return self.sum_parts(parts.into_iter().map(|(_, p)| p).collect());
         }
@@ -1452,6 +1468,7 @@ impl Graph {
     }
 
     pub fn bcount(&mut self, b: V) -> V {
+        tv_hook!(self, "bcount", Req::Op(Op::BCount(b)), self.bcount(b));
         if let Some(vals) = self.as_bconst(b) {
             let n = vals.len() as i32;
             return self.konst(n);
@@ -1502,6 +1519,7 @@ impl Graph {
 
     /// `Σ a[s] · b[s]`: with `b` one-hot, `a`'s value of `b`'s signal.
     pub fn bdot(&mut self, a: V, b: V) -> V {
+        tv_hook!(self, "bdot", Req::Op(Op::BDot(a, b)), self.bdot(a, b));
         if let Some(vals) = self.as_bconst(b).cloned() {
             let mut acc = self.konst(0);
             for (s, k) in vals {
@@ -1585,6 +1603,7 @@ impl Graph {
     /// The signal ranked `index` by value (from the largest if `max`); nothing if there are
     /// fewer signals.
     pub fn brank(&mut self, b: V, max: bool, index: u32) -> V {
+        tv_hook!(self, "brank", Req::Op(Op::BSelect(b, max, index)), self.brank(b, max, index));
         if let Some(vals) = self.as_bconst(b) {
             let mut v = vals.clone();
             let t = SignalTable::base();
@@ -1624,6 +1643,7 @@ impl Graph {
 
     /// Element `i` of an `n`-element array bundle; 0 when `i` is out of range.
     pub fn aget(&mut self, b: V, i: V, n: usize) -> V {
+        tv_hook!(self, "aget", Req::AGetN(b, i, n), self.aget(b, i, n));
         if let Some(k) = self.as_const(i) {
             return if (0..n as i64).contains(&(k as i64)) { self.bget(b, Graph::slot(k as usize)) } else { self.konst(0) };
         }
@@ -1636,6 +1656,7 @@ impl Graph {
 
     /// [`Op::AGet`] from its index bundle.
     pub fn aget_ix(&mut self, b: V, ix: V) -> V {
+        tv_hook!(self, "aget_ix", Req::Op(Op::AGet(b, ix)), self.aget_ix(b, ix));
         if let (Some(bv), Some(iv)) = (self.as_bconst(b), self.as_bconst(ix)) {
             let r = SignalTable::base().index_signal();
             let i = bval(iv, r);
@@ -1683,6 +1704,7 @@ impl Graph {
 
     /// Array bundle `b` with element `i` set to `x` (unchanged when `i` is out of range).
     pub fn aset(&mut self, b: V, i: V, x: V, n: usize) -> V {
+        tv_hook!(self, "aset", Req::ASet(b, i, x, n), self.aset(b, i, x, n));
         if let Some(k) = self.as_const(i) {
             if !(0..n as i64).contains(&(k as i64)) {
                 return b;
@@ -1720,6 +1742,7 @@ impl Graph {
 
     /// Array bundle `b` with `d` added to element `i`.
     pub fn aadd(&mut self, b: V, i: V, d: V, n: usize) -> V {
+        tv_hook!(self, "aadd", Req::AAdd(b, i, d, n), self.aadd(b, i, d, n));
         let z = self.konst(0);
         let mut terms = vec![BTerm::Map(ArOp::Add, b, z)];
         terms.extend(self.ahot_times(i, n, d));
@@ -1731,6 +1754,7 @@ impl Graph {
 
     /// `x` on every slot of an `n`-element array bundle that holds 0.
     pub fn azeros(&mut self, b: V, x: V, n: usize) -> V {
+        tv_hook!(self, "azeros", Req::AZeros(b, x, n), self.azeros(b, x, n));
         let ones = self.bconst((0..n).map(|k| (Graph::slot(k), 1)));
         let z = self.konst(0);
         let zero = vec![vec![BLit { op: CmpOp::Eq, a: BOp::Each, b: BOp::Val(z) }]];
@@ -1776,6 +1800,7 @@ impl Graph {
 
     /// Bundle select over mutually exclusive guards (see [`Op::BDec`]).
     pub fn bdec(&mut self, arms: Vec<(Dnf, V)>) -> V {
+        tv_hook!(self, "bdec", Req::Op(Op::BDec(arms.clone())), self.bdec(arms));
         let arms: Vec<(Dnf, V)> =
             arms.into_iter().filter(|(d, x)| !d.is_empty() && self.as_bconst(*x).is_none_or(|b| !b.is_empty())).collect();
         match arms.as_slice() {
@@ -1787,6 +1812,7 @@ impl Graph {
 
     /// Bundle select from complementary conditions.
     pub fn bmux_tf(&mut self, t: V, f: V, a: V, b: V) -> V {
+        tv_hook!(self, "bmux_tf", Req::Op(Op::BMux { t, f, a, b }), self.bmux_tf(t, f, a, b));
         if a == b {
             return a;
         }
@@ -1830,6 +1856,7 @@ impl Graph {
 
     /// `b` with signal `s` set to `x` (Python `b[s] = x`).
     pub fn bset(&mut self, b: V, s: Sig, x: V) -> V {
+        tv_hook!(self, "bset", Req::BSetS(b, s, x), self.bset(b, s, x));
         if let Some(parts) = self.singles(b) {
             let mut m = self.collect(parts);
             m.insert(s, x);

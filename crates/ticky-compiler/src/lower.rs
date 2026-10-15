@@ -643,6 +643,7 @@ fn log2_const(g: &Graph, v: V) -> Option<i32> {
 
 /// Python `//`: floors. Free when both operands are provably non-negative.
 pub fn floor_div(g: &mut Graph, a: V, b: V) -> V {
+    crate::ir_export::tv_hook!(g, "floor_div", crate::ir_export::Req::FloorDiv(a, b, g.path.clone()), floor_div(g, a, b));
     let facts = g.path_facts();
     // `(x * c1) // c2` where the product can't wrap is the real quotient `x * c1 / c2`
     // floored, so with `c1` dividing `c2` it's `x // (c2 / c1)`, and with `c2` dividing `c1`
@@ -680,6 +681,7 @@ pub fn floor_div(g: &mut Graph, a: V, b: V) -> V {
 
 /// Python `%`: result takes the divisor's sign. Free when both operands are non-negative.
 pub fn floor_mod(g: &mut Graph, a: V, b: V) -> V {
+    crate::ir_export::tv_hook!(g, "floor_mod", crate::ir_export::Req::FloorMod(a, b, g.path.clone()), floor_mod(g, a, b));
     // Masking is Python's modulo by a positive power of two, negatives included.
     if let Some(k) = log2_const(g, b) {
         let mask = g.konst((1 << k) - 1);

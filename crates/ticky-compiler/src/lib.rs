@@ -8,6 +8,7 @@ pub mod consteval;
 pub mod expand;
 pub mod fuse;
 pub mod ir;
+pub mod ir_export;
 pub mod layout;
 pub mod liveness;
 pub mod lower;

@@ -94,6 +94,27 @@ before/after table. Set `TICKY=/path/to/ticky` to compare an existing compiler b
 Failed examples produce a nonzero exit and a labeled subtotal excluding those files.
 Counts include arithmetic, decider, and selector combinators, but not constants or poles.
 
+**Translation validation** (`tools/validate.py`) proves with the z3 SMT solver that the
+compiler's IR rewrites keep each value's meaning on 32-bit wrapping integers with Factorio's
+division, modulo and shift rules: every simplifying constructor call (constant folding,
+range-based decisions, algebraic rewrites, `//`/`%` corrections), every register update before
+and after fusion, and the state ranges the lowering assumes. The compiler itself needs no
+solver: `TICKY_EXPORT_IR=file ticky check prog.ticky` appends the IR as JSON lines, which the
+tool reads. One-time setup: `python3 -m venv tools/.venv && tools/.venv/bin/pip install
+z3-solver`. Then:
+
+```bash
+tools/validate.py examples/math.ticky             # per block: equivalent / counterexample
+tools/validate.py --examples -v                   # every example; -v lists what isn't proved
+tools/validate.py --collect /tmp/corpus tools/fuzz_exprs.py 50 1   # keep a fuzzer's programs
+tools/validate.py --corpus /tmp/corpus            # ... and validate them
+tools/validate.py --selftest                      # the encoding vs. the compiler's operators
+```
+
+It exits non-zero on a counterexample. See the docstring at the top of the script for what is
+checked, what is assumed (input ranges, a bounded set of signals for bundles) and what isn't
+encoded.
+
 `--set name=value@tick` changes an input at a tick (default tick 0); bundle inputs take
 `--set stock=iron-plate:5,copper-plate:3@10`, and `Signal` inputs a signal name
 (`--set want=coal`; `iron-plate@rare` for a quality). `RUN=0@tick` and `RUN=1@tick` switch the program
