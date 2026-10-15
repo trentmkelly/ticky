@@ -1,0 +1,73 @@
+# superopt search --targets tools/superopt/targets.tsv --top 40 --min-excess 4 --budget 45 --seed 1 --out tools/superopt/rules.jsonl
+# Targets: tools/superopt_harvest.py --abstract --modes speed over examples/*.ticky and 687 fuzz
+# programs (tools/validate.py --collect, 13 fuzzers x 40 programs, seed 11), built with the
+# compiler before picks (1dfff72). Columns: occurrences, today's average combinators -> the
+# fewest found (depth in ticks, constant combinators), the class's most frequent shape.
+# 11.5 min, 1.05 GB peak. Then tools/superopt_confirm.py tools/superopt/rules.jsonl --write:
+# 25 of 25 winners proved with z3. ("budget hit": the serial search ran out of time.)
+ 189x avg 3.89 -> 1 (depth 1, 1 constants)  (mux (lt x0 x1) (ge x0 x1) x0 x1)   [0.5s, 6977203 evals; A 109012]
+        decider each(r) = 1 & X(g) < Y(g) | each(r) = 2 & X(g) ≥ Y(g) -> O=copy(g) [red: table {X:1,Y:2}]
+ 171x avg 3.98 -> 1 (depth 1, 1 constants)  (mux (gt x0 x1) (le x0 x1) x0 x1)   [0.5s, 6977203 evals; A 109012]
+        decider each(r) = 1 & X(g) > Y(g) | each(r) = 2 & X(g) ≤ Y(g) -> O=copy(g) [red: table {X:1,Y:2}]
+ 223x avg 3.00 -> 1 (depth 1, 1 constants)  (add x0 (mux (dec (arm 1 (or (and (lt x1 0) (ge x0 0) (ne x0 0)) (and (ge x1 0) (lt x0 0) (ne x0 0))))) _ x1 0))   [0.5s, 6999640 evals; A 109363]
+        decider each(r) = 1 | each(r) = 2 & Y(g) < 0 & X(g) ≥ 0 & X(g) ≠ 0 | each(r) = 2 & Y(g) ≥ 0 & X(g) < 0 & X(g) ≠ 0 -> O=copy(g) [red: table {X:1,Y:2}]
+  47x avg 4.00 -> 3 (depth 2, 1 constants)  (mux (lt x0 0) (ge x0 0) (sub 0 x0) x0)   [2.1s, 14208987 evals; A 10375, P 112 distinct of 5401, S 11778]
+        arith X(g) >> -1 -> T => P; arith X(g) * T(r) -> O [red: P]; decider each(r) = 1 & X(g) ≥ 0 -> O=copy(g) [red: table {X:1}]
+  50x avg 2.62 -> 3 (depth 2, 0 constants)  (sub (div x0 10) (lt (mod x0 10) 0))   [14.7s, 98800327 evals; A 46263, P 212 distinct of 16323, S 44708]
+        arith X(g) % 10 -> T => P; arith T(r) >> T(r) -> O [red: P]; arith X(g) / 10 -> O
+  45x avg 2.78 -> none ≤3 (depth 0, 0 constants)  (mod (add x0 (mul x1 3)) 7)   [45.0s, 186101768 evals; A 961372, P 1720 distinct of 316170, S 281700, budget hit after 37 P contents]
+  24x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (gt x0 -5) (le x0 -5) x1 x2)   [2.8s, 24200383 evals; A 378025]
+        decider each(r) = 2 & X(g) > -5 | each(r) = 3 & X(g) ≤ -5 -> O=copy(g) [red: table {X:1,Y:2,Z:3}]
+  34x avg 3.00 -> none ≤3 (depth 0, 0 constants)  (add (add x0 (dec (arm 1000 (or (and (lt x0 0)))))) (dec (arm 8 (or (and (eq x1 0))))))   [45.0s, 286650324 evals; A 109148, P 1305 distinct of 72578, S 41594, budget hit after 661 P contents]
+  34x avg 3.00 -> 2 (depth 1, 0 constants)  (sub (div 2 x0) (dec (arm 1 (or (and (lt x0 0) (ne (mod 2 x0) 0))))))   [0.2s, 2356692 evals; A 36821]
+        arith 2 / X(g) -> O; decider X(g) < 2 & X(g) < -2 -> O=-1
+  33x avg 3.00 -> none ≤3 (depth 0, 0 constants)  (add (add x0 (mul x1 7)) (mul x2 3))   [45.8s, 207454256 evals; A 635733, P 4000 distinct of 1122796, S 631016, budget hit after 15 P contents]
+ 121x avg 1.54 -> 3 (depth 2, 0 constants)  (add x0 (dec (arm 5 (or (and (lt x0 0))))))   [6.5s, 38771859 evals; A 26413, P 150 distinct of 10015, S 28476]
+        arith X(g) >> X(g) -> T => P; arith X(g) - T(r) -> O [red: P]; decider X(g) < 0 -> O=4
+  32x avg 3.00 -> 1 (depth 1, 1 constants)  (add x0 (mux (dec (arm 1 (or (and (lt x1 0) (ne x0 0))))) _ x1 0))   [0.5s, 6988214 evals; A 109187]
+        decider each(r) = 1 | each(r) = 2 & Y(g) < 0 & X(g) ≠ 0 -> O=copy(g) [red: table {X:1,Y:2}]
+  16x avg 4.94 -> none ≤3 (depth 0, 0 constants)  (and (mux (ne x0 0) (eq x0 0) x0 x1) 3)   [45.2s, 313820528 evals; A 474188, P 2516 distinct of 181990, S 152620, budget hit after 178 P contents]
+  36x avg 2.69 -> 2 (depth 1, 1 constants)  (mux (gt x0 2) (le x0 2) 2 x0)   [0.1s, 1398228 evals; A 21845]
+        decider X(g) > 2 -> O=2; decider each(r) = 1 & X(g) ≤ 2 -> O=copy(g) [red: table {X:1}]
+  19x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (ne x0 0) (eq x0 0) x1 x0)   [0.5s, 6981299 evals; A 109076]
+        decider each(r) = 2 & X(g) ≠ 0 -> O=copy(g) [red: table {X:1,Y:2}]
+  30x avg 2.87 -> 2 (depth 1, 1 constants)  (mux (gt x0 -1) (le x0 -1) x0 -1)   [0.1s, 1006290 evals; A 15721]
+        arith X(g) >> -1 -> O; decider each(r) = 1 & X(g) > -1 -> O=copy(g) [red: table {X:1}]
+  27x avg 2.93 -> 2 (depth 1, 1 constants)  (mux (lt x0 1) (ge x0 1) x0 1)   [0.0s, 664146 evals; A 10375]
+        decider X(g) > 1 | X(g) = 1 -> O=1; decider each(r) = 1 & X(g) < 1 -> O=copy(g) [red: table {X:1}]
+  29x avg 2.72 -> 2 (depth 1, 1 constants)  (mux (lt x0 2) (ge x0 2) 2 x0)   [0.1s, 1398228 evals; A 21845]
+        decider X(g) < 2 -> O=2; decider each(r) = 1 & X(g) ≥ 2 -> O=copy(g) [red: table {X:1}]
+  16x avg 4.00 -> none ≤3 (depth 0, 0 constants)  (xor (shl x0 1) (dec (arm 27 (or (and (ne (and x0 128) 0))))))   [13.0s, 84938568 evals; A 46263, P 181 distinct of 16323, S 44708]
+  11x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (ne x0 0) (eq x0 0) x0 x1)   [0.5s, 6981299 evals; A 109076]
+        decider each(r) = 1 | each(r) = 2 & X(g) = 0 -> O=copy(g) [red: table {X:1,Y:2}]
+ 141x avg 1.21 -> 1 (depth 1, 0 constants)  (mod x0 5)   [0.2s, 2961063 evals; A 46263]
+        arith X(g) % 5 -> O
+  14x avg 3.00 -> 2 (depth 1, 1 constants)  (mux (ne x0 0) (eq x0 0) x1 2)   [0.9s, 14072464 evals; A 219872, 1 candidates failed the wide tests]
+        decider X(g) = 0 -> O=2; decider each(r) = 2 & X(g) ≠ 0 -> O=copy(g) [red: table {X:1,Y:2}]
+   9x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (ne x0 0) (eq x0 0) x1 x2)   [2.0s, 11601547 evals; A 181237]
+        decider each(r) = 2 & X(g) ≠ 0 | each(r) = 3 & X(g) = 0 -> O=copy(g) [red: table {X:1,Y:2,Z:3}]
+   6x avg 5.00 -> none ≤3 (depth 0, 0 constants)  (mul (mux (gt x0 3) (le x0 3) x1 x2) 7)   [46.8s, 212183440 evals; A 656319, P 4000 distinct of 1161216, S 637368, budget hit after 15 P contents]
+   8x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (ge x0 0) (lt x0 0) (add x0 x1) x2)   [2.0s, 11601061 evals; A 181237]
+        decider each(r) = 1 & X(g) ≥ 0 | each(r) = 2 & X(g) ≥ 0 | each(r) = 3 & X(g) < 0 -> O=copy(g) [red: table {X:1,Y:2,Z:3}]
+   6x avg 5.00 -> 1 (depth 1, 2 constants)  (sub (mux (gt x0 -2) (le x0 -2) x1 x0) -2)   [0.9s, 14072300 evals; A 219872]
+        decider each(r) = 1 & X(g) ≤ -2 | each(r) = 2 & X(g) > -2 -> O=copy(g) [red: table {X:1,Y:2}]; constant O=2
+  11x avg 3.00 -> 2 (depth 1, 0 constants)  (sub (div x0 x1) (dec (arm 1 (or (and (lt x1 0) (ne (mod x0 x1) 0))))))   [0.7s, 10551404 evals; A 164858, 1 candidates failed the wide tests]
+        decider X(g) < Y(g) | Y(g) ≤ 0 -> O=-1; decider X(g) = 0 | Y(g) ≥ 0 -> O=1
+   8x avg 3.50 -> none ≤3 (depth 0, 0 constants)  (and (add x0 (mux (dec (arm 1 (or (and (lt x1 0) (ge x0 0) (ne x0 0)) (and (ge x1 0) (lt x0 0) (ne x0 0))))) _ x1 0)) 3)   [46.3s, 208103192 evals; A 474475, P 1231 distinct of 197028, S 158892, budget hit after 21 P contents]
+   5x avg 5.00 -> none ≤3 (depth 0, 0 constants)  (and (mux (ne x0 0) (eq x0 0) x1 x0) 3)   [45.9s, 203853616 evals; A 474188, P 2146 distinct of 181990, S 152620, budget hit after 26 P contents]
+   9x avg 3.00 -> none ≤3 (depth 0, 0 constants)  (add (add (mul x0 7) (mul x1 3)) x2)   [45.4s, 207454256 evals; A 635733, P 4000 distinct of 1122796, S 631016, budget hit after 15 P contents]
+   6x avg 4.00 -> none ≤3 (depth 0, 0 constants)  (mul (mux (lt x0 2) (ge x0 2) 2 x0) 7)   [26.9s, 177402944 evals; A 76077, P 232 distinct of 25437, S 73660]
+   6x avg 4.00 -> 1 (depth 1, 1 constants)  (mux (ge x0 1) (lt x0 1) x1 x2)   [2.0s, 11601547 evals; A 181237]
+        decider each(r) = 2 & X(g) ≥ 1 | each(r) = 3 & X(g) < 1 -> O=copy(g) [red: table {X:1,Y:2,Z:3}]
+  12x avg 2.50 -> 2 (depth 1, 0 constants)  (sub (div x0 -2) (gt (mod x0 -2) 0))   [0.1s, 1398100 evals; A 21843]
+        arith X(g) * -1 -> O; arith X(g) >> 1 -> O
+   6x avg 4.00 -> none ≤3 (depth 0, 0 constants)  (sub x0 (add x1 (mux (dec (arm 1 (or (and (lt x2 0) (ge x1 0) (ne x1 0)) (and (ge x2 0) (lt x1 0) (ne x1 0))))) _ x2 0)))   [45.0s, 272787368 evals; A 228569, P 4000 distinct of 516614, S 111306, budget hit after 202 P contents]
+   4x avg 5.00 -> none ≤3 (depth 0, 0 constants)  (and (mux (gt x0 3) (le x0 3) x1 x2) 3)   [45.4s, 216388800 evals; A 429383, P 4000 distinct of 765352, S 367552, budget hit after 38 P contents]
+   4x avg 5.00 -> none ≤3 (depth 0, 0 constants)  (and (mux (ne x0 0) (eq x0 0) x1 x2) 3)   [45.9s, 193923904 evals; A 429383, P 4000 distinct of 765352, S 367552, budget hit after 8 P contents]
+   4x avg 5.00 -> 2 (depth 1, 1 constants)  (ge (mux (gt x0 -5) (le x0 -5) x1 x2) 2)   [3.6s, 34305712 evals; A 535939]
+        decider X(g) > -5 & X(r) < Y(g) -> O=1 [red: table {X:1,Y:2,Z:3}]; decider X(g) ≤ -5 & X(r) < Z(g) -> O=1 [red: table {X:1,Y:2,Z:3}]
+   4x avg 5.00 -> none ≤3 (depth 0, 0 constants)  (lt (mux (gt x0 -5) (le x0 -5) x1 x2) 12)   [46.3s, 215563088 evals; A 721693, P 4000 distinct of 1275302, S 716342, budget hit after 12 P contents]
+   8x avg 3.00 -> none ≤3 (depth 0, 0 constants)  (mux (gt x0 40) (le x0 40) -1 (add x1 559))   [45.1s, 214303744 evals; A 1393046, P 2454 distinct of 428096, S 406640, budget hit after 24 P contents]
+   8x avg 3.00 -> 3 (depth 2, 0 constants)  (mux (lt x0 1) (ge x0 1) 3 (add x0 2))   [14.5s, 90168926 evals; A 49969, P 172 distinct of 17573, S 49904]
+        arith X(g) - 1 -> T => P; decider each(r) ≥ 1 -> O=copy(r) [red: P]; decider X(g) < 1 | X(g) ≥ 1 -> O=3
+40 patterns: 21 improved; their combinators 4497 -> 2455 (if every occurrence took the winner)

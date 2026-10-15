@@ -192,6 +192,13 @@ impl Cg {
         // Gated selects pass a signal through under its own name, so can't write a sum's.
         let sum_op = |v: V| is_scalar_op(v) && !plan.has_pass(v);
         let mut transparent: std::collections::HashSet<V> = Default::default();
+        // `x + s`, `s` a select with picks used only by the sum, `x` a value on the bus: `x`
+        // joins `s`'s pick decider as an unconditional term (picks sum what passes) and the
+        // decider writes the sum's signal. Python's `%` by a runtime divisor (`r + (d if r and
+        // the signs differ else 0)`) is then one decider after the truncated `%`.
+        let mut pick_addends: HashMap<V, V> = HashMap::new();
+        let has_picks = |s: V| plan.stages.get(&s).is_some_and(|st| st.deciders.iter().any(|(_, o)| matches!(o, Out::Pick(_))));
+        let picked_values = |s: V| -> Vec<V> { plan.stages[&s].deciders.iter().filter_map(|(_, o)| if let Out::Pick(x) = o { Some(*x) } else { None }).collect() };
         {
             // Reads write the bus or a cluster wire, not a bundle's.
             let same_place = |o: V, t: V| if is_read(o) { !bundle_writes.contains_key(&t) } else { !local(t) || cluster.get(&o) == cluster.get(&t) };
@@ -204,6 +211,25 @@ impl Cg {
                             transparent.insert(v);
                             fold.insert(a, (t, ma));
                             fold.insert(b, (t, mb));
+                        } else if op == ArOp::Add && m == 1 && selects::pick_enabled() {
+                            let addend = [(a, b), (b, a)].into_iter().find(|&(s, x)| {
+                                has_picks(s)
+                                    && !plan.has_pass(s)
+                                    && single(s)
+                                    && same_place(s, t)
+                                    && !fold.contains_key(&s)
+                                    && !pick_addends.contains_key(&s)
+                                    && g.as_const(x).is_none()
+                                    && !matches!(*g.op(x), Op::Src(i) if matches!(src(i), Ref::Op(Operand::Const(_))))
+                                    && !local(x)
+                                    && !pass_of.contains_key(&x)
+                                    && !picked_values(s).contains(&x)
+                            });
+                            if let Some((s, x)) = addend {
+                                transparent.insert(v);
+                                fold.insert(s, (t, 1));
+                                pick_addends.insert(s, x);
+                            }
                         }
                     }
                     // `x * k` with `x` a sum or condition that can take the factor itself.
@@ -419,6 +445,7 @@ impl Cg {
             let placed = |v: V| {
                 fold.contains_key(&v) || floor_at.contains_key(&v) || writes_into(v) || staged.contains_key(&v) || bundle_writes.contains_key(&v)
                     || plan.stages.contains_key(&v) || pass_of.contains_key(&v) || node_ref.contains_key(&v) || local_sig.contains_key(&v) || cond_reads.contains_key(&v)
+                    || pick_addends.values().any(|&x| x == v)
             };
             let lane_ok = |v: V| !placed(v) && !transparent.contains(&v) && eff_operands(v) == g.operands(v);
             // Reads write a private wire too (`emit_from_bundle`'s `out_net`), unless they're
@@ -494,8 +521,11 @@ impl Cg {
         let mut cluster_net: HashMap<usize, usize> = HashMap::new();
         let mut shared_deciders: HashMap<Vec<(usize, Conn)>, Vec<EntId>> = HashMap::new();
         let mut floor_done: std::collections::HashSet<usize> = Default::default();
+        // Combinators emitted per node, for `fuse::superopt::harvest` (superoptimiser targets).
+        let mut marks: Vec<(V, EntId)> = Vec::new();
 
         for v in producers {
+            marks.push((v, self.net.entities.len()));
             if filter_totals.contains_key(&v) {
                 continue;
             }
@@ -577,6 +607,9 @@ impl Cg {
             };
             if let Some(st) = plan.stages.get(&v) {
                 for (d, o) in &st.deciders {
+                    if matches!(o, Out::Pick(_)) {
+                        continue;
+                    }
                     let reads = selects::Stage::reads(d, o);
                     // The red wire it reads: a further pass's own, else the cluster's (a
                     // decider has one red input; the plan moved everything else to the bus).
@@ -622,6 +655,7 @@ impl Cg {
                             let ((first, first_nets), (second, second_nets)) = (pick(x), pick(c));
                             Kind::Arith(Arith { first, first_nets, second, second_nets, op: ArOp::Mul, out })
                         }
+                        Out::Pick(_) => unreachable!("picks are emitted together"),
                     };
                     let id = self.net.add(kind, Role::Core);
                     self.net.entities[id].description = Some(format!("{what}: select"));
@@ -632,6 +666,25 @@ impl Cg {
                     wire_out(self, &mut cluster_net, id);
                     if let Some(output) = scalar_output {
                         self.share_logic_decider(id, red, output, &mut shared_deciders);
+                    }
+                }
+                // The stage's picks: one decider reading the bus and its code table.
+                let picks: Vec<(&selects::SDnf, V)> = st.deciders.iter().filter_map(|(d, o)| if let Out::Pick(x) = *o { Some((d, x)) } else { None }).collect();
+                let addend = pick_addends.get(&v).copied();
+                if !picks.is_empty() {
+                    assert_eq!(sign, 1, "a select with picks in a scaled wire sum");
+                    let on_bus = |u: V| -> Operand {
+                        match *g.op(u) {
+                            Op::Const(k) => Operand::Const(k),
+                            Op::Src(s) => src(s).op(),
+                            _ => {
+                                assert!(!local(u), "a value picks read is on a private wire");
+                                node_ref[&u].op()
+                            }
+                        }
+                    };
+                    for id in self.emit_picks(&picks, addend, &on_bus, out, what) {
+                        wire_out(self, &mut cluster_net, id);
                     }
                 }
                 continue;
@@ -718,6 +771,9 @@ impl Cg {
         for v in staged.keys().chain(lane_in.keys()) {
             node_ref.remove(v);
         }
+        if crate::fuse::superopt::harvesting() {
+            crate::fuse::superopt::harvest(g, &live, roots, &marks, &self.net, what);
+        }
         Ok(node_ref)
     }
 
@@ -751,6 +807,95 @@ impl Cg {
             self.bprod(consts, kc);
             self.bread(consts, id, true);
         }
+    }
+
+    /// A stage's picks (`selects::Out::Pick`): one decider copying the arm whose condition holds
+    /// off the bus (green) onto `out`, its red input a constant giving each arm's signal a code;
+    /// terms `each(red) = code ∧ the arm's literals (green)`. With `each` in the conditions, the
+    /// single output sums the passing signals' green values: the arm value, renamed. Arms whose
+    /// value turns out constant (a source with no signal) get a constant decider of their own.
+    /// `addend`: a value always added (a term with its code alone). Returns the deciders made
+    /// (all reading the bus; outputs not wired yet).
+    fn emit_picks(&mut self, picks: &[(&selects::SDnf, V)], addend: Option<V>, on_bus: &dyn Fn(V) -> Operand, out: Sig, what: &str) -> Vec<EntId> {
+        let each = self.each;
+        // `None`: a literal that always holds; `Err(())`: one that never does.
+        let lit = |l: &selects::SLit| -> Result<Option<Cond>, ()> {
+            let opnd = |o: Opd| match o {
+                Opd::K(k) => Operand::Const(k),
+                Opd::V(u) => on_bus(u),
+            };
+            match (opnd(l.a), opnd(l.b)) {
+                (Operand::Sig(s), y) => Ok(Some(Cond { first: s, first_nets: Nets::GREEN, second: y, second_nets: Nets::GREEN, cmp: l.op, and: true })),
+                (Operand::Const(p), Operand::Sig(s)) => Ok(Some(Cond { first: s, first_nets: Nets::GREEN, second: Operand::Const(p), second_nets: Nets::GREEN, cmp: l.op.flip(), and: true })),
+                (Operand::Const(p), Operand::Const(q)) => if l.op.apply(p, q) { Ok(None) } else { Err(()) },
+            }
+        };
+        let terms_of = |d: &selects::SDnf, prefix: Option<Cond>| -> CDnf {
+            let mut terms = Vec::new();
+            'terms: for t in d {
+                let mut conds: Vec<Cond> = prefix.iter().cloned().collect();
+                for l in t {
+                    match lit(l) {
+                        Ok(Some(c)) => conds.push(c),
+                        Ok(None) => {}
+                        Err(()) => continue 'terms,
+                    }
+                }
+                if conds.is_empty() {
+                    // Always true (no literal reads a signal): tests a signal that's never there.
+                    conds.push(Cond { first: out, first_nets: Nets::RED, second: Operand::Const(0), second_nets: Nets::BOTH, cmp: CmpOp::Eq, and: true });
+                }
+                terms.push(conds);
+            }
+            terms
+        };
+        let mut codes: Vec<(Sig, i32)> = Vec::new();
+        let mut terms: CDnf = Vec::new();
+        let mut made = Vec::new();
+        for &(d, x) in picks {
+            match on_bus(x) {
+                Operand::Const(0) => {}
+                Operand::Const(k) => {
+                    let t = terms_of(d, None);
+                    if !t.is_empty() {
+                        let id = self.loose(dec_const(distribute(&[], &t), out, k), format!("{what}: select"));
+                        self.nets[0].members.push((id, Conn::InGreen));
+                        made.push(id);
+                    }
+                }
+                Operand::Sig(s) => {
+                    let code = match codes.iter().find(|c| c.0 == s) {
+                        Some(c) => c.1,
+                        None => {
+                            codes.push((s, codes.len() as i32 + 1));
+                            codes.len() as i32
+                        }
+                    };
+                    let prefix = Cond { first: each, first_nets: Nets::RED, second: Operand::Const(code), second_nets: Nets::BOTH, cmp: CmpOp::Eq, and: true };
+                    terms.extend(terms_of(d, Some(prefix)));
+                }
+            }
+        }
+        match addend.map(on_bus) {
+            None | Some(Operand::Const(0)) => {}
+            Some(Operand::Const(_)) => unreachable!("pick addends are signals (logic: `pick_addends`)"),
+            Some(Operand::Sig(s)) => {
+                // Its own code: a signal already picked would pass once, not twice.
+                assert!(codes.iter().all(|c| c.0 != s), "a pick's addend is one of its arms");
+                codes.push((s, codes.len() as i32 + 1));
+                let code = codes.len() as i32;
+                terms.push(vec![Cond { first: each, first_nets: Nets::RED, second: Operand::Const(code), second_nets: Nets::BOTH, cmp: CmpOp::Eq, and: true }]);
+            }
+        }
+        if !terms.is_empty() {
+            let kind = dec(distribute(&[], &terms), vec![DOut { sig: out, copy: true, constant: 0, nets: Nets::GREEN }]);
+            let id = self.loose(kind, format!("{what}: select (picks {} off the bus)", if codes.len() == 1 { "1 value".to_string() } else { format!("{} values", codes.len()) }));
+            let table = self.loose(Kind::Constant(ConstComb { values: crate::ir::normalize(codes), on: true }), format!("{what}: select codes"));
+            self.nets[0].members.push((id, Conn::InGreen));
+            self.nets.push(NetSpec { red: true, members: vec![(table, Conn::Red), (id, Conn::InRed)] });
+            made.push(id);
+        }
+        made
     }
 
     /// Share only constant-output scalar deciders on exactly the same physical networks.

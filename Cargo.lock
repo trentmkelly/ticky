@@ -321,6 +321,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ticky-superopt"
+version = "0.1.0"
+dependencies = [
+ "ticky-factorio",
+ "ticky-sim",
+]
+
+[[package]]
 name = "ticky-syntax"
 version = "0.1.0"
 
