@@ -14,6 +14,7 @@ pub mod liveness;
 pub mod lower;
 pub mod pipeline;
 pub mod place;
+pub mod profile;
 pub mod program;
 pub mod stdlib;
 pub mod strconst;
@@ -102,11 +103,14 @@ pub struct Options {
     pub space_age: bool,
     /// Fixed places for peripherals by name (`--at NAME=X,Y`), overriding `at=` in the source.
     pub at: Vec<(String, (i64, i64))>,
+    /// Profile-guided optimisation (`--profile`, speed mode only): processes' recorded step
+    /// and branch counts (see [`profile`]). Without one, the build doesn't change.
+    pub profile: Option<profile::Profile>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, compact_outputs: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new(), duplicate_drivers: false }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, compact_outputs: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new(), profile: None, duplicate_drivers: false }
     }
 }
 
@@ -119,6 +123,9 @@ pub struct Compiled {
     pub quality: bool,
     /// Built for Space Age item data.
     pub space_age: bool,
+    /// Built with a profile: estimated ticks the processes spent running steps in the
+    /// profiled run, without and with profile-guided decisions.
+    pub profiled: Option<(f64, f64)>,
 }
 
 pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
@@ -128,8 +135,26 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
     SIZE.with(|c| c.set(opts.opt == Opt::Size));
     COPY_TAILS.with(|c| c.set(true));
     let module = ticky_syntax::parse(src).map_err(|d| vec![d])?;
-    let fast = compile_module(&module, opts, true, &[])?;
+    let mut profile_warnings = Vec::new();
+    let usable = opts.profile.as_ref().filter(|p| {
+        let same = p.source == profile::source_hash(src);
+        if !same {
+            profile_warnings.push(Diag::warning(Span::default(), "the profile was recorded from a different version of this program; ignoring it"));
+        } else if opts.opt == Opt::Size {
+            profile_warnings.push(Diag::warning(Span::default(), "a profile only guides --opt=speed builds; ignoring it"));
+        }
+        same && opts.opt == Opt::Speed
+    });
+    let mut fast = match usable {
+        None => compile_module(&module, opts, true, &[])?,
+        Some(p) => {
+            let r = compile_guided(&module, opts, p);
+            profile_warnings.extend(profile::take_warnings());
+            r?
+        }
+    };
     if opts.opt == Opt::Speed {
+        fast.warnings.extend(profile_warnings);
         return Ok(fast);
     }
     // Preserve all four global candidates before trying mixed pipeline choices.
@@ -163,7 +188,70 @@ pub fn compile(src: &str, opts: &Options) -> Result<Compiled, Vec<Diag>> {
         }
     }
     COPY_TAILS.with(|c| c.set(true));
+    best.warnings.extend(profile_warnings);
     Ok(best)
+}
+
+/// Estimated ticks the processes spent running steps in the profiled run: each step's
+/// estimated runs times its duration (waits at their shortest).
+fn profiled_ticks(p: &Program) -> f64 {
+    use program::{StepKind, WaitN};
+    p.procs
+        .iter()
+        .flat_map(|m| &m.steps)
+        .map(|s| {
+            let ticks = match &s.kind {
+                StepKind::Run(_) => s.depth.max(1) + 1,
+                StepKind::WaitTicks(WaitN::Const(n), _) => (*n).max(2) as u32,
+                StepKind::WaitUntil(..) | StepKind::WaitTicks(WaitN::Dyn(_), _) => s.wait_ready + 2,
+            };
+            s.visits * ticks as f64
+        })
+        .sum()
+}
+
+/// A speed build guided by profile `p`. The program is analysed without profile-guided
+/// decisions (exactly the steps a build without a profile has), with all of them and with
+/// each kind alone; the one with the fewest estimated ticks in the profiled run (ties: the
+/// plain one) is built. (Only the analysis is repeated: codegen and layout run once.)
+fn compile_guided(module: &ticky_syntax::ast::Module, opts: &Options, p: &profile::Profile) -> Result<Compiled, Vec<Diag>> {
+    use profile::Guide;
+    let off = Guide { merge: false, copy: false };
+    profile::clear_warnings();
+    let mut best: Option<(f64, Guide)> = None;
+    let mut plain = 0.0;
+    for guide in [off, Guide { merge: true, copy: true }, Guide { merge: true, copy: false }, Guide { merge: false, copy: true }] {
+        profile::set_current(Some(p.clone()), guide);
+        let r = program::analyze_with_pipelines(module, true, &[]);
+        profile::set_current(None, off);
+        let Ok(prog) = r else {
+            // The plain build reports its own errors below; a guided alternative that fails
+            // is just not taken.
+            if guide == off {
+                break;
+            }
+            continue;
+        };
+        let ticks = profiled_ticks(&prog);
+        if guide == off {
+            plain = ticks;
+        }
+        if best.is_none_or(|(t, _)| ticks < t) {
+            best = Some((ticks, guide));
+        }
+    }
+    let (ticks, guide) = best.unwrap_or((plain, off));
+    profile::set_current(Some(p.clone()), guide);
+    let r = compile_module(module, opts, true, &[]);
+    profile::set_current(None, off);
+    let mut c = match r {
+        Ok(c) => c,
+        Err(e) if guide == off => return Err(e),
+        // The winner failed later on (e.g. ran out of signals): build without the profile.
+        Err(_) => return compile_module(module, opts, true, &[]).map(|c| Compiled { profiled: Some((plain, plain)), ..c }),
+    };
+    c.profiled = Some((plain, ticks));
+    Ok(c)
 }
 
 fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: bool, choices: &[bool]) -> Result<Compiled, Vec<Diag>> {
@@ -288,7 +376,7 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
     if opts.allow_unknown_signals {
         warnings.retain(|w| !w.message.starts_with("unknown signal"));
     }
-    Ok(Compiled { program, cg, layout, warnings, quality: opts.quality, space_age: opts.space_age })
+    Ok(Compiled { program, cg, layout, warnings, quality: opts.quality, space_age: opts.space_age, profiled: None })
 }
 
 impl Compiled {
@@ -327,6 +415,11 @@ impl Compiled {
                 let tag = if s.self_loop { "  (loop: per iteration)" } else { "" };
                 out.push_str(&format!("    step {:<3} line {line:<4} {}{tag}\n", i + 1, s.duration));
             }
+        }
+        if let Some((plain, guided)) = self.profiled {
+            let (plain, guided) = (plain + 0.0, guided + 0.0);
+            let what = if guided < plain { "profile-guided" } else { "no profile-guided changes paid off" };
+            out.push_str(&format!("  profile: {what}: about {guided:.0} ticks running steps in the profiled tests ({plain:.0} without)\n"));
         }
         if !self.program.checks.is_empty() {
             out.push_str("  error codes (--checks; shown on the `error` output, signal-E):\n");

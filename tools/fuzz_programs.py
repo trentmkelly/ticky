@@ -10,6 +10,10 @@ With CHECKS=1 the programs are built with `--checks`: where Python raises
 ZeroDivisionError, the circuit must report an error (any code); elsewhere the error output
 must stay 0 and the values must match.
 
+With PGO=1 (tools/fuzz_pgo.py) each program gets a test block, a profile is recorded with
+`ticky test --profile` (on the same inputs, or on other ones half the time, so cold paths
+run too) and the circuit simulated is the one `--profile` builds.
+
 usage: tools/fuzz_programs.py [COUNT] [SEED]
 """
 import os
@@ -128,6 +132,7 @@ class Gen:
 
 
 CHECKS = bool(os.environ.get("CHECKS"))
+PGO = bool(os.environ.get("PGO"))
 
 
 def checked(line):
@@ -168,11 +173,23 @@ def main():  # pylint: disable=too-many-locals
         lines = ["input x: int @ X", "input y: int @ Y", "output oa: int @ A", "output ob: int @ B",
                  "output oc: int @ C", "output done: bool @ D", "a = 0", "b = 1", "c = 2"]
         lines += body + ["oa = a", "ob = b", "oc = c", "done = True"]
+        if PGO:
+            px, py = (x, y) if r.random() < 0.5 else (r.randint(-20, 20), r.randint(-20, 20))
+            lines += ['test "profile":', f"    set x = {px}", f"    set y = {py}", "    run 20000 ticks"]
         src = "\n".join(lines) + "\n"
         with tempfile.NamedTemporaryFile("w", suffix=".ticky", delete=False) as f:
             f.write(src)
             path = f.name
         cmd = [TICKY, "sim", path, "--ticks", "20000", f"--set=x={x}", f"--set=y={y}"] + (["--checks"] if CHECKS else [])
+        if PGO:
+            prof = path + ".profile.json"
+            rec = subprocess.run([TICKY, "test", path, "--profile", prof] + (["--checks"] if CHECKS else []),
+                                 capture_output=True, text=True, check=False)
+            if not os.path.exists(prof):
+                failed += 1
+                print(f"PROFILE FAILURE ({path}):\n{rec.stderr}")
+                continue
+            cmd += ["--profile", prof]
         out = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if out.returncode != 0:
             failed += 1

@@ -881,6 +881,11 @@ work and bundle/array operations scale far better.
   combinators (pipelining sometimes saves combinators, since it needs no sample registers or
   clocks, and sometimes costs them, in delay chains). It then tries up to eight per-block
   pipeline choices, keeping a change only when the complete circuit gets smaller.
+- `--profile FILE` (speed only) uses a profile recorded by `ticky test --profile FILE`:
+  hot branch targets are merged into the branching step (run speculatively when their writes
+  are dead on the other path and invisible outside the process), hot jump targets are copied
+  more readily and cold ones never; the build is kept only if it is estimated to take fewer
+  ticks on the profiled run (README, "Profile-guided builds").
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
 
 Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so

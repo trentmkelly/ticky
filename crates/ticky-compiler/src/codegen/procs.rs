@@ -27,7 +27,9 @@ pub(super) fn main_proc(
     let tm = cg.alloc()?;
     let pc_of = |s: Option<usize>| s.map_or(0, |i| i as i32 + 1);
 
-    // Step timer: ticks since the current step started.
+    // Step timer: ticks since the current step started (its decider reads the bus: the
+    // profiler's probe).
+    let probe = cg.net.entities.len();
     cg.counter(tm, vec![c(any, CmpOp::Eq, 0), c(rp, CmpOp::Ne, 0)], &format!("{}: step timer", m.name));
 
     // Sources: own variables directly, inputs and other processes' state sampled at each
@@ -286,5 +288,5 @@ pub(super) fn main_proc(
         cg.register(r, 0, &ws, &format!("{}: return address of `{func}`", m.name))?;
     }
     cg.flush_shared(false);
-    Ok(MainStats { name: m.name.clone(), steps: stats, combinators: cg.combinators_since(first_ent) })
+    Ok(MainStats { name: m.name.clone(), steps: stats, combinators: cg.combinators_since(first_ent), probe: (probe, pc, any) })
 }

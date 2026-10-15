@@ -8,6 +8,8 @@
 use ticky_syntax::ast::{BinOp, CmpOp, Expr, ExprKind, Stmt, StmtKind};
 use ticky_syntax::{Diag, Span};
 
+use crate::profile::{ProcProfile, RawStep};
+
 /// Step index; `None` as a target means "halt".
 pub type Target = Option<usize>;
 
@@ -30,6 +32,12 @@ pub struct Draft {
     pub stmts: Vec<Stmt>,
     pub term: Term,
     pub span: Span,
+    /// The raw steps (see [`crate::profile`]) this step runs, in order: one, or several when
+    /// steps joined by plain jumps were merged. (After a profile-guided branch merge, only
+    /// the branching step's.)
+    pub origin: Vec<usize>,
+    /// With a profile: how often the profiled run is estimated to run this step.
+    pub visits: f64,
 }
 
 pub struct Cfg {
@@ -39,6 +47,8 @@ pub struct Cfg {
     pub subs: std::collections::HashMap<String, usize>,
     /// Hidden variables introduced for `for` loops.
     pub hidden: Vec<String>,
+    /// The raw steps, before any merging (what a profile counts).
+    pub raw: Vec<RawStep>,
 }
 
 /// What `continue` does in the innermost loop.
@@ -155,7 +165,7 @@ fn uses(stmts: &[Stmt], var: &str) -> (bool, bool) {
 
 impl Builder<'_> {
     fn new_step(&mut self, span: Span) -> usize {
-        self.steps.push(Draft { stmts: Vec::new(), term: Term::Open, span });
+        self.steps.push(Draft { stmts: Vec::new(), term: Term::Open, span, origin: Vec::new(), visits: 0.0 });
         self.steps.len() - 1
     }
 
@@ -419,7 +429,7 @@ const MAX_COPY: usize = 6;
 /// combinators, so `A; goto B` becomes one step running A's code and then B's. When B has
 /// other predecessors too, it is copied, if small. B must not wait: what A writes has to
 /// be visible during the wait. Entry steps (`protected`) keep their identity.
-fn fuse(steps: &mut [Draft], protected: &[usize]) {
+fn fuse(steps: &mut [Draft], protected: &[usize], mut est: Option<&mut Est>) {
     let preds = |steps: &[Draft], b: usize| -> usize {
         steps.iter().map(|d| targets(&d.term).into_iter().filter(|t| *t == Some(b)).count()).sum::<usize>()
             + if protected.contains(&b) { 1 } else { 0 }
@@ -437,15 +447,26 @@ fn fuse(steps: &mut [Draft], protected: &[usize]) {
             // jump, so each gets a copy and `b` goes): a copy for some predecessors saves
             // those paths a step (2 ticks) but adds code.
             let partial = || steps.iter().filter(|d| matches!(d.term, Term::Goto(Some(t)) if t == b)).count() != preds(steps, b);
-            if !only && (!crate::copy_tails() || steps[b].stmts.len() > MAX_COPY || budget == 0 || crate::opt_size() && partial()) {
+            // With a profile: never copy into a predecessor that didn't take this jump; copy
+            // bigger steps into one that took it often.
+            let cap = match est.as_deref().filter(|_| crate::profile::guide().copy) {
+                Some(e) if e.get(a, Some(b)) == 0.0 => 0,
+                Some(e) if e.get(a, Some(b)) >= hot_min() => HOT_COPY,
+                _ => MAX_COPY,
+            };
+            if !only && (!crate::copy_tails() || steps[b].stmts.len() > cap || cap == 0 || budget == 0 || crate::opt_size() && partial()) {
                 continue;
             }
             if !only {
                 budget -= 1;
             }
-            let (stmts, term) = (steps[b].stmts.clone(), steps[b].term.clone());
+            let (stmts, term, origin) = (steps[b].stmts.clone(), steps[b].term.clone(), steps[b].origin.clone());
             steps[a].stmts.extend(stmts);
             steps[a].term = term;
+            steps[a].origin.extend(origin);
+            if let Some(e) = est.as_deref_mut() {
+                e.inline(a, &[Some(b)], only);
+            }
             if only {
                 // `b` is now unreachable (dropped below).
                 steps[b].stmts.clear();
@@ -459,10 +480,367 @@ fn fuse(steps: &mut [Draft], protected: &[usize]) {
     }
 }
 
+/// A jump taken at least this often (in the profile) is hot: 8, or `TICKY_PGO_HOT` (the PGO
+/// fuzzer uses 1, as its random programs' loops are short).
+fn hot_min() -> f64 {
+    static HOT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *HOT.get_or_init(|| std::env::var("TICKY_PGO_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0))
+}
+/// Largest step copied into a hot predecessor, or merged into a branch whose hot side it is.
+const HOT_COPY: usize = 32;
+
+/// Estimated transition counts between steps while they are being merged: the profile's
+/// counts at first (steps are still raw steps then), updated as steps absorb others.
+struct Est {
+    e: std::collections::HashMap<(usize, Target), f64>,
+}
+
+impl Est {
+    fn new(p: &ProcProfile) -> Est {
+        Est { e: p.edges.iter().map(|(&k, &n)| (k, n as f64)).collect() }
+    }
+
+    fn get(&self, a: usize, t: Target) -> f64 {
+        self.e.get(&(a, t)).copied().unwrap_or(0.0)
+    }
+
+    fn outs(&self, a: usize) -> Vec<(Target, f64)> {
+        let mut v: Vec<(Target, f64)> = self.e.iter().filter(|((x, _), _)| *x == a).map(|((_, t), n)| (*t, *n)).collect();
+        v.sort_by_key(|(t, _)| *t);
+        v
+    }
+
+    /// Step `a` now runs the code of `arms` (some of its targets) after its own and continues
+    /// where they continue. `gone`: the arms are no longer reached any other way.
+    fn inline(&mut self, a: usize, arms: &[Target], gone: bool) {
+        let mut add: Vec<(Target, f64)> = Vec::new();
+        for &arm in arms {
+            let n = self.e.remove(&(a, arm)).unwrap_or(0.0);
+            let Some(x) = arm else { continue };
+            let outs = self.outs(x);
+            let total: f64 = outs.iter().map(|(_, k)| k).sum();
+            if total > 0.0 {
+                let share = (n / total).min(1.0);
+                for (t, k) in outs {
+                    add.push((t, k * share));
+                    // What is left of `x`'s own traffic.
+                    self.e.insert((x, t), if gone { 0.0 } else { k * (1.0 - share) });
+                }
+            }
+        }
+        for (t, k) in add {
+            *self.e.entry((a, t)).or_insert(0.0) += k;
+        }
+    }
+}
+
+/// Whether `stmts` assign a branch temporary (`#pgo…`), which then can't be put inside
+/// another `if` (it is read after it).
+fn has_temp(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Assign { targets, .. } => targets.iter().any(|t| matches!(&t.kind, ExprKind::Name(n) if n.starts_with("#pgo"))),
+        StmtKind::If { body, orelse, .. } => has_temp(body) || has_temp(orelse),
+        _ => false,
+    })
+}
+
+/// Names `stmts` assign anywhere (an element assignment `xs[i] = v` assigns `xs`).
+fn assigned(stmts: &[Stmt], out: &mut std::collections::BTreeSet<String>) {
+    fn target(t: &Expr, out: &mut std::collections::BTreeSet<String>) {
+        match &t.kind {
+            ExprKind::Name(n) => {
+                out.insert(n.clone());
+            }
+            ExprKind::Tuple(xs) | ExprKind::List(xs) => xs.iter().for_each(|x| target(x, out)),
+            ExprKind::Index(b, _) | ExprKind::Attr(b, _) => target(b, out),
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign { targets, .. } => targets.iter().for_each(|t| target(t, out)),
+            StmtKind::AugAssign { target: t, .. } | StmtKind::AnnAssign { target: t, .. } => target(t, out),
+            StmtKind::If { body, orelse, .. } => {
+                assigned(body, out);
+                assigned(orelse, out);
+            }
+            StmtKind::Block { body, .. } | StmtKind::While { body, .. } | StmtKind::For { body, .. } => assigned(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn has_assert(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Assert(_) => true,
+        StmtKind::If { body, orelse, .. } => has_assert(body) || has_assert(orelse),
+        StmtKind::Block { body, .. } => has_assert(body),
+        _ => false,
+    })
+}
+
+type Names = std::collections::BTreeSet<String>;
+
+fn names_in(e: &Expr, out: &mut Names) {
+    crate::expand::visit(e, &mut |x| {
+        if let ExprKind::Name(n) = &x.kind {
+            out.insert(n.clone());
+        }
+    });
+}
+
+/// What straight-line step code reads before writing it, and what it surely writes; `None`
+/// for code this doesn't follow.
+fn use_def(stmts: &[Stmt]) -> Option<(Names, Names)> {
+    let (mut used, mut def) = (Names::new(), Names::new());
+    let read = |e: &Expr, used: &mut Names, def: &Names| {
+        let mut r = Names::new();
+        names_in(e, &mut r);
+        used.extend(r.into_iter().filter(|n| !def.contains(n)));
+    };
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Pass => {}
+            StmtKind::Expr(e) | StmtKind::Assert(e) => read(e, &mut used, &def),
+            StmtKind::Assign { targets, value } => {
+                read(value, &mut used, &def);
+                let mut whole = Vec::new();
+                for t in targets {
+                    match &t.kind {
+                        ExprKind::Name(n) => whole.push(n.clone()),
+                        ExprKind::Tuple(xs) if xs.iter().all(|x| matches!(x.kind, ExprKind::Name(_))) => {
+                            whole.extend(xs.iter().filter_map(|x| match &x.kind {
+                                ExprKind::Name(n) => Some(n.clone()),
+                                _ => None,
+                            }))
+                        }
+                        // An element assignment keeps the other elements: it reads the array.
+                        ExprKind::Index(..) => read(t, &mut used, &def),
+                        _ => return None,
+                    }
+                }
+                def.extend(whole);
+            }
+            StmtKind::AugAssign { target, value, .. } | StmtKind::AnnAssign { target, value: Some(value), .. } => {
+                read(value, &mut used, &def);
+                let ExprKind::Name(n) = &target.kind else { return None };
+                if matches!(s.kind, StmtKind::AugAssign { .. }) && !def.contains(n) {
+                    used.insert(n.clone());
+                }
+                def.insert(n.clone());
+            }
+            StmtKind::If { cond, body, orelse } => {
+                read(cond, &mut used, &def);
+                let (u1, d1) = use_def(body)?;
+                let (u2, d2) = use_def(orelse)?;
+                used.extend(u1.into_iter().chain(u2).filter(|n| !def.contains(n)));
+                def.extend(d1.intersection(&d2).cloned());
+            }
+            _ => return None,
+        }
+    }
+    Some((used, def))
+}
+
+/// Names live on entry to each step (read on some path before being written); `None` where
+/// that can't be told (calls, returns, unusual code: anything might be read).
+fn live_in(steps: &[Draft]) -> Vec<Option<Names>> {
+    let local: Vec<Option<(Names, Names, Names)>> = steps
+        .iter()
+        .map(|d| {
+            let (used, def) = use_def(&d.stmts)?;
+            let mut term = Names::new();
+            match &d.term {
+                Term::Goto(_) | Term::Open => {}
+                Term::Branch(e, ..) | Term::WaitUntil(e, _) | Term::WaitTicks(e, _) => names_in(e, &mut term),
+                Term::Call(..) | Term::Return(_) => return None,
+            }
+            Some((used, def, term))
+        })
+        .collect();
+    let mut live: Vec<Option<Names>> = vec![Some(Names::new()); steps.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..steps.len()).rev() {
+            let new = local[i].as_ref().and_then(|(used, def, term)| {
+                let mut out = term.clone();
+                for t in targets(&steps[i].term).into_iter().flatten() {
+                    out.extend(live[t].clone()?);
+                }
+                let mut l = used.clone();
+                l.extend(out.into_iter().filter(|n| !def.contains(n)));
+                Some(l)
+            });
+            if new != live[i] {
+                live[i] = new;
+                changed = true;
+            }
+        }
+        if !changed {
+            return live;
+        }
+    }
+}
+
+/// Profile-guided if-conversion of hot branch targets. A step ending in a branch that goes
+/// one way most of the time (at least 2/3 of its runs, and `hot_min()` times or more) takes
+/// in the code of that side: `A; if c → H else → O` becomes `A; t = c; if t: H`, continuing
+/// where H continues (when `t`) or at O, so the hot path saves a step (two ticks or more)
+/// and the cold path runs a longer step. The cold side is taken in too when that's needed to
+/// keep two targets, if it is small. A side whose own branch condition is `d` computes it
+/// in its arm (`t and d` in the merged condition). Sides that wait, call or return are left
+/// alone.
+///
+/// When everything H writes is dead wherever the cold path continues, invisible outside the
+/// process (`observable`), and H has no `assert` (and the build no `--checks`), H runs
+/// unconditionally (speculatively) after the cold side's code, so its results don't pass
+/// through selects on `t` (which would cost a tick: `if not t: d += 1` becomes `d + [not t]`).
+/// Whether any of this pays off is decided by the caller ([`crate::compile`]), which costs
+/// the whole build against the profile.
+fn merge_hot_branches(steps: &mut [Draft], est: &mut Est, observable: &dyn Fn(&str) -> bool) {
+    let n = steps.len();
+    let mut budget = n;
+    for a in 0..n {
+        let Term::Branch(c, t, f) = steps[a].term.clone() else { continue };
+        if t == f || budget == 0 {
+            continue;
+        }
+        let (ct, cf) = (est.get(a, t), est.get(a, f));
+        let hot_t = ct >= cf;
+        let (hot, cold) = if hot_t { (t, f) } else { (f, t) };
+        let hot_n = ct.max(cf);
+        if hot_n < hot_min() || hot_n * 3.0 < (ct + cf) * 2.0 {
+            continue;
+        }
+        let ok = |x: Target, cap: usize| match x {
+            Some(i) if i != a => {
+                matches!(steps[i].term, Term::Goto(_) | Term::Branch(..)) && steps[i].stmts.len() <= cap && !has_temp(&steps[i].stmts)
+            }
+            _ => false,
+        };
+        if !ok(hot, HOT_COPY) {
+            continue;
+        }
+        let span = steps[a].span;
+        let tmp = format!("#pgo{a}");
+        let flag = name(&tmp, span);
+        let not = |e: &Expr| Expr { kind: ExprKind::Not(Box::new(e.clone())), span: e.span };
+        // A side's own branch condition is computed inside its arm of the `if` (into
+        // `#pgo{a}t` or `…f`, False in the other arm), from the values on that path: read
+        // after the `if`, it would see them through selects on the flag (deeper logic).
+        let cond_tmp = |x: Target| format!("#pgo{a}{}", if x == t { "t" } else { "f" });
+        // One side's ways out: (condition, target), the condition `None` when always.
+        let outs = |x: Target, inlined: bool| -> Vec<(Option<Expr>, Target)> {
+            match (inlined, x) {
+                (true, Some(i)) => match &steps[i].term {
+                    Term::Goto(y) => vec![(None, *y)],
+                    Term::Branch(_, p, q) if p == q => vec![(None, *p)],
+                    Term::Branch(_, p, q) => {
+                        let d = name(&cond_tmp(x), span);
+                        vec![(Some(d.clone()), *p), (Some(not(&d)), *q)]
+                    }
+                    _ => unreachable!(),
+                },
+                _ => vec![(None, x)],
+            }
+        };
+        let combine = |inl_t: bool, inl_f: bool| -> Option<Term> {
+            let sides = [(flag.clone(), outs(t, inl_t)), (not(&flag), outs(f, inl_f))];
+            let mut targets: Vec<Target> = Vec::new();
+            for (_, o) in &sides {
+                for (_, y) in o {
+                    if !targets.contains(y) {
+                        targets.push(*y);
+                    }
+                }
+            }
+            match targets.len() {
+                1 => Some(Term::Goto(targets[0])),
+                2 => {
+                    let p = targets[0];
+                    let mut terms: Vec<Expr> = Vec::new();
+                    for (sel, o) in &sides {
+                        for (d, y) in o {
+                            if *y == p {
+                                terms.push(match d {
+                                    None => sel.clone(),
+                                    Some(d) => Expr { kind: ExprKind::BoolOp(ticky_syntax::ast::BoolOp::And, vec![sel.clone(), d.clone()]), span },
+                                });
+                            }
+                        }
+                    }
+                    let cond = if terms.len() == 1 { terms.pop().unwrap() } else { Expr { kind: ExprKind::BoolOp(ticky_syntax::ast::BoolOp::Or, terms), span } };
+                    Some(Term::Branch(cond, p, targets[1]))
+                }
+                _ => None,
+            }
+        };
+        let (inl_t, inl_f, term) = match combine(hot_t, !hot_t) {
+            Some(term) => (hot_t, !hot_t, term),
+            None if ok(cold, MAX_COPY) => match combine(true, true) {
+                Some(term) => (true, true, term),
+                None => continue,
+            },
+            None => continue,
+        };
+        // Speculation: when everything the hot side writes is dead wherever the cold path
+        // goes next (and nobody else can see it), the hot side's code runs unconditionally,
+        // after the cold side's: no selects on the flag in front of its results.
+        let h = hot.unwrap();
+        // (Recomputed per merge: a merge changes what its step reads and writes.)
+        let live = live_in(steps);
+        let cold_next: Vec<Target> = if inl_t && inl_f { targets(&steps[cold.unwrap()].term) } else { vec![cold] };
+        let spec = !crate::checks_on() && {
+            let mut w = std::collections::BTreeSet::new();
+            assigned(&steps[h].stmts, &mut w);
+            !w.is_empty()
+                && !has_assert(&steps[h].stmts)
+                && w.iter().all(|n| !observable(n))
+                && cold_next.iter().all(|c| c.is_none_or(|j| live[j].as_ref().is_some_and(|l| l.is_disjoint(&w))))
+        };
+        let arm = |x: Target, inl: bool| if inl && !(spec && x == hot) { steps[x.unwrap()].stmts.clone() } else { Vec::new() };
+        let (mut body, mut orelse) = (arm(t, inl_t), arm(f, inl_f));
+        let mut after = Vec::new();
+        for (x, inl) in [(t, inl_t), (f, inl_f)] {
+            let Some(i) = x.filter(|_| inl) else { continue };
+            if spec && x == hot {
+                after.extend(steps[i].stmts.clone());
+                if let Term::Branch(d, p, q) = &steps[i].term {
+                    if p != q {
+                        after.push(assign(&cond_tmp(x), d.clone(), span));
+                    }
+                }
+                continue;
+            }
+            if let Term::Branch(d, p, q) = &steps[i].term {
+                if p != q {
+                    let v = cond_tmp(x);
+                    let (mine, other) = if x == t { (&mut body, &mut orelse) } else { (&mut orelse, &mut body) };
+                    mine.push(assign(&v, d.clone(), span));
+                    other.push(assign(&v, Expr { kind: ExprKind::Bool(false), span }, span));
+                }
+            }
+        }
+        steps[a].stmts.push(assign(&tmp, c.clone(), span));
+        if !body.is_empty() || !orelse.is_empty() {
+            steps[a].stmts.push(Stmt { kind: StmtKind::If { cond: flag.clone(), body, orelse }, span });
+        }
+        steps[a].stmts.extend(after);
+        steps[a].term = term;
+        budget -= 1;
+        let arms: Vec<Target> = [(t, inl_t), (f, inl_f)].into_iter().filter(|(_, i)| *i).map(|(x, _)| x).collect();
+        est.inline(a, &arms, false);
+    }
+}
+
 /// A subroutine: name, return label and body.
 pub type SubDef = (String, usize, Vec<Stmt>);
 
-pub fn build(stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) -> Option<i32>) -> Result<Cfg, Diag> {
+/// Builds the steps of process `proc` (`main` or its name: which profile applies).
+///
+/// `observable`: names something outside this process can see (ports, other processes'
+/// and blocks' code), which profile-guided speculation must not write early.
+pub fn build(proc: &str, stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) -> Option<i32>, observable: &dyn Fn(&str) -> bool) -> Result<Cfg, Diag> {
     let span = stmts.first().map(|s| s.span).unwrap_or_default();
     let mut b = Builder {
         steps: Vec::new(),
@@ -513,7 +891,36 @@ pub fn build(stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) -> Option<i3
         }
     }
     let protected: Vec<usize> = entry.into_iter().chain(sub_entry.values().copied()).collect();
-    fuse(&mut steps, &protected);
+    // Raw steps: what a profile counts (see `crate::profile`).
+    let raw: Vec<RawStep> = steps
+        .iter()
+        .map(|d| RawStep { span: d.span, branch: match d.term { Term::Branch(_, t, f) => Some((t, f)), _ => None } })
+        .collect();
+    for (i, d) in steps.iter_mut().enumerate() {
+        d.origin = vec![i];
+    }
+    // Profile-guided decisions (speed only: under `--opt=size` nothing is spent on ticks).
+    let profile = if crate::opt_size() { None } else { crate::profile::for_proc(proc, &raw) };
+    let mut est = profile.as_ref().map(Est::new);
+    if let Some(e) = est.as_mut().filter(|_| crate::profile::guide().merge) {
+        merge_hot_branches(&mut steps, e, observable);
+    }
+    fuse(&mut steps, &protected, est.as_mut());
+    // Estimated runs of each step (what leaves it), to cost the decisions.
+    if let Some(e) = &est {
+        for (i, d) in steps.iter_mut().enumerate() {
+            d.visits = e.outs(i).iter().map(|(_, n)| n).sum();
+        }
+    }
+    if std::env::var_os("TICKY_DUMP_CFG").is_some() {
+        eprintln!("== cfg of `{proc}` (profile: {})", profile.is_some());
+        for (i, d) in steps.iter().enumerate() {
+            eprintln!("step {i} origin {:?}: {} statements, {:?}", d.origin, d.stmts.len(), targets(&d.term));
+            for s in &d.stmts {
+                eprintln!("    {s:?}");
+            }
+        }
+    }
 
     // Keep reachable steps only, renumbered in order.
     let mut keep = vec![false; steps.len()];
@@ -542,12 +949,12 @@ pub fn build(stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) -> Option<i3
     let entry = match entry {
         Some(e) => new_id[e],
         None => {
-            out.push(Draft { stmts: vec![], term: Term::Goto(None), span });
+            out.push(Draft { stmts: vec![], term: Term::Goto(None), span, origin: Vec::new(), visits: 0.0 });
             out.len() - 1
         }
     };
     let subs = sub_entry.into_iter().filter(|(_, e)| keep[*e]).map(|(f, e)| (f, new_id[e])).collect();
-    Ok(Cfg { steps: out, entry, subs, hidden: b.hidden })
+    Ok(Cfg { steps: out, entry, subs, hidden: b.hidden, raw })
 }
 
 impl Cfg {
@@ -574,10 +981,10 @@ mod tests {
 
     fn cfg(src: &str) -> Cfg {
         let m = ticky_syntax::parse(src).unwrap();
-        build(&m.body, &[], &|e| match e.kind {
+        build("main", &m.body, &[], &|e| match e.kind {
             ExprKind::Int(v) => Some(v as i32),
             _ => None,
-        })
+        }, &|_| true)
         .unwrap()
     }
 
@@ -588,6 +995,66 @@ mod tests {
         assert_eq!(c.steps.len(), 3);
         let Term::Branch(_, Some(t), _) = &c.steps[1].term else { panic!("{:?}", c.steps[1].term) };
         assert_eq!(*t, 1);
+    }
+
+    /// Builds `src` with a profile in which every branch went to its `else` side 100 times
+    /// (and once the other way), merging hot targets, with `observable` names.
+    fn guided(src: &str, observable: &dyn Fn(&str) -> bool) -> Cfg {
+        use crate::profile::{Guide, ProcProfile, Profile};
+        let raw = cfg(src).raw;
+        let mut edges = std::collections::BTreeMap::new();
+        for (i, r) in raw.iter().enumerate() {
+            if let Some((t, f)) = r.branch {
+                edges.insert((i, t), 1);
+                edges.insert((i, f), 100);
+            }
+        }
+        let p = ProcProfile { steps: raw.iter().map(|r| (r.span, 0)).collect(), edges };
+        let profile = Profile { source: 0, procs: [("main".to_string(), p)].into_iter().collect() };
+        crate::profile::set_current(Some(profile), Guide { merge: true, copy: false });
+        let m = ticky_syntax::parse(src).unwrap();
+        let c = build("main", &m.body, &[], &|e| match e.kind {
+            ExprKind::Int(v) => Some(v as i32),
+            _ => None,
+        }, observable);
+        crate::profile::set_current(None, Guide { merge: false, copy: false });
+        c.unwrap()
+    }
+
+    #[test]
+    fn hot_branch_targets_merge_and_speculate_only_unseen_dead_writes() {
+        // `d += 1` (the hot side) is dead after the `break` (the cold side), `probe` is not
+        // dead if something outside can see it.
+        let src = "d = 2\nwhile d < n:\n    if n % d == 0:\n        first = d\n        break\n    d += 1\n    probe = d\nx = d * 0\n";
+        let stmt_names = |s: &Stmt| -> Vec<String> {
+            let mut w = std::collections::BTreeSet::new();
+            assigned(std::slice::from_ref(s), &mut w);
+            w.into_iter().collect()
+        };
+        // The merged `if n % d == 0` step (it computes a flag `#pgo…` and assigns `first`).
+        // What it writes outside its `if` runs unconditionally.
+        let merged = |c: &Cfg| -> usize {
+            c.steps.iter().position(|d| has_temp(&d.stmts) && {
+                let mut w = std::collections::BTreeSet::new();
+                assigned(&d.stmts, &mut w);
+                w.contains("first")
+            }).expect("a merged step")
+        };
+        let top_level = |c: &Cfg| -> Vec<String> {
+            let d = &c.steps[merged(c)];
+            d.stmts.iter().filter(|s| !matches!(s.kind, StmtKind::If { .. })).flat_map(stmt_names).filter(|n| !n.starts_with('#')).collect()
+        };
+        // `x = d * 0` reads `d` after the loop: nothing can be speculated.
+        assert_eq!(top_level(&guided(src, &|_| false)), Vec::<String>::new());
+        let src = src.replace("x = d * 0", "x = 1");
+        assert_eq!(top_level(&guided(&src, &|_| false)), vec!["d".to_string(), "probe".to_string()]);
+        // `probe` visible (an output, or read by another process): the hot side stays
+        // conditional.
+        assert_eq!(top_level(&guided(&src, &|n| n == "probe")), Vec::<String>::new());
+        // The loop is one step now: the merged step branches back to itself.
+        let c = guided(&src, &|_| false);
+        let i = merged(&c);
+        assert!(targets(&c.steps[i].term).contains(&Some(i)));
     }
 
     #[test]

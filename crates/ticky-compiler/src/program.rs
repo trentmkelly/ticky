@@ -184,6 +184,10 @@ pub enum StepKind {
 #[derive(Clone, Debug)]
 pub struct Step {
     pub span: Span,
+    /// The raw steps it runs (`cfg::Draft::origin`), for profiles.
+    pub origin: Vec<usize>,
+    /// With a profile: estimated runs in the profiled run (`cfg::Draft::visits`).
+    pub visits: f64,
     /// New values of the variables this step assigns.
     pub writes: Vec<(usize, V)>,
     /// How those writes are carried out (after fusion).
@@ -239,6 +243,8 @@ pub struct MainProc {
     pub graph: Graph,
     pub steps: Vec<Step>,
     pub entry: usize,
+    /// The raw steps (`cfg::Cfg::raw`), for profiles.
+    pub raw: Vec<crate::profile::RawStep>,
 }
 
 impl MainProc {
@@ -747,7 +753,7 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
-    let mut p = analyze_expanded(&expanded, pipeline, choices)?;
+    let mut p = analyze_expanded(&expanded, pipeline, choices, &mem)?;
     p.screens = screens;
     p.random = random;
     p.controls = controls;
@@ -757,7 +763,8 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
     Ok(p)
 }
 
-fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Program, Vec<Diag>> {
+/// `peripherals`: variables shown by screens, readouts, panels and speakers.
+fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool], peripherals: &HashSet<String>) -> Result<Program, Vec<Diag>> {
     let t0 = std::time::Instant::now();
     let table = SignalTable::base();
     let mut errs = Vec::new();
@@ -898,10 +905,30 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Prog
     }
 
     let konst = |e: &Expr| eval_int(e, &consts, &ports).ok();
+    // Names each piece of code mentions (main, each process, with their subroutines; the
+    // `every` blocks): what a process's steps write early under profile-guided speculation
+    // must be invisible to the rest and to the ports.
+    let mut unit_names: Vec<BTreeSet<String>> = Vec::new();
+    for proc in std::iter::once(None).chain(procs_src.iter().map(|(n, _)| Some(n.as_str()))) {
+        let mut m = BTreeSet::new();
+        crate::liveness::mentioned(proc.map_or(&main_stmts[..], |n| &procs_src.iter().find(|(p, _)| p == n).unwrap().1[..]), &mut m);
+        subs_of(proc).iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
+        unit_names.push(m);
+    }
+    {
+        let mut m = BTreeSet::new();
+        every.iter().for_each(|(_, _, b)| crate::liveness::mentioned(b, &mut m));
+        unit_names.push(m);
+    }
+    let observable = |unit: usize| {
+        let unit_names = &unit_names;
+        let ports = &ports;
+        move |n: &str| peripherals.contains(n) || ports.iter().any(|p| p.name == n) || unit_names.iter().enumerate().any(|(k, m)| k != unit && m.contains(n))
+    };
     let main_cfg = if main_stmts.is_empty() {
         None
     } else {
-        match cfg::build(&main_stmts, &subs_of(None), &konst) {
+        match cfg::build("main", &main_stmts, &subs_of(None), &konst, &observable(0)) {
             Ok(c) => {
                 for h in &c.hidden {
                     main_assigns.insert(h.clone(), main_stmts[0].span);
@@ -917,7 +944,7 @@ fn analyze_expanded(m: &Module, pipeline: bool, choices: &[bool]) -> Result<Prog
     let mut proc_cfgs = Vec::new();
     for (k, (name, body)) in procs_src.iter().enumerate() {
         let span = body.first().map(|s| s.span).unwrap_or_default();
-        match cfg::build(body, &subs_of(Some(name)), &konst) {
+        match cfg::build(name, body, &subs_of(Some(name)), &konst, &observable(k + 1)) {
             Ok(c) => {
                 for h in &c.hidden {
                     proc_assigns[k].insert(h.clone(), span);
@@ -1946,7 +1973,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
             };
             srcs = n.srcs;
             let checks = g.checks[first_check..].iter().map(|&(fail, span, what)| Check { fail, code: 0, span, what }).collect();
-            steps.push(Step { span: d.span, writes, plans: Vec::new(), kind, depth: 0, wait_ready: 0, checks });
+            steps.push(Step { span: d.span, origin: d.origin.clone(), visits: d.visits, writes, plans: Vec::new(), kind, depth: 0, wait_ready: 0, checks });
         }
         let ivs: Vec<(usize, Iv)> =
             steps.iter().flat_map(|s| s.writes.iter().map(|(si, v)| (*si, g.iv(*v))).collect::<Vec<_>>()).collect();
@@ -2037,7 +2064,7 @@ fn lower_main(ctx: &Ctx, c: &cfg::Cfg, elsewhere: &BTreeSet<&String>) -> Result<
                 StepKind::WaitTicks(n, t) => StepKind::WaitTicks(n, remap(t)),
             };
         }
-        return Ok(MainProc { name: String::new(), owner: ctx.owner, srcs, graph: g, steps: out, entry: new_id[entry] });
+        return Ok(MainProc { name: String::new(), owner: ctx.owner, srcs, graph: g, steps: out, entry: new_id[entry], raw: c.raw.clone() });
     }
     unreachable!()
 }

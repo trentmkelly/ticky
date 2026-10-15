@@ -8,6 +8,7 @@ use ticky_syntax::{Diag, Span};
 
 use crate::ir::{normalize, BVals, Cv, Graph, V};
 use crate::lower::{self, Names};
+use crate::profile::{source_hash, ProcProfile, Profile, RawStep};
 use crate::program::Ty;
 use crate::Compiled;
 
@@ -278,13 +279,79 @@ impl<'a> Harness<'a> {
 }
 
 pub fn run_tests(c: &Compiled, src: &str) -> Vec<TestOutcome> {
+    run(c, src, None)
+}
+
+/// [`run_tests`], also recording how often each process's steps ran and which way its
+/// branches went (`ticky test --profile`; the file format is in [`crate::profile`]).
+/// Only for a build without a profile (whose steps map back to raw steps exactly).
+pub fn run_tests_profiled(c: &Compiled, src: &str) -> (Vec<TestOutcome>, Profile) {
+    let mut prof = Profile { source: source_hash(src), procs: Default::default() };
+    for (m, st) in c.program.procs.iter().zip(&c.cg.procs) {
+        prof.procs.insert(st.name.clone(), ProcProfile { steps: m.raw.iter().map(|r| (r.span, 0)).collect(), edges: Default::default() });
+    }
+    let results = run(c, src, Some(&mut prof));
+    (results, prof)
+}
+
+/// The raw steps of every process, by name (for [`Profile::to_json`]).
+pub fn raw_steps(c: &Compiled) -> std::collections::BTreeMap<String, Vec<RawStep>> {
+    c.program.procs.iter().zip(&c.cg.procs).map(|(m, st)| (st.name.clone(), m.raw.clone())).collect()
+}
+
+fn run(c: &Compiled, src: &str, mut prof: Option<&mut Profile>) -> Vec<TestOutcome> {
     c.program
         .tests
         .iter()
         .map(|t| {
             let mut h = Harness::new(c);
+            if prof.is_some() {
+                for st in &c.cg.procs {
+                    let (e, pc, any) = st.probe;
+                    h.sim.trace_states(e, pc, any);
+                }
+            }
             let failure = t.body.iter().try_for_each(|s| h.exec(s, src)).err();
+            if let Some(p) = prof.as_deref_mut() {
+                record(c, &h.sim.state_traces(), p);
+            }
             TestOutcome { name: t.name.clone(), ticks: h.sim.tick, failure }
         })
         .collect()
+}
+
+/// Adds one run's traces (by program counter value) to the profile (by raw step).
+fn record(c: &Compiled, traces: &[ticky_sim::StateTrace], prof: &mut Profile) {
+    for ((m, st), tr) in c.program.procs.iter().zip(&c.cg.procs).zip(traces) {
+        let Some(p) = prof.procs.get_mut(&st.name) else { continue };
+        let origin = |pc: i32| -> &[usize] {
+            match usize::try_from(pc - 1).ok().and_then(|i| m.steps.get(i)) {
+                Some(s) => &s.origin,
+                None => &[],
+            }
+        };
+        for (&pc, &n) in &tr.visits {
+            let o = origin(pc);
+            for &r in o {
+                if let Some(v) = p.steps.get_mut(r) {
+                    v.1 += n;
+                }
+            }
+            for w in o.windows(2) {
+                *p.edges.entry((w[0], Some(w[1]))).or_insert(0) += n;
+            }
+        }
+        for (&(from, to), &n) in &tr.edges {
+            let Some(&last) = origin(from).last() else { continue };
+            let next = if to == 0 {
+                None
+            } else {
+                match origin(to).first() {
+                    Some(&r) => Some(r),
+                    None => continue,
+                }
+            };
+            *p.edges.entry((last, next)).or_insert(0) += n;
+        }
+    }
 }
