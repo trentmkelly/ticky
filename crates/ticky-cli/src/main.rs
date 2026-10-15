@@ -47,6 +47,9 @@ enum Cmd {
     /// Run the program's `test` blocks in the simulator.
     Test {
         file: PathBuf,
+        /// Optimisation mode, as for `build` (the circuit tested is the one that mode builds).
+        #[arg(long, default_value = "speed", value_parser = parse_opt)]
+        opt: Opt,
         /// Don't warn about signal names Ticky doesn't know (modded names).
         #[arg(long)]
         allow_unknown_signals: bool,
@@ -60,6 +63,9 @@ enum Cmd {
     /// Simulate and print output ports whenever they change.
     Sim {
         file: PathBuf,
+        /// Optimisation mode, as for `build` (the circuit tested is the one that mode builds).
+        #[arg(long, default_value = "speed", value_parser = parse_opt)]
+        opt: Opt,
         #[arg(long, default_value_t = 600)]
         ticks: u64,
         /// Set an input: `name=value` (at tick 0) or `name=value@tick`. Repeatable.
@@ -502,7 +508,7 @@ fn main() -> ExitCode {
             }
         }),
         Cmd::Check { file, opt, place } => build(&file, false, opt, &place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file, allow_unknown_signals, checks, space_age } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(name, src, c)| {
+        Cmd::Test { file, opt, allow_unknown_signals, checks, space_age } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(name, src, c)| {
             let results = run_tests(&c, &src);
             if results.is_empty() {
                 eprintln!("no tests in {name}");
@@ -525,7 +531,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, ticks, sets, all, allow_unknown_signals, checks, space_age } => build(&file, false, Opt::Speed, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(_, _, c)| {
+        Cmd::Sim { file, opt, ticks, sets, all, allow_unknown_signals, checks, space_age } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE

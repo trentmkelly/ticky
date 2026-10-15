@@ -1,0 +1,268 @@
+# Thruster governor for a space platform with one Cubonium monopropellant thruster (Lily's
+# Cubeine). A thruster's thrust follows how full its fluid boxes are (2 x 500 cubonium): about
+# half thrust at 10% and full thrust from 80%, and fuel can't be taken back out, only burnt. So
+# fuel goes in in small measured doses, only while travelling, and only while the platform is
+# below its target speed and not already speeding up from the last dose. Parked, nothing goes
+# in, so the next departure starts gently, except one small starter dose (STARTER) on arriving
+# and when the program starts (RUN on, e.g. after pasting): the hub shows no destination until
+# the platform moves, so with an empty thruster it would never set off. To start from empty,
+# clear the lines and switch RUN off and on.
+#
+# Plumbing (an airlock): reserve -> pump 1 -> buffer tank -> pump 2 -> thruster. Pump 1 fills the
+# buffer to DOSE with pump 2 closed; then pump 2 lets that dose through to the thruster.
+#
+#   pump 1   wired to the "fill" port and to the buffer tank, enabled on
+#            liquid-cubonium < signal-F. The controller sets F to DOSE while it wants a dose
+#            (else 0), and the pump itself stops when the buffer has it: a pump moves ~20 a
+#            tick, and the controller takes several ticks to react, the pump one.
+#   pump 2   enabled on signal-R > 0 (the "release" port)
+#
+# Inputs: the platform hub (read speed as signal-V, damage taken this trip as signal-D, and
+# "moving from" / "moving to"; anything else on its wire is ignored) and the buffer tank. The hub gives the
+# planet it's leaving as 1 and the one it's going to as 2, or the one it's parked at as 3.
+#
+# The route sets the target speed, from four settings in the blueprint (edit their constant
+# combinators): easy between inner and modded planets, medium to or from Aquilo, hard to or
+# from the solar system edge and the shattered planet (the harder end of the trip decides).
+# Any damage on a trip drops the target to the limp-home speed for the rest of it.
+#
+# Stuck at 0 with a destination showing: 0 is below any target and not rising, so a dose goes
+# in every SETTLE ticks until the platform moves.
+import controls
+
+FUEL      = S("liquid-cubonium", type="fluid")
+AQUILO    = S("aquilo", type="space-location")
+EDGE      = S("solar-system-edge", type="space-location")
+SHATTERED = S("shattered-planet", type="space-location")
+NAUVIS    = S("nauvis", type="space-location")
+FULGORA   = S("fulgora", type="space-location")
+
+HARDNESS = {AQUILO: 1, EDGE: 2, SHATTERED: 2}   # anywhere else is easy (0)
+
+# Every place the hub can name. Only these count, so nothing else on the hub's wire (its
+# contents, say) can look like a destination. A planet missing here never counts as a trip, so
+# the governor won't fuel trips to or from it: add new planets' names here.
+PLACES = {
+    S("nauvis", type="space-location"): 1,
+    S("vulcanus", type="space-location"): 1,
+    S("fulgora", type="space-location"): 1,
+    S("gleba", type="space-location"): 1,
+    S("aquilo", type="space-location"): 1,
+    S("solar-system-edge", type="space-location"): 1,
+    S("shattered-planet", type="space-location"): 1,
+    S("cubium", type="space-location"): 1,
+    S("nix", type="space-location"): 1,
+    S("mirandus-a", type="space-location"): 1,
+    S("ringworld", type="space-location"): 1,
+    S("shipyard", type="space-location"): 1,
+    S("calidus-senestella-gate-calidus", type="space-location"): 1,
+    S("calidus-senestella-gate-senestella", type="space-location"): 1,
+}
+
+DOSE    = 30    # fuel per dose (pump 1 may overshoot by up to ~20 in the tick it stops)
+STARTER = 20    # fuel put in on arriving and at the start, so the platform can always set off
+TIMEOUT = 600   # ticks a pump may take over its part of a dose before the governor moves on
+                # (an empty reserve, a full thruster): a stuck dose can't stop it
+SETTLE = 120    # ticks between looks at the speed, so a dose can show before the next
+
+input  hub: Bundle = port("Platform hub: speed (V), damage (D), moving from/to")
+input  tank: Bundle = port("Buffer tank, between the pumps")
+input  easy: controls.Setting("Easy route speed", 190)
+input  medium: controls.Setting("Aquilo route speed", 120)
+input  hard: controls.Setting("Edge / shattered planet route speed", 60)
+input  limp: controls.Setting("Speed after damage", 30)
+
+output fill: int @ F = port("Pump 1, reserve to buffer: the dose to fill the buffer to")
+output release: bool @ R = port("Pump 2, buffer to thruster")
+output target: int @ T = port("Target speed (0 while parked)")
+
+def places():
+    # The hub's planets (1 leaving, 2 going to, 3 parked at), and nothing else on its wire.
+    return hub * PLACES
+
+def travelling():
+    # A destination, and not parked anywhere.
+    return len({s: v for s, v in places().items() if v == 2}) > 0 \
+        and len({s: v for s, v in places().items() if v == 3}) == 0
+
+def parked():
+    return len({s: v for s, v in places().items() if v == 3}) > 0
+
+def target_speed():
+    if not travelling():
+        return 0
+    if hub["signal-D"] > 0:
+        return limp
+    route = {s: 1 for s, v in places().items() if v > 0} * HARDNESS
+    hardness = max(route.values())
+    return hard if hardness == 2 else medium if hardness == 1 else easy
+
+moving = False     # travelling, as of the last tick (read live by the waits below)
+
+every tick:
+    moving = travelling()
+
+every tick:
+    target = target_speed()     # live; the main loop reads it
+
+def prime():
+    # A starter dose, parked or not. If the thruster is full, the dose waits in the buffer
+    # until there's room (pump 2 gives up after TIMEOUT; the dose goes in with the next one).
+    global fill
+    global release
+    t0 = ticks()
+    fill = STARTER
+    wait until tank[FUEL] >= STARTER or ticks() - t0 >= TIMEOUT
+    fill = 0
+    t0 = ticks()
+    release = True
+    wait until tank[FUEL] <= 1 or ticks() - t0 >= TIMEOUT
+    release = False
+
+prime()
+was_travelling = False
+while True:
+    before = hub["signal-V"]
+    wait SETTLE
+    speed = hub["signal-V"]
+    goal = target
+    # Out of fuel the platform drifts at -10 (back, under halfway) or +10 (on, past halfway):
+    # below any goal and not rising, so it gets doses like a standstill.
+    if goal > 0 and speed < goal and speed <= before:
+        t0 = ticks()
+        fill = DOSE
+        wait until tank[FUEL] >= DOSE or not moving or ticks() - t0 >= TIMEOUT
+        fill = 0
+        if moving:          # arrived mid-dose: the starter dose below takes it in
+            t0 = ticks()
+            release = True
+            wait until tank[FUEL] <= 1 or not moving or ticks() - t0 >= TIMEOUT
+            release = False
+    elif was_travelling and parked():
+        prime()             # just arrived
+    was_travelling = goal > 0
+
+test "a starter dose when first switched on, parked; then nothing":
+    set hub = {NAUVIS: 3}
+    run 10 ticks
+    assert fill == STARTER and not release
+    set tank = {FUEL: 20}
+    run 30 ticks
+    assert fill == 0 and release
+    set tank = {}
+    run 30 ticks
+    assert fill == 0 and not release
+    run 1000 ticks
+    assert fill == 0 and not release
+
+test "parked: no fuel goes in":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 3}
+    run 400 ticks
+    assert fill == 0 and not release and target == 0
+
+test "parked, with other signals on the hub's wire (its contents): still parked":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 3, "iron-plate": 2, "signal-A": 2, "signal-R": 1, "signal-F": 30}
+    run 400 ticks
+    assert fill == 0 and not release and target == 0
+
+test "departing at a standstill: a dose, filled then released":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2}
+    run 160 ticks
+    assert target == 190 and fill == DOSE and not release
+    set tank = {FUEL: 35}
+    run 12 ticks
+    assert fill == 0 and release
+    set tank = {}
+    run 12 ticks
+    assert fill == 0 and not release
+
+test "routes: Aquilo is medium, the edge and the shattered planet hard, modded planets easy":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {FULGORA: 1, AQUILO: 2, "signal-V": 500}
+    run 160 ticks
+    assert target == 120
+    set hub = {AQUILO: 1, EDGE: 2, "signal-V": 500}
+    run 160 ticks
+    assert target == 60
+    set hub = {SHATTERED: 1, EDGE: 2, "signal-V": 500}
+    run 160 ticks
+    assert target == 60
+    set hub = {S("nix", type="space-location"): 1, NAUVIS: 2, "signal-V": 500}
+    run 160 ticks
+    assert target == 190
+
+test "damage: limp home":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 100, "signal-D": 3}
+    run 160 ticks
+    assert target == 30 and fill == 0
+
+test "no dose while still speeding up from the last one, or at speed":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 50}
+    run 60 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 80}
+    run 100 ticks
+    assert fill == 0
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 200}
+    run 300 ticks
+    assert fill == 0
+
+test "slowing below the target: a dose":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 180}
+    run 260 ticks
+    assert fill == DOSE
+
+test "arriving mid-dose closes both pumps":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2}
+    run 160 ticks
+    assert fill == DOSE
+    set hub = {FULGORA: 3}
+    run 12 ticks
+    assert fill == 0 and not release
+
+test "arriving: one starter dose":
+    set tank = {FUEL: 20}
+    run 30 ticks
+    set tank = {}
+    run 30 ticks
+    set hub = {NAUVIS: 1, FULGORA: 2, "signal-V": 300}
+    run 300 ticks
+    set hub = {FULGORA: 3}
+    run 300 ticks
+    assert fill == STARTER
+    set tank = {FUEL: 20}
+    run 30 ticks
+    assert fill == 0 and release
+    set tank = {}
+    run 1000 ticks
+    assert fill == 0 and not release

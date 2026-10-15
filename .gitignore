@@ -1,3 +1,4 @@
 /target
 *.bp.txt
 __pycache__/
+.knowledge-graph/

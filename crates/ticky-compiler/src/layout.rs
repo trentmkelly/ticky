@@ -406,11 +406,15 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
             row(&mut poles, n_out, block_h + 2.5);
         }
     } else {
-        // Poles one column left of the inputs.
+        // Poles one column left of the inputs, or of their controls when any sits there.
         let left_rows = inputs.len() + 1;
+        let controls_left = (0..net.entities.len()).any(|i| {
+            matches!(net.entities[i].role, Role::Control { .. }) && !opts.controls_at.iter().any(|c| c.0 == i)
+        });
+        let px = if controls_left { -4.5 } else { -3.5 };
         // A pole powers 3 rows either side of its own.
         for k in 0..left_rows.div_ceil(7).max(1) {
-            poles.push((-3.5, 7.0 * k as f64 + 3.5));
+            poles.push((px, 7.0 * k as f64 + 3.5));
         }
         // Right: output ports (or gates) just past the last core column.
         if east {
