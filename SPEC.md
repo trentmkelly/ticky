@@ -886,6 +886,14 @@ work and bundle/array operations scale far better.
   are dead on the other path and invisible outside the process), hot jump targets are copied
   more readily and cold ones never; the build is kept only if it is estimated to take fewer
   ticks on the profiled run (README, "Profile-guided builds").
+- Under `speed`, a loop whose body is one step overlaps its iterations where that makes the
+  step shorter: values that depend only on the loop's counters (variables it changes only by
+  `+= k`), on names it doesn't change, or on variables read before the body changes them
+  are computed during the previous iteration (for the first, before the loop) into hidden
+  registers. Nothing else moves, so a program sees the same values in the same order; the
+  value computed for the iteration after the last one is never used. A loop keeps this only
+  if its step gets shorter and the extra ticks before the loop are paid back within about
+  four iterations (or by the profile's counts). `TICKY_NO_MODSCHED=1` turns it off.
 - Planned: unrolling small loops and duplicating shared functions under `speed`.
 
 Whatever the mode, the compiler rewrites common shapes of code into cheaper circuits, so

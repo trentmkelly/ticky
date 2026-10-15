@@ -199,18 +199,28 @@ fn speculative_values_never_fail_checks() {
     }
 }
 
-/// No example changes (none has a loop whose step is long for a reason this pass removes:
-/// production-moments' loop is long only because of dead arithmetic, whose timing
-/// `prune_dead_stores` deliberately keeps), so their circuits are exactly as before.
+/// No example loop gets slower, and every example still passes its tests. (When this was
+/// written, none changed at all: production-moments' loop is long only because of dead
+/// arithmetic, whose timing `prune_dead_stores` deliberately keeps, and the other loops'
+/// steps are as long as their recurrences or read inputs.)
 #[test]
-fn examples_are_unchanged() {
+fn examples_never_get_slower() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "ticky")).collect();
     files.sort();
     for f in files {
         let src = std::fs::read_to_string(&f).unwrap();
-        let a = build(&src, Opt::Speed, false, false);
-        let b = build(&src, Opt::Speed, false, true);
-        assert_eq!((count(&a), loop_ticks(&a)), (count(&b), loop_ticks(&b)), "{}", f.display());
+        // `# ticky: --checks` on the first line: the tests need runtime checks.
+        let checks = src.starts_with("# ticky: --checks");
+        let a = build(&src, Opt::Speed, checks, false);
+        let b = build(&src, Opt::Speed, checks, true);
+        let (ta, tb) = (loop_ticks(&a), loop_ticks(&b));
+        assert_eq!(ta.len(), tb.len(), "{}", f.display());
+        assert!(ta.iter().zip(&tb).all(|(x, y)| y <= x), "{}: {ta:?} → {tb:?}", f.display());
+        for r in run_tests(&b, &src) {
+            assert!(r.failure.is_none(), "{}: test {} failed", f.display(), r.name);
+        }
     }
+    let src = include_str!("../../../examples/production-moments.ticky");
+    assert_eq!(pipelined(&build(src, Opt::Speed, false, true)), 0, "dead arithmetic sets that loop's step");
 }
