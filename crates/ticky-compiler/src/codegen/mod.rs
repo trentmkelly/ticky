@@ -98,6 +98,10 @@ pub struct MainStats {
     pub name: String,
     pub steps: Vec<StepStats>,
     pub combinators: usize,
+    /// Where to watch the step machine (for profiles): a combinator whose green input is the
+    /// bus, the program counter's signal (step `i` is `i + 1`, 0 halted) and the commit
+    /// pulse ANY.
+    pub probe: (EntId, Sig, Sig),
 }
 
 /// A wire network to build: its colour and the connectors on it.

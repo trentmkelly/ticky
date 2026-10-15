@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ticky_compiler::program::Ty;
-use ticky_compiler::testrun::{run_tests, Harness, PVal};
+use ticky_compiler::testrun::{raw_steps, run_tests, run_tests_profiled, Harness, PVal};
 use ticky_compiler::{compile, Compiled, Opt, Options};
 use ticky_factorio::{blueprint, SignalTable, QUALITIES};
 use ticky_syntax::ast::PortDir;
@@ -59,6 +59,13 @@ enum Cmd {
         /// Item data for Space Age (see `build --space-age`).
         #[arg(long)]
         space_age: bool,
+        /// Record a profile while the tests run: how often each step of every process ran
+        /// and which way its branches went (JSON), for `ticky build --profile FILE`.
+        #[arg(long, value_name = "FILE")]
+        profile: Option<PathBuf>,
+        /// Test the circuit `build --profile FILE` makes (can't be combined with --profile).
+        #[arg(long, value_name = "FILE", conflicts_with = "profile")]
+        use_profile: Option<PathBuf>,
     },
     /// Simulate and print output ports whenever they change.
     Sim {
@@ -84,6 +91,9 @@ enum Cmd {
         /// Item data for Space Age (see `build --space-age`).
         #[arg(long)]
         space_age: bool,
+        /// Simulate the circuit `build --profile FILE` makes.
+        #[arg(long, value_name = "FILE")]
+        profile: Option<PathBuf>,
     },
     /// Run the program in the simulator and in headless Factorio, and compare tick by tick.
     Difftest {
@@ -164,6 +174,11 @@ struct Placement {
     /// (the ports and RUN switch are just west of it). Overrides `at=` in the program.
     #[arg(long = "at", value_parser = parse_at)]
     at: Vec<(String, (i64, i64))>,
+    /// Profile-guided optimisation: a profile written by `ticky test --profile FILE`. Steps
+    /// and branches the tests ran often get fewer ticks (for more combinators), ones they
+    /// never ran stay compact. `--opt=speed` only; without it the build is unchanged.
+    #[arg(long, value_name = "FILE")]
+    profile: Option<PathBuf>,
 }
 
 fn parse_at(s: &str) -> Result<(String, (i64, i64)), String> {
@@ -244,6 +259,12 @@ fn load(file: &Path) -> Result<(String, String), ExitCode> {
     }
 }
 
+fn load_profile(p: &Path) -> Result<ticky_compiler::profile::Profile, String> {
+    let text = std::fs::read_to_string(p).map_err(|e| format!("can't read the profile: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("not JSON: {e}"))?;
+    ticky_compiler::profile::Profile::from_json(&v)
+}
+
 fn print_diags(diags: &[Diag], file: &str, src: &str) {
     for d in diags {
         eprint!("{}", d.render(file, src));
@@ -270,7 +291,14 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
             (n.clone(), side)
         })
         .collect();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, compact_outputs: place.compact_outputs, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone() };
+    let profile = match &place.profile {
+        None => None,
+        Some(p) => Some(load_profile(p).map_err(|e| {
+            eprintln!("error: {}: {e}", p.display());
+            ExitCode::FAILURE
+        })?),
+    };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, compact_outputs: place.compact_outputs, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone(), profile };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -484,7 +512,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, compact_outputs: false, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new() }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, compact_outputs: false, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new(), profile: None }
 }
 
 fn main() -> ExitCode {
@@ -509,8 +537,20 @@ fn main() -> ExitCode {
             }
         }),
         Cmd::Check { file, opt, place } => build(&file, false, opt, &place).map(|(_, src, c)| eprint!("{}", c.report(&src))),
-        Cmd::Test { file, opt, allow_unknown_signals, checks, space_age } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(name, src, c)| {
-            let results = run_tests(&c, &src);
+        Cmd::Test { file, opt, allow_unknown_signals, checks, space_age, profile, use_profile } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, profile: use_profile, ..default_place() }).and_then(|(name, src, c)| {
+            let results = match &profile {
+                None => run_tests(&c, &src),
+                Some(out) => {
+                    let (results, prof) = run_tests_profiled(&c, &src);
+                    let json = serde_json::to_string_pretty(&prof.to_json(&raw_steps(&c), &src)).unwrap();
+                    std::fs::write(out, json + "\n").map_err(|e| {
+                        eprintln!("error: can't write {}: {e}", out.display());
+                        ExitCode::FAILURE
+                    })?;
+                    eprintln!("profile written to {}", out.display());
+                    results
+                }
+            };
             if results.is_empty() {
                 eprintln!("no tests in {name}");
             }
@@ -532,7 +572,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
         }),
-        Cmd::Sim { file, opt, ticks, sets, all, allow_unknown_signals, checks, space_age } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, ..default_place() }).and_then(|(_, _, c)| {
+        Cmd::Sim { file, opt, ticks, sets, all, allow_unknown_signals, checks, space_age, profile } => build(&file, false, opt, &Placement { allow_unknown_signals, checks, space_age, profile, ..default_place() }).and_then(|(_, _, c)| {
             let sets = parse_sets(&c, &sets).map_err(|e| {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE

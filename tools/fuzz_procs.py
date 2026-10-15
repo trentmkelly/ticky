@@ -6,6 +6,9 @@ program from fuzz_programs over its own local variables a, b, c. Process k > 0 f
 for process k-1's flag and reads its result `r{k-1}` as `z`, the "write the data, then set
 the flag" pattern. Python runs the bodies one after another; the final values must match.
 
+With PGO=1 (tools/fuzz_pgo.py) the circuit is built with a profile recorded by
+`ticky test --profile` (as in fuzz_programs.py).
+
 usage: tools/fuzz_procs.py [COUNT] [SEED]
 """
 import os
@@ -18,6 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fuzz_programs import Gen, run_python  # pylint: disable=wrong-import-position
 
 TICKY = os.environ.get("TICKY", "./target/debug/ticky")
+PGO = bool(os.environ.get("PGO"))
 
 
 class ZGen(Gen):
@@ -70,11 +74,22 @@ def main():  # pylint: disable=too-many-locals
                 pre = [f"wait until f{k - 1}", f"z = r{k - 1}"] + pre
             post = [f"o{k}{v} = {v}" for v in "abc"] + [f"r{k} = a", f"f{k} = True"]
             lines += [ind + line for line in pre + body + post]
+        if PGO:
+            px, py = (x, y) if r.random() < 0.5 else (r.randint(-20, 20), r.randint(-20, 20))
+            lines += ['test "profile":', f"    set x = {px}", f"    set y = {py}", "    run 30000 ticks"]
         src = "\n".join(lines) + "\n"
         with tempfile.NamedTemporaryFile("w", suffix=".ticky", delete=False) as f:
             f.write(src)
             path = f.name
         cmd = [TICKY, "sim", path, "--ticks", "30000", f"--set=x={x}", f"--set=y={y}"]
+        if PGO:
+            prof = path + ".profile.json"
+            rec = subprocess.run([TICKY, "test", path, "--profile", prof], capture_output=True, text=True, check=False)
+            if not os.path.exists(prof):
+                failed += 1
+                print(f"PROFILE FAILURE ({path}):\n{rec.stderr}")
+                continue
+            cmd += ["--profile", prof]
         out = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if out.returncode != 0:
             failed += 1

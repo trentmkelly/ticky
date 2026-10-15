@@ -72,6 +72,46 @@ pub struct Sim<'a> {
     /// values check ranges).
     pub seed: u64,
     pub tick: u64,
+    /// State machines being profiled ([`Sim::trace_states`]).
+    traces: Vec<StateTrace>,
+}
+
+/// A profile of one state machine: a program counter `pc` (state `s` > 0, 0 = halted) and a
+/// one-tick pulse `any` on the same network when a state ends, as `ticky`'s processes have.
+/// Each pulse counts a visit to the state the counter held the tick before (the pulse tick
+/// itself may already show the next state's offset), and a transition from the previously
+/// counted state.
+#[derive(Clone, Debug)]
+pub struct StateTrace {
+    /// Entity whose green input network carries `pc` and `any`.
+    pub ent: EntId,
+    pub pc: Sig,
+    pub any: Sig,
+    prev_pc: i32,
+    last: Option<i32>,
+    /// Visits per state.
+    pub visits: HashMap<i32, u64>,
+    /// Transitions (from, to); `to` = 0: halted.
+    pub edges: HashMap<(i32, i32), u64>,
+}
+
+impl StateTrace {
+    fn observe(&mut self, pc: i32, any: i32) {
+        if any != 0 {
+            let s = self.prev_pc;
+            if s > 0 {
+                *self.visits.entry(s).or_insert(0) += 1;
+                if let Some(l) = self.last {
+                    *self.edges.entry((l, s)).or_insert(0) += 1;
+                }
+                self.last = Some(s);
+            } else {
+                // The start pulse (or a restart): no state ran.
+                self.last = None;
+            }
+        }
+        self.prev_pc = pc;
+    }
 }
 
 fn find(parent: &mut [usize], mut x: usize) -> usize {
@@ -124,6 +164,7 @@ impl<'a> Sim<'a> {
             picks: HashMap::new(),
             seed: 0x7469636b79,
             tick: 0,
+            traces: Vec::new(),
         }
     }
 
@@ -450,7 +491,33 @@ impl<'a> Sim<'a> {
             };
             self.outputs[e] = out;
         }
+        for i in 0..self.traces.len() {
+            let t = &self.traces[i];
+            let (pc, any) = (self.net_value(t.ent, Conn::InGreen, t.pc), self.net_value(t.ent, Conn::InGreen, t.any));
+            self.traces[i].observe(pc, any);
+        }
         self.tick += 1;
+    }
+
+    /// Starts profiling a state machine (see [`StateTrace`]); returns its index.
+    pub fn trace_states(&mut self, ent: EntId, pc: Sig, any: Sig) -> usize {
+        self.traces.push(StateTrace { ent, pc, any, prev_pc: 0, last: None, visits: HashMap::new(), edges: HashMap::new() });
+        self.traces.len() - 1
+    }
+
+    /// The profiles so far. A machine that has halted (its counter is 0 now) gets its last
+    /// state's transition to 0.
+    pub fn state_traces(&self) -> Vec<StateTrace> {
+        self.traces
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                if let Some(l) = t.last.filter(|_| self.net_value(t.ent, Conn::InGreen, t.pc) == 0) {
+                    *t.edges.entry((l, 0)).or_insert(0) += 1;
+                }
+                t
+            })
+            .collect()
     }
 }
 
