@@ -5,7 +5,10 @@
 //!   |     in1   with a pole column in the middle of each      out1          |
 //!   |     in2   segment                                       out2          |
 //! ```
-//! Wires are minimum spanning trees over each network's members, so every wire is short.
+//! Wires are minimum spanning trees over each network's members, so every wire is short;
+//! hops too long for one wire go through relay poles on free tiles. Afterwards (always when
+//! annealed, with `--duplicate-drivers` on the grid) cheap drivers of relayed networks may be
+//! copied next to their far members where that saves relays ([`crate::dup`]).
 
 use ticky_factorio::*;
 
@@ -19,7 +22,7 @@ fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// Prim's algorithm over points; returns edges as index pairs.
-fn mst(points: &[(f64, f64)]) -> Vec<(usize, usize)> {
+pub(crate) fn mst(points: &[(f64, f64)]) -> Vec<(usize, usize)> {
     let n = points.len();
     if n < 2 {
         return vec![];
@@ -80,6 +83,8 @@ pub struct LayoutOpts {
     pub ports_ew: bool,
     /// Experimental placement by simulated annealing instead of the grid.
     pub anneal: Option<crate::place::AnnealOpts>,
+    /// Copy cheap drivers where that saves relays ([`crate::dup`]) with the grid too.
+    pub duplicate: bool,
     /// Each screen's size (`width`, `height`) and which side of the blueprint it goes on, or
     /// its fixed top-left tile (from the top-left corner of the combinator grid).
     pub screens: Vec<(usize, usize, Side, Option<(i64, i64)>)>,
@@ -596,26 +601,20 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
         }
         net.wire(prev, (*port, Conn::InRed));
     }
-    // Relays for long hops. When a network can't get through (relays of earlier networks
-    // have taken every spot near one of its members), start again with that network first:
-    // rip-up and reroute, as chip routers do.
-    let base = net.clone();
-    let mut order: Vec<usize> = (0..nets.len()).collect();
-    let mut attempts = 0;
-    let relays = loop {
-        match relay_nets(net, &nets, &order, used.clone(), bbox) {
-            Ok(n) => break n,
-            Err((ni, msg)) => {
-                attempts += 1;
-                if attempts > 8 || order[0] == ni {
-                    return Err(Failure::NoRelayRoom(msg));
-                }
-                *net = base.clone();
-                order.retain(|&x| x != ni);
-                order.insert(0, ni);
-            }
+    // Relays for long hops.
+    let unrouted = net.clone();
+    let mut relays_per_net = route_all(net, &nets, &used, bbox)?;
+    if std::env::var_os("TICKY_DUP_STATS").is_some() {
+        eprint!("{}", crate::dup::report(net, &nets, &relays_per_net));
+    }
+    // Copies of cheap drivers where they save relays, on free tiles of the block.
+    if dup_enabled(opts) {
+        let route = |n: &mut Netlist, ns: &[crate::codegen::NetSpec], u: &std::collections::HashSet<(i64, i64)>| route_all(n, ns, u, bbox).ok();
+        let env = crate::dup::Env { used: &used, reserved: &reserved, bbox, poles: opts.poles, route: &route };
+        if let Some((routed, r)) = crate::dup::improve(&unrouted, net, &nets, &relays_per_net, &env) {
+            (*net, relays_per_net) = (routed, r);
         }
-    };
+    }
 
     let (width, height) = if ew || gates_move || screens_at || !opts.controls_at.is_empty() {
         // The bounding box of everything placed.
@@ -635,6 +634,7 @@ fn layout_with_gap(net: &mut Netlist, nets: &[crate::codegen::NetSpec], opts: &L
         let width = w as usize + 3 + if east { 3 } else { 0 } + if outs_north { 1 } else { 0 };
         (width, height)
     };
+    let relays = relays_per_net.iter().sum();
     Ok(LayoutInfo { width: width as u32, height: height as u32, poles: poles.len(), relays, carriers, gap })
 }
 
@@ -721,17 +721,56 @@ fn place_screens(net: &mut Netlist, opts: &LayoutOpts, poles: &mut Vec<(f64, f64
     true
 }
 
+/// Whether to duplicate cheap drivers to save relays ([`crate::dup`]).
+fn dup_enabled(opts: &LayoutOpts) -> bool {
+    match std::env::var("TICKY_DUP").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => opts.duplicate || opts.anneal.is_some_and(|a| a.duplicate),
+    }
+}
+
+/// Wires every network of `nets` into `net` (placed, with its poles), through relay poles
+/// on free tiles (not in `used`) where a hop is too long; the relays of each network. When a
+/// network can't get through (relays of earlier networks have taken every spot near one of
+/// its members), starts again with that network first: rip-up and reroute, as chip routers
+/// do.
+fn route_all(
+    net: &mut Netlist,
+    nets: &[crate::codegen::NetSpec],
+    used: &std::collections::HashSet<(i64, i64)>,
+    bbox: (i64, i64, i64, i64),
+) -> Result<Vec<usize>, Failure> {
+    let base = net.clone();
+    let mut order: Vec<usize> = (0..nets.len()).collect();
+    let mut attempts = 0;
+    loop {
+        match relay_nets(net, nets, &order, used.clone(), bbox) {
+            Ok(n) => return Ok(n),
+            Err((ni, msg)) => {
+                attempts += 1;
+                if attempts > 8 || order[0] == ni {
+                    return Err(Failure::NoRelayRoom(msg));
+                }
+                *net = base.clone();
+                order.retain(|&x| x != ni);
+                order.insert(0, ni);
+            }
+        }
+    }
+}
+
 /// Wires every network in `order`, through relay poles on free tiles where a hop is too long.
-/// Returns the number of relays, or the network that couldn't be routed.
+/// Returns the number of relays per network, or the network that couldn't be routed.
 fn relay_nets(
     net: &mut Netlist,
     nets: &[crate::codegen::NetSpec],
     order: &[usize],
     mut used: std::collections::HashSet<(i64, i64)>,
     bbox: (i64, i64, i64, i64),
-) -> Result<usize, (usize, String)> {
+) -> Result<Vec<usize>, (usize, String)> {
     let tile = |p: (f64, f64)| (p.0.floor() as i64, p.1.floor() as i64);
-    let mut relays = 0;
+    let mut relays = vec![0; nets.len()];
     // Poles (power, output lines) by tile, with the network on their red and green
     // connectors: a relay can use a pole whose connector of the wire's colour is free or
     // already on the same network.
@@ -794,7 +833,7 @@ fn relay_nets(
                         let id = net.add(Kind::Pole, Role::Power);
                         net.entities[id].pos = (tile.0 as f64 + 0.5, tile.1 as f64 + 0.5);
                         net.entities[id].description = Some("Ticky wire relay".into());
-                        relays += 1;
+                        relays[ni] += 1;
                         let mut taken = [None, None];
                         taken[ci] = Some(ni);
                         pole_at.insert(tile, (id, taken));
@@ -952,12 +991,41 @@ mod tests {
         spec.members.iter().all(|m| seen.contains(m))
     }
 
+    /// A constant read at both ends of the grid: with duplication, a copy at the far end
+    /// replaces the relays, the footprint stays, and every network is still connected.
+    #[test]
+    fn a_far_reader_gets_its_own_copy() {
+        let (mut net, mut nets) = converging(300, 0..0);
+        let k = net.add(Kind::Constant(ConstComb { values: vec![(Sig(1), 5)], on: true }), Role::Core);
+        // Codegen order is placement order: the constant sits after the first readers.
+        net.entities.swap(k, 3);
+        let readers = [0, 1, 2, 228, 229, 230, 231];
+        nets.push(NetSpec { red: true, members: std::iter::once((3, Conn::Red)).chain(readers.iter().map(|&r| (r, Conn::InRed))).collect() });
+        for dup in [false, true] {
+            let opts = LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, duplicate: dup, screens: vec![], controls_at: vec![] };
+            let mut placed = net.clone();
+            let info = layout(&mut placed, &nets, &opts).unwrap();
+            assert!(placed.validate(true).is_empty(), "{:?}", placed.validate(true));
+            let copies: Vec<usize> = (0..placed.entities.len()).filter(|&i| placed.entities[i].description.as_deref().is_some_and(|d| d.contains("copy"))).collect();
+            if !dup {
+                assert!(info.relays >= 2 && copies.is_empty(), "{} relays", info.relays);
+                continue;
+            }
+            assert_eq!((info.relays, copies.len()), (0, 1));
+            // The copy drives the far readers on a network of its own.
+            let far = NetSpec { red: true, members: std::iter::once((copies[0], Conn::Red)).chain(readers[3..].iter().map(|&r| (r, Conn::InRed))).collect() };
+            assert!(connected(&placed, &far));
+            let near = NetSpec { red: true, members: std::iter::once((3, Conn::Red)).chain(readers[..3].iter().map(|&r| (r, Conn::InRed))).collect() };
+            assert!(connected(&placed, &near));
+        }
+    }
+
     /// Relays that fill the grid's pole columns (fuzz_level2 seeds 3 and 11 did this with
     /// arrays read all over big programs: "no room for a wire relay"): the grid is laid out
     /// again with free columns between its segments.
     #[test]
     fn relays_get_room_in_a_crowded_grid() {
-        let opts = LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, screens: vec![], controls_at: vec![] };
+        let opts = LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, duplicate: false, screens: vec![], controls_at: vec![] };
         let (n, hubs) = (600, 270..330);
         let (base, nets) = converging(n, hubs);
         // Without the gap there is no room.
