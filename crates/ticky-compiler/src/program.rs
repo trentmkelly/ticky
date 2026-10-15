@@ -93,6 +93,9 @@ impl State {
 
     /// Hidden loop variables have names that can't be written in source.
     fn display_one(name: &str) -> String {
+        if let Some(d) = crate::modsched::display(name) {
+            return d;
+        }
         if let Some((var, rest)) = name.split_once('#') {
             if rest.starts_with('k') || rest.starts_with("end") {
                 return format!("loop counter for {}", crate::expand::display(var));
@@ -753,7 +756,7 @@ pub(crate) fn analyze_with_pipelines(m: &Module, pipeline: bool, choices: &[bool
     let mem: std::collections::HashSet<String> = screens.iter().map(|s| s.var.clone()).collect();
     let (expanded, (calls, subs)) = crate::expand::expand_module(&m, &mem)?;
     timing("expand", t);
-    let mut p = analyze_expanded(&expanded, pipeline, choices, &mem)?;
+    let mut p = crate::modsched::choose(|| analyze_expanded(&expanded, pipeline, choices, &mem))?;
     p.screens = screens;
     p.random = random;
     p.controls = controls;

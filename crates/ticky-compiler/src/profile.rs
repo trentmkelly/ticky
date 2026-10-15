@@ -208,6 +208,11 @@ pub(crate) fn guide() -> Guide {
     GUIDE.with(|g| g.get())
 }
 
+/// Whether this compilation has a profile.
+pub(crate) fn active() -> bool {
+    CURRENT.with(|c| c.borrow().is_some())
+}
+
 pub(crate) fn clear_warnings() {
     WARNINGS.with(|w| w.borrow_mut().clear());
 }

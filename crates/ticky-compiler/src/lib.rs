@@ -12,6 +12,7 @@ pub mod ir;
 pub mod layout;
 pub mod liveness;
 pub mod lower;
+pub mod modsched;
 pub mod pipeline;
 pub mod place;
 pub mod profile;
