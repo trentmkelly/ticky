@@ -47,11 +47,6 @@ impl Cg {
         self.nets[ni].members.push((e, if on_green { Conn::InGreen } else { Conn::InRed }));
     }
 
-    /// Bundle `r`'s red wire, once something reads it there.
-    pub(super) fn bred(&self, r: BRef) -> usize {
-        self.bvals[r].red.expect("bundle not read on red")
-    }
-
     /// Connects single-sided entity `e` (a lamp) to bundle `r`'s red wire.
     pub(super) fn bread_single(&mut self, r: BRef, e: EntId) {
         self.bread(r, e, false);
