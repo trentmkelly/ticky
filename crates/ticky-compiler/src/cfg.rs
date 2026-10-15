@@ -906,6 +906,8 @@ pub fn build(proc: &str, stmts: &[Stmt], subs: &[SubDef], konst: &dyn Fn(&Expr) 
         merge_hot_branches(&mut steps, e, observable);
     }
     fuse(&mut steps, &protected, est.as_mut());
+    // Overlapping loop iterations (speed only; see `crate::modsched`).
+    crate::modsched::transform(proc, &mut steps, &protected, &mut b.hidden, konst, observable);
     // Estimated runs of each step (what leaves it), to cost the decisions.
     if let Some(e) = &est {
         for (i, d) in steps.iter_mut().enumerate() {
