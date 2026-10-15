@@ -349,11 +349,18 @@ pub fn unit(name: &str, g: &Graph, srcs: &[SrcKind], states: &[crate::program::S
                 SrcKind::Ticks => ("Ticks", 0, "ticks()".to_string()),
                 SrcKind::LiveTicks => ("LiveTicks", 0, "ticks()".to_string()),
             };
+            // Own state's initial value (the validator checks the assumed interval holds
+            // from the start, and which signals a bundle register can ever hold).
+            let (init, binit) = match *k {
+                SrcKind::Own(s) if s < states.len() => (json!(states[s].init), j.vals(&states[s].binit)),
+                _ => (Value::Null, Value::Null),
+            };
             json!({
                 "kind": kind, "index": idx, "name": name,
                 "iv": iv(g.src_iv[id]),
                 "bun": g.src_bun.get(id).copied().unwrap_or(false),
                 "sig": g.src_sig.get(id).copied().unwrap_or(false),
+                "init": init, "binit": binit,
             })
         })
         .collect();
