@@ -40,11 +40,14 @@ pub struct AnnealOpts {
     pub seed: u64,
     /// Multiplies the number of moves tried.
     pub effort: f64,
+    /// Copy cheap drivers of relayed networks next to their far members when that saves
+    /// relays (see [`crate::dup`]).
+    pub duplicate: bool,
 }
 
 impl Default for AnnealOpts {
     fn default() -> Self {
-        AnnealOpts { objective: Objective::Area, seed: 1, effort: 1.0 }
+        AnnealOpts { objective: Objective::Area, seed: 1, effort: 1.0, duplicate: true }
     }
 }
 

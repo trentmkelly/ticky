@@ -5,6 +5,7 @@ pub mod cfg;
 pub mod display;
 pub mod codegen;
 pub mod consteval;
+pub mod dup;
 pub mod expand;
 pub mod fuse;
 pub mod ir;
@@ -84,6 +85,9 @@ pub struct Options {
     pub ports_ew: bool,
     /// Experimental: place combinators by simulated annealing instead of the grid.
     pub anneal: Option<place::AnnealOpts>,
+    /// With the grid too: copy cheap drivers of far-flung networks where that saves relays
+    /// (annealed placement does this unless `AnnealOpts::duplicate` is off; see [`dup`]).
+    pub duplicate_drivers: bool,
     /// Don't warn about signal names the compiler doesn't know (e.g. from mods).
     pub allow_unknown_signals: bool,
     /// Internal wiring uses the quality variants (uncommon to legendary) of signals, leaving
@@ -102,7 +106,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, compact_outputs: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new() }
+        Options { autostart: false, opt: Opt::Speed, label: String::new(), poles: true, outputs_west: false, compact_outputs: false, ports_ew: false, anneal: None, allow_unknown_signals: false, quality: true, checks: false, screen_sides: Vec::new(), space_age: false, at: Vec::new(), duplicate_drivers: false }
     }
 }
 
@@ -206,7 +210,7 @@ fn compile_module(module: &ticky_syntax::ast::Module, opts: &Options, pipeline: 
             Some((k, at_of(&c.name, c.at)?))
         })
         .collect();
-    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal, screens, controls_at };
+    let lo = layout::LayoutOpts { poles: opts.poles, outputs_west: opts.outputs_west, ports_ew: opts.ports_ew, anneal: opts.anneal, duplicate: opts.duplicate_drivers, screens, controls_at };
     // Fixed peripherals mustn't overlap each other.
     let mut fixed: Vec<(String, Span, std::collections::HashSet<(i64, i64)>)> = Vec::new();
     for (k, s) in program.screens.iter().enumerate() {

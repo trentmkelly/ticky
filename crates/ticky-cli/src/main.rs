@@ -140,6 +140,10 @@ struct Placement {
     /// With `--place=anneal`: how hard to try (1 = default; more is slower and usually better).
     #[arg(long, default_value_t = 1.0)]
     effort: f64,
+    /// Copy a cheap combinator that feeds far-apart places next to each, where that saves
+    /// more wire relays than it adds (always done with `--place=anneal`).
+    #[arg(long)]
+    duplicate_drivers: bool,
     /// Don't warn about item/recipe/signal names Ticky doesn't know (modded names).
     #[arg(long)]
     allow_unknown_signals: bool,
@@ -189,7 +193,7 @@ impl Placement {
             (None, Some(h)) => Objective::MaxHeight(h),
             (None, None) => Objective::Area,
         };
-        Some(AnnealOpts { objective, seed: self.seed, effort: self.effort })
+        Some(AnnealOpts { objective, seed: self.seed, effort: self.effort, ..Default::default() })
     }
 }
 
@@ -270,7 +274,7 @@ fn build(file: &Path, autostart: bool, opt: Opt, place: &Placement) -> Result<(S
             (n.clone(), side)
         })
         .collect();
-    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, compact_outputs: place.compact_outputs, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone() };
+    let opts = Options { autostart, label, opt, poles: !place.no_poles, outputs_west, compact_outputs: place.compact_outputs, ports_ew, anneal: place.anneal(), allow_unknown_signals: place.allow_unknown_signals, quality: !place.no_quality, checks: place.checks, screen_sides, space_age: place.space_age, at: place.at.clone(), duplicate_drivers: place.duplicate_drivers };
     match compile(&src, &opts) {
         Ok(c) => {
             print_diags(&c.warnings, &name, &src);
@@ -484,7 +488,7 @@ fn job_lua(c: &Compiled, sets: &[(u64, usize, PVal)], ticks: u64) -> String {
 }
 
 fn default_place() -> Placement {
-    Placement { no_poles: false, ports: "ns".into(), outputs: None, compact_outputs: false, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new() }
+    Placement { no_poles: false, ports: "ns".into(), outputs: None, compact_outputs: false, place: "grid".into(), max_width: None, max_height: None, seed: 1, effort: 1.0, allow_unknown_signals: false, no_quality: false, checks: false, displays: Vec::new(), space_age: false, at: Vec::new(), duplicate_drivers: false }
 }
 
 fn main() -> ExitCode {

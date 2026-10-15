@@ -77,6 +77,7 @@ ticky build prog.ticky --ports=ew --outputs=north   # all ports in one row along
 ticky build prog.ticky --ports=ew       # inputs along the north edge, outputs along the south edge
 ticky build prog.ticky --place=anneal   # experimental: smaller footprint by simulated annealing
 ticky build prog.ticky --place=anneal --max-width 30   # ... at most 30 tiles wide (or --max-height)
+ticky build prog.ticky --duplicate-drivers   # copy cheap combinators next to far readers when that saves relays
 ticky build prog.ticky --allow-unknown-signals         # no warnings for modded item/recipe names
 ticky build prog.ticky --no-quality    # for games without the Quality mod (see below)
 ticky build prog.ticky --checks        # runtime checks: error lamp + `error` code output
@@ -137,7 +138,10 @@ The Python script rechecks the committed answers using the installed OpenSSL.
 
 - **Power:** the blueprint includes medium electric poles; connect one to your network. With
   `--no-poles` it has none and you power it yourself. Poles labelled "Ticky wire relay" carry
-  long circuit wires and are always included.
+  long circuit wires and are always included. With `--place=anneal` (or `--duplicate-drivers`)
+  a cheap combinator whose readers are far apart may be copied next to the far ones instead
+  (described "… (copy, saves wire relays)"); only where that saves more relays than it adds,
+  so the blueprint gets no bigger. The copy computes the same value on the same tick.
 - **RUN switch:** the constant combinator at the top left. It is saved **off**, so bots can finish
   building first. Turn it on to start the program; turning it off stops and resets it.
 - **Inputs:** combinators down the left edge, under the RUN switch, in declaration order. Connect a
