@@ -23,7 +23,7 @@ fn with_and_without(src: &str) -> (Compiled, Compiled) {
     }
     let mut cg = codegen::codegen(&p, false, false).unwrap();
     // Layout connects the wires.
-    let lo = layout::LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, screens: Vec::new(), controls_at: Vec::new() };
+    let lo = layout::LayoutOpts { poles: true, outputs_west: false, ports_ew: false, anneal: None, duplicate: false, screens: Vec::new(), controls_at: Vec::new() };
     layout::layout(&mut cg.netlist, &cg.nets, &lo).unwrap();
     let mut old = compile(src, &Options::default()).unwrap();
     old.cg = cg;
