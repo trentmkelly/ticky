@@ -225,10 +225,16 @@ EMPTY = Bundle()
 | `a * b`, `a // b`, `a % b`, `a & b`, … | Per-signal over the signals present in **both** | Missing operand is 0 |
 | `a * k`, `a // k`, `a + k`, … (`k` an `int`) | Applied to each **present** signal | `a + 5` does *not* create signals that were missing |
 | `-a` | Per-signal negation | |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | 1 on each signal of the **union** where the comparison holds | One decider; missing is 0, so no overflow |
+| `a < k`, `k <= a`, … (`k` an `int`) | 1 on each **present** signal where it holds | One decider |
 
 The "present signals only" rule for scalar operators is Factorio's `Each` semantics. It is the
 main gotcha, so the compiler should warn on `bundle + nonzero_scalar` and `scalar - bundle`
 (e.g. `500 - stock`), and suggest a target bundle such as `WANT - stock` as in §2.
+
+`==` and `!=` compare whole bundles and give a `bool`; the ordering comparisons work signal by
+signal and give a bundle of 1s (a mask: multiply by it, or use it as a filter). They can't be
+chained. A signal missing from both sides is never in the result, even where `0 <= 0` holds.
 
 #### 4.3.3 Filtering and mapping
 
@@ -280,8 +286,9 @@ doesn't depend on how many signals the bundle has.
   (`Bundle(stone=-4000 if low else 0)`); `S(...)` signal constants (`FUEL = S("nt-fuel")`).
 - Element writes: `b[sig] = x`, `b["name"] = x`, `b[sig] += x` (only that signal changes).
 - Arithmetic: bundle `op` bundle (union), bundle `op` number and number `op` bundle (signals
-  present only, with a warning for `+`/`-`), unary `-`, `==`/`!=` between bundles, `x if c else
-  y`, truthiness (non-empty), augmented assignment.
+  present only, with a warning for `+`/`-`), unary `-`, `==`/`!=` between bundles, per-signal
+  `<`/`<=`/`>`/`>=` (a bundle of 1s, §4.3.2), `x if c else y`, truthiness (non-empty),
+  augmented assignment.
 - Reads: `b[sig]`, `b["name"]`, `b.name`, `b.get(sig, default)`, `sig in b`, `len(b)`,
   `b.total()`, `sum(b.values())`, `max(b.values())`, `min(b.values())` (0 for an empty bundle).
 - Comprehensions `{s: value for s, v in b.items() if cond …}`: `value` and `cond` may use `v`,

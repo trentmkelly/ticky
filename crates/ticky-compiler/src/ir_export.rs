@@ -162,6 +162,7 @@ impl J {
             BTerm::Map(op, b, k) => json!(["Map", ar(*op), b, k]),
             BTerm::RMap(op, k, b) => json!(["RMap", ar(*op), k, b]),
             BTerm::Zip(op, a, b) => json!(["Zip", ar(*op), a, b]),
+            BTerm::ZCmp(op, a, b) => json!(["ZCmp", cmp(*op), a, b]),
             BTerm::One(s, x) => json!(["One", self.sig(*s), x]),
             BTerm::Set(b, s, x) => json!(["Set", b, self.sig(*s), x]),
             BTerm::Filter(b, d, o) => json!(["Filter", b, self.bdnf(d), out(o)]),

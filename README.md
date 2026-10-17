@@ -19,7 +19,7 @@ sequential code (`while`, `for`, `if`, `break`/`continue`, `wait until`, `wait n
 with functions (`def`, defaults, keyword arguments, tuple returns), arrays (`[0] * 8`,
 indexing, comprehensions, `sum`/`min`/`max`/`sorted`; arrays indexed at runtime live on
 signals, SPEC §4.4), **bundles** (everything on a wire as one value, with element-wise
-arithmetic, dict comprehensions and reductions, SPEC §4.3), concurrent **processes**
+arithmetic and comparisons, dict comprehensions and reductions, SPEC §4.3), concurrent **processes**
 (`process name:`, SPEC §9.2), runtime checks (`--checks`, SPEC §13) and runtime **signals**
 (`b.argmax()`, `Signal` ports and variables, `for s, v in b.items():`, SPEC §4.2, §4.3.4).
 

@@ -137,6 +137,19 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                         let (a, b) = (g.unsig(left), g.unsig(r));
                         Some(bundle::equal(g, a, b, *op == ast::CmpOp::Eq))
                     }
+                    // Per-signal: a bundle of 1s where the comparison holds.
+                    ast::CmpOp::Lt | ast::CmpOp::Gt | ast::CmpOp::Le | ast::CmpOp::Ge if kl == Kind::Bundle || kr == Kind::Bundle => {
+                        if rest.len() > 1 {
+                            return Err(Diag::error(e.span, "bundle comparisons can't be chained").with_help("compare two at a time; the result is a bundle of 1s"));
+                        }
+                        let op = match op {
+                            ast::CmpOp::Lt => CmpOp::Lt,
+                            ast::CmpOp::Gt => CmpOp::Gt,
+                            ast::CmpOp::Le => CmpOp::Le,
+                            _ => CmpOp::Ge,
+                        };
+                        Some(bundle::compare(g, op, left, r, e.span)?)
+                    }
                     _ => None,
                 };
                 let c = match special {
@@ -146,8 +159,8 @@ pub fn expr(g: &mut Graph, names: &mut dyn Names, e: &Expr) -> Result<V, Diag> {
                             return Err(Diag::error(e.span, "signals can only be compared with `==` and `!=` (with other signals)"));
                         }
                         if kl == Kind::Bundle || kr == Kind::Bundle {
-                            return Err(Diag::error(e.span, "bundles can only be compared with `==` and `!=`")
-                                .with_help("to compare each signal, use a comprehension, e.g. `{s: v for s, v in b.items() if v > 10}`"));
+                            return Err(Diag::error(e.span, "bundles can't be compared with this operator")
+                                .with_help("`==`/`!=` compare whole bundles; `<`, `<=`, `>`, `>=` compare signal by signal"));
                         }
                         let (l, rr) = (bundle::int(g, left, left_span)?, bundle::int(g, r, right.span)?);
                         let op = match op {

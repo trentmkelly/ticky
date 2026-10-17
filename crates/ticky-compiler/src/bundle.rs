@@ -242,6 +242,28 @@ fn each_scalar_warning(g: &Graph, op: ArOp, k: V, span: Span) {
     }
 }
 
+/// `a < b` etc. with at least one bundle: 1 on every signal where the comparison holds.
+/// Two bundles compare over the union of their signals (missing = 0); a bundle and a
+/// number compare the bundle's present signals only, like arithmetic.
+pub fn compare(g: &mut Graph, op: CmpOp, a: V, b: V, span: Span) -> Result<V, Diag> {
+    let (ka, kb) = (kind(g, a), kind(g, b));
+    if ka.is_signal() || kb.is_signal() {
+        return Err(Diag::error(span, "signals can only be compared with `==` and `!=` (with other signals)"));
+    }
+    let lit = |op, k| vec![vec![BLit { op, a: BOp::Each, b: BOp::Val(k) }]];
+    Ok(match (ka, kb) {
+        (Kind::Bundle, Kind::Bundle) => g.bun(vec![BTerm::ZCmp(op, a, b)]),
+        (Kind::Bundle, _) => {
+            let k = int(g, b, span)?;
+            g.bun(vec![BTerm::Filter(a, lit(op, k), FOut::Const(1))])
+        }
+        _ => {
+            let k = int(g, a, span)?;
+            g.bun(vec![BTerm::Filter(b, lit(op.flip(), k), FOut::Const(1))])
+        }
+    })
+}
+
 /// `a == b` / `a != b` on bundles: equal when their difference has no signals.
 pub fn equal(g: &mut Graph, a: V, b: V, eq: bool) -> V {
     let d = g.bun(vec![BTerm::Zip(ArOp::Sub, a, b)]);

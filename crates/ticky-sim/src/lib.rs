@@ -731,6 +731,13 @@ mod wildcard_tests {
             outputs: vec![out("signal-each", true, 1, r)],
         };
         assert_eq!(probe(Kind::Decider(d), arr, &[("copper-plate", 1)]), v(&[("coal", 9), ("iron-plate", 5)]));
+        // Z1/Z2 bundle comparisons: each(red) op each(green) -> each = 1, over both inputs' signals
+        // (expected values, not yet confirmed by the probe scenario)
+        let za: &[(&str, i32)] = &[("iron-plate", 5), ("copper-plate", 3), ("coal", -7), ("stone", 7)];
+        let zb: &[(&str, i32)] = &[("iron-plate", 5), ("copper-plate", 9), ("coal", 2), ("wood", -1)];
+        let zc = |op| Kind::Decider(Decider { conds: vec![cond("signal-each", r, op, s("signal-each"), g, true)], outputs: vec![out("signal-each", false, 1, b)] });
+        assert_eq!(probe(zc(CmpOp::Lt), za, zb), v(&[("coal", 1), ("copper-plate", 1)]));
+        assert_eq!(probe(zc(CmpOp::Ge), za, zb), v(&[("iron-plate", 1), ("stone", 1), ("wood", 1)]));
         // L4/L5 each >> 1 -> X: arithmetic shift, summed
         let shr = || ar(s("signal-each"), r, ArOp::Shr, k(1), b, "signal-X");
         assert_eq!(probe(shr(), &[("iron-plate", -5)], &[]), v(&[("signal-X", -3)]));

@@ -113,6 +113,18 @@ script.on_event(defines.events.on_tick, function(e)
       {conditions = {{first_signal = EACH, first_signal_networks = RED, constant = 0, comparator = "≠"},
         {first_signal = EACH, first_signal_networks = GREEN, constant = 0, comparator = "=", compare_type = "and"}},
        outputs = {{signal = EACH, copy_count_from_input = true, networks = RED}}}, arr, {{I("copper-plate"), 1}})
+    -- Bundle comparisons (`a < b`): `each` on both sides of one decider condition.
+    local za = {{I("iron-plate"), 5}, {I("copper-plate"), 3}, {I("coal"), -7}, {I("stone"), 7}}
+    local zb = {{I("iron-plate"), 5}, {I("copper-plate"), 9}, {I("coal"), 2}, {I("wood"), -1}}
+    local okz, errz = pcall(function()
+      t("Z1 each(red) < each(green) -> each 1", "decider-combinator",
+        {conditions = {{first_signal = EACH, first_signal_networks = RED, second_signal = EACH, second_signal_networks = GREEN, comparator = "<"}},
+         outputs = {{signal = EACH, copy_count_from_input = false, constant = 1}}}, za, zb)
+      t("Z2 each(red) >= each(green) -> each 1", "decider-combinator",
+        {conditions = {{first_signal = EACH, first_signal_networks = RED, second_signal = EACH, second_signal_networks = GREEN, comparator = "≥"}},
+         outputs = {{signal = EACH, copy_count_from_input = false, constant = 1}}}, za, zb)
+    end)
+    if not okz then log("Z error: " .. tostring(errz)) end
     t("L4 each >> 1 -> X (single -5)", "arithmetic-combinator",
       {first_signal = EACH, first_signal_networks = RED, second_constant = 1, operation = ">>", output_signal = V("signal-X")}, {{I("iron-plate"), -5}}, nil)
     t("L5 each >> 1 -> X (7, -5)", "arithmetic-combinator",

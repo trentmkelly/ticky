@@ -116,6 +116,10 @@ impl Cg {
                             };
                             (Kind::Arith(ar), vec![(a, false), (b, true)], false, "signal by signal")
                         }
+                        BTerm::ZCmp(op, a, b) => {
+                            let cond = Cond { first: each, first_nets: Nets::RED, second: Operand::Sig(each), second_nets: Nets::GREEN, cmp: op, and: true };
+                            (dec(vec![cond], vec![out_const(each, 1)]), vec![(a, false), (b, true)], false, "compare signal by signal")
+                        }
                         BTerm::Set(b, sig, x) => {
                             let (o, n) = scal(x);
                             let a = Arith { first: o, first_nets: n, second: Operand::Sig(sig), second_nets: Nets::RED, op: ArOp::Sub, out: sig };

@@ -180,7 +180,7 @@ def bdnf_nodes(d):
 
 def term_operands(t):
     k = t[0]
-    if k in ("Map", "RMap", "Zip"):
+    if k in ("Map", "RMap", "Zip", "ZCmp"):
         return [t[2], t[3]]
     if k in ("One", "Shift"):
         return [t[2]]
@@ -352,7 +352,7 @@ class Export:
                 k = t[0]
                 if k in ("Map", "RMap"):
                     ts = self.sup(t[2] if k == "Map" else t[3], own, memo)
-                elif k == "Zip":
+                elif k in ("Zip", "ZCmp"):
                     ts = union(self.sup(t[2], own, memo), self.sup(t[3], own, memo))
                 elif k in ("Filter", "DFilter", "Hot", "HotEq"):
                     ts = self.sup(t[1], own, memo)
@@ -537,6 +537,9 @@ class Unit:
         if tag == "Zip":
             a, b = self.bundle(t[2]), self.bundle(t[3])
             return {s: z3.If(z3.Or(a[s] != 0, b[s] != 0), self.ar(t[1], a[s], b[s]), ZERO) for s in U}
+        if tag == "ZCmp":  # decider `each(red) op each(green) -> 1` over both bundles' signals
+            a, b = self.bundle(t[2]), self.bundle(t[3])
+            return {s: z3.If(z3.And(z3.Or(a[s] != 0, b[s] != 0), cmpb(t[1], a[s], b[s])), ONE, ZERO) for s in U}
         if tag == "One":
             x = self.scalar(t[2])
             return {s: (x if s == t[1] else ZERO) for s in U}

@@ -404,6 +404,7 @@ impl<'g> Fuser<'g> {
             BTerm::Map(op, b, k) => BTerm::Map(op, self.rebuild(b), self.rebuild(k)),
             BTerm::RMap(op, k, b) => BTerm::RMap(op, self.rebuild(k), self.rebuild(b)),
             BTerm::Zip(op, a, b) => BTerm::Zip(op, self.rebuild(a), self.rebuild(b)),
+            BTerm::ZCmp(op, a, b) => BTerm::ZCmp(op, self.rebuild(a), self.rebuild(b)),
             BTerm::One(s, x) => {
                 // The combinator that computes `x` can write the bundle's signal itself.
                 let x = self.rebuild(x);

@@ -78,6 +78,8 @@ pub enum BTerm {
     RMap(ArOp, V, V),
     /// `each(a) op each(b)` over the union of the two bundles' signals.
     Zip(ArOp, V, V),
+    /// `each(a) op each(b) → 1` over the union of the two bundles' signals (missing = 0).
+    ZCmp(CmpOp, V, V),
     /// A single signal carrying a scalar's value.
     One(Sig, V),
     /// `x - b[s]` on signal `s`: next to a copy of `b`, sets `s` to `x` (one arithmetic
@@ -193,7 +195,7 @@ impl Op {
 impl BTerm {
     pub fn operands(&self) -> Vec<V> {
         match self {
-            BTerm::Map(_, a, b) | BTerm::RMap(_, a, b) | BTerm::Zip(_, a, b) => vec![*a, *b],
+            BTerm::Map(_, a, b) | BTerm::RMap(_, a, b) | BTerm::Zip(_, a, b) | BTerm::ZCmp(_, a, b) => vec![*a, *b],
             BTerm::One(_, x) => vec![*x],
             BTerm::Set(b, _, x) => vec![*b, *x],
             BTerm::Filter(b, d, _) | BTerm::DFilter(_, b, d, _) => {
@@ -346,6 +348,7 @@ fn bun_interval(terms: &[BTerm], iv: &impl Fn(V) -> Iv, konst: &impl Fn(V) -> Op
             BTerm::Map(op, b, k) => ar_interval(op, iv(b), iv(k), konst(k)),
             BTerm::RMap(op, k, b) => ar_interval(op, iv(k), iv(b), None),
             BTerm::Zip(op, a, b) => ar_interval(op, read(a), read(b), None),
+            BTerm::ZCmp(..) => Iv::k(1),
             BTerm::One(_, x) => iv(x),
             BTerm::Set(b, _, x) => ar_interval(ArOp::Sub, iv(x), read(b), None),
             BTerm::Filter(b, _, FOut::Copy) | BTerm::DFilter(b, _, _, FOut::Copy) => iv(b),
@@ -1194,6 +1197,13 @@ impl Graph {
                 sigs.sort();
                 sigs.dedup();
                 normalize(sigs.into_iter().map(|s| (s, op.apply(bval(x, s), bval(y, s)))))
+            }
+            BTerm::ZCmp(op, x, y) => {
+                let (x, y) = (b(*x)?, b(*y)?);
+                let mut sigs: Vec<Sig> = x.iter().chain(y.iter()).map(|(s, _)| *s).collect();
+                sigs.sort();
+                sigs.dedup();
+                normalize(sigs.into_iter().filter(|s| op.apply(bval(x, *s), bval(y, *s))).map(|s| (s, 1)))
             }
             BTerm::One(s, x) => normalize([(*s, k(*x)?)]),
             BTerm::Set(x, s, v) => normalize([(*s, k(*v)?.wrapping_sub(bval(b(*x)?, *s)))]),

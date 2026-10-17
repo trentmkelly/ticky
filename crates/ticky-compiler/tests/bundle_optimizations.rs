@@ -113,3 +113,47 @@ test "zero intermediates and missing lanes":
     assert_eq!(made(&c, "each with a number"), 2, "remainder and final OR");
     assert_eq!(made(&c, "signal by signal"), 1, "restoring +11");
 }
+
+#[test]
+fn bundle_comparisons_are_one_decider_per_signal() {
+    let src = r#"input a: Bundle
+input b: Bundle
+input k: int @ K
+output lt: Bundle
+output ge: Bundle
+output small: Bundle
+output big: Bundle
+output n: int @ N
+every 60 ticks:
+    lt = a < b
+    ge = a >= b
+    small = a < k
+    big = k < a
+    n = len(a < b)
+test "values":
+    set a = {"iron-plate": 5, "copper-plate": 3, "coal": -2147483647, "stone": 7}
+    set b = {"iron-plate": 5, "copper-plate": 9, "coal": 2147483647, "wood": -1}
+    set k = 4
+    run 180 ticks
+    assert lt == {"copper-plate": 1, "coal": 1}
+    assert ge == {"iron-plate": 1, "stone": 1, "wood": 1}
+    assert small == {"copper-plate": 1, "coal": 1}
+    assert big == {"iron-plate": 1, "stone": 1}
+    assert n == 2
+    set a = {}
+    set b = {}
+    run 180 ticks
+    assert lt == {} and ge == {} and small == {} and n == 0
+"#;
+    let c = checked(src);
+    // No wrapping difference: `a < b` and `a >= b` are one decider each.
+    assert_eq!(made(&c, "compare signal by signal"), 2);
+    assert_eq!(made(&c, "signal by signal") - made(&c, "compare signal by signal"), 0);
+}
+
+#[test]
+fn bundle_comparisons_reject_chains() {
+    let src = "input a: Bundle\ninput b: Bundle\noutput y: Bundle\nevery tick:\n    y = a < b < a\n";
+    let e = compile(src, &Options::default()).err().expect("chained bundle comparison compiled");
+    assert!(e[0].message.contains("can't be chained"), "{}", e[0].message);
+}

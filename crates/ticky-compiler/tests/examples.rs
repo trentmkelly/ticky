@@ -96,7 +96,9 @@ fn helpful_errors() {
     // Bundles.
     let b = "input b: Bundle\noutput o: Bundle\noutput y: int\n";
     assert!(error_of(&format!("{b}every tick:\n    y = b\n")).contains("is a number, but this value is a bundle"));
-    assert!(error_of(&format!("{b}every tick:\n    y = b < 5\n")).contains("only be compared with `==`"));
+    // `b < 5` is a per-signal bundle of 1s, not a number.
+    assert!(error_of(&format!("{b}every tick:\n    y = b < 5\n")).contains("is a number, but this value is a bundle"));
+    assert!(error_of(&format!("{b}every tick:\n    o = 0 < b < 5\n")).contains("can't be chained"));
     assert!(error_of(&format!("{b}every tick:\n    o = {{s: v for s, v in b.items() if s > 3}}\n")).contains("can only be used as the key"));
     assert!(error_of(&format!("{b}def f(x):\n    return x\nevery tick:\n    o = {{s: f(v) for s, v in b.items()}}\n")).contains("can't be called inside"));
     assert!(error_of("input b: Bundle @ A\n").contains("no `@ signal`"));
