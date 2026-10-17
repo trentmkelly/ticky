@@ -16,7 +16,20 @@ export interface Entity {
   y: number;
   w: number;
   h: number;
+  /** 0 north, 1 east, 2 south, 3 west. */
+  dir: number;
+  /** What a combinator's display shows (the game's symbol sprite name), if anything. */
+  symbol: string | null;
   description: string | null;
+}
+
+export interface Wire {
+  a: number;
+  b: number;
+  colour: "red" | "green";
+  /** Which terminal each end uses: "in", "out", or "" for one-terminal entities. */
+  as: string;
+  bs: string;
 }
 
 export interface CompileResult {
@@ -25,7 +38,7 @@ export interface CompileResult {
   report?: string;
   blueprint?: string;
   stats?: { combinators: number; entities: number; width: number; height: number; poles: number; relays: number };
-  circuit?: { entities: Entity[]; wires: { a: number; b: number; colour: "red" | "green" }[] };
+  circuit?: { entities: Entity[]; wires: Wire[] };
 }
 
 export interface TestResult {

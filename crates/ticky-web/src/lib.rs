@@ -7,7 +7,8 @@
 use serde_json::{json, Value};
 use ticky_compiler::testrun::run_tests;
 use ticky_compiler::{compile as compile_src, Compiled, Opt, Options};
-use ticky_factorio::Conn;
+use ticky_factorio::netlist::{Dir, Kind, Selector};
+use ticky_factorio::{ArOp, CmpOp, Conn};
 use ticky_syntax::diag::Severity;
 use ticky_syntax::Diag;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -75,6 +76,52 @@ fn diag(d: &Diag, src: &str) -> Value {
     })
 }
 
+/// What a combinator's display shows (the game's `*_symbol_sprites` names, without the suffix).
+fn symbol(k: &Kind) -> Option<&'static str> {
+    Some(match k {
+        Kind::Arith(a) => match a.op {
+            ArOp::Add => "plus",
+            ArOp::Sub => "minus",
+            ArOp::Mul => "multiply",
+            ArOp::Div => "divide",
+            ArOp::Mod => "modulo",
+            ArOp::Pow => "power",
+            ArOp::Shl => "left_shift",
+            ArOp::Shr => "right_shift",
+            ArOp::And => "and",
+            ArOp::Or => "or",
+            ArOp::Xor => "xor",
+        },
+        Kind::Decider(d) => match d.conds.first()?.cmp {
+            CmpOp::Gt => "greater",
+            CmpOp::Lt => "less",
+            CmpOp::Eq => "equal",
+            CmpOp::Ne => "not_equal",
+            CmpOp::Le => "less_or_equal",
+            CmpOp::Ge => "greater_or_equal",
+        },
+        Kind::Selector(s) => match s {
+            Selector::Select { max: true, .. } | Selector::SelectAt { max: true, .. } => "max",
+            Selector::Select { .. } | Selector::SelectAt { .. } => "min",
+            Selector::Count { .. } => "count",
+            Selector::Random { .. } => "random",
+            Selector::StackSize => "stack_size",
+            Selector::RocketCapacity => "rocket_capacity",
+            Selector::QualityFilter { .. } | Selector::QualitySet { .. } => "quality",
+        },
+        _ => return None,
+    })
+}
+
+/// Which of a combinator's terminals a wire end uses: `"in"`, `"out"`, or `""` (one terminal).
+fn side(c: Conn) -> &'static str {
+    match c {
+        Conn::InRed | Conn::InGreen => "in",
+        Conn::OutRed | Conn::OutGreen => "out",
+        _ => "",
+    }
+}
+
 /// The placed circuit, for drawing: entities (centre, size, kind, what made them) and wires
 /// between their centres.
 fn circuit(c: &Compiled) -> Value {
@@ -83,9 +130,16 @@ fn circuit(c: &Compiled) -> Value {
         .map(|i| {
             let e = &net.entities[i];
             let (w, h) = net.footprint(i);
+            let dir = match e.dir {
+                Dir::North => 0,
+                Dir::East => 1,
+                Dir::South => 2,
+                Dir::West => 3,
+            };
             json!({
                 "name": e.kind.proto_name(),
-                "x": e.pos.0, "y": e.pos.1, "w": w, "h": h,
+                "x": e.pos.0, "y": e.pos.1, "w": w, "h": h, "dir": dir,
+                "symbol": symbol(&e.kind),
                 "description": e.description,
             })
         })
@@ -99,7 +153,7 @@ fn circuit(c: &Compiled) -> Value {
                 (Conn::InRed | Conn::OutRed | Conn::Red, _) => "red",
                 _ => "green",
             };
-            Some(json!({ "a": w.a.0, "b": w.b.0, "colour": colour }))
+            Some(json!({ "a": w.a.0, "b": w.b.0, "colour": colour, "as": side(w.a.1), "bs": side(w.b.1) }))
         })
         .collect();
     json!({ "entities": entities, "wires": wires })
@@ -174,7 +228,11 @@ mod tests {
         assert_eq!(c["ok"], true, "{c}");
         assert!(c["blueprint"].as_str().unwrap().starts_with('0'));
         assert!(c["stats"]["combinators"].as_u64().unwrap() >= 1);
-        assert!(!c["circuit"]["entities"].as_array().unwrap().is_empty());
+        let es = c["circuit"]["entities"].as_array().unwrap();
+        // The doubling combinator shows `*`; wires name the terminals they use.
+        assert!(es.iter().any(|e| e["name"] == "arithmetic-combinator" && e["symbol"] == "multiply" && e["dir"].is_u64()), "{es:?}");
+        let wires = c["circuit"]["wires"].as_array().unwrap();
+        assert!(wires.iter().any(|w| w["as"] == "in" || w["bs"] == "in"), "{wires:?}");
         let t: Value = serde_json::from_str(&test(SRC, r#"{"opt":"size"}"#)).unwrap();
         assert_eq!(t["tests"][0]["passed"], true, "{t}");
     }

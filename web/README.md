@@ -17,5 +17,9 @@ npm run build     # dist/
 
 - `crates/ticky-web`: `compile(src, options)` and `test(src, options)`, JSON in and out.
 - `src/worker.ts`: the compiler runs in a Web Worker (restarted after a panic or a 60 s build).
-- `src/ticky-lang.ts`: syntax highlighting; `src/circuit.ts`: the circuit drawing.
+- `src/ticky-lang.ts`: syntax highlighting; `src/circuit.ts`: the circuit drawing, with the
+  game's graphics from `public/sprites/` (checked in). `scripts/build-sprites.py [DATA_DIR]`
+  remakes them from a Factorio install (needs Pillow): it slices the frames used and reads
+  sprite offsets, display symbols and wire terminals from the game's prototype files.
+  Graphics © Wube Software.
 - The examples menu reads `../examples/*.ticky` at build time (the list is in `src/main.ts`).

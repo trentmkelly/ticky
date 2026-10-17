@@ -1,17 +1,7 @@
-// Draws the placed circuit: one box per entity (as it sits in the blueprint) and its red and
-// green wires. Hovering a box shows what it is and what made it.
+// Draws the placed circuit with the game's own graphics (sliced by scripts/build-sprites.py):
+// shadows, then entities back to front with their display symbols, then red and green wires
+// between the real terminals. Hovering an entity shows what it is and what made it.
 import type { CompileResult, Entity } from "./compiler";
-
-const COLOURS: Record<string, string> = {
-  "arithmetic-combinator": "#3b82c4",
-  "decider-combinator": "#d4892a",
-  "selector-combinator": "#9a5cc6",
-  "constant-combinator": "#7a8288",
-  "medium-electric-pole": "#6b4f35",
-  "small-lamp": "#d8c64a",
-  "programmable-speaker": "#4aa58a",
-  "display-panel": "#5a7fa0",
-};
 
 const LABELS: Record<string, string> = {
   "arithmetic-combinator": "arithmetic",
@@ -20,18 +10,63 @@ const LABELS: Record<string, string> = {
   "constant-combinator": "constant",
   "medium-electric-pole": "pole",
   "small-lamp": "lamp",
+  "programmable-speaker": "speaker",
+  "display-panel": "display panel",
 };
+
+/** Where a frame of a sheet lands, in tiles from the entity's centre. */
+interface Frame { file: string; x: number; y: number; w: number; h: number; dx: number; dy: number; dw: number; dh: number }
+type Point = [number, number];
+/** Per entity: terminal ("in", "out", or "") → per direction → wire colour → point. */
+type Connections = Record<string, Record<string, Record<string, Point | null>[]>>;
+
+interface Sprites { frames: Record<string, Frame>; connections: Connections; images: Map<string, HTMLImageElement> }
+
+const BASE = `${import.meta.env.BASE_URL}sprites/`;
+
+async function loadSprites(): Promise<Sprites> {
+  const r = await fetch(`${BASE}sprites.json`);
+  const { frames, connections } = (await r.json()) as { frames: Record<string, Frame>; connections: Connections };
+  const files = [...new Set(Object.values(frames).map((f) => f.file))];
+  const images = new Map<string, HTMLImageElement>();
+  await Promise.all(
+    files.map(
+      (file) =>
+        new Promise<void>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve();
+          img.onerror = () => reject(new Error(`couldn't load ${file}`));
+          img.src = BASE + file;
+          images.set(file, img);
+        }),
+    ),
+  );
+  return { frames, connections, images };
+}
+
+/** Entities drawn in one direction only (the frame for direction 0). */
+const ONE_WAY = new Set(["medium-electric-pole", "small-lamp", "programmable-speaker"]);
+
+/** Wire terminals for entities whose game definition isn't sliced (generic connectors). */
+const FALLBACK: Record<string, Point> = { "small-lamp": [0, -0.25], "programmable-speaker": [0, -1.1] };
 
 export class CircuitView {
   private ctx: CanvasRenderingContext2D;
   private data: CompileResult["circuit"] | null = null;
   private view = { scale: 1, ox: 0, oy: 0 };
+  private sprites: Sprites | null = null;
 
   constructor(private canvas: HTMLCanvasElement, private tip: HTMLElement) {
     this.ctx = canvas.getContext("2d")!;
     new ResizeObserver(() => this.draw()).observe(canvas);
     canvas.addEventListener("mousemove", (e) => this.hover(e));
     canvas.addEventListener("mouseleave", () => (this.tip.hidden = true));
+    loadSprites()
+      .then((s) => {
+        this.sprites = s;
+        this.draw();
+      })
+      .catch((e) => console.warn("circuit graphics:", e));
   }
 
   show(circuit: CompileResult["circuit"] | undefined) {
@@ -47,7 +82,21 @@ export class CircuitView {
       x1 = Math.max(x1, e.x + e.w / 2);
       y1 = Math.max(y1, e.y + e.h / 2);
     }
-    return { x0, y0, x1, y1 };
+    // Room for what sticks out of the footprints: poles' tops, shadows to the right.
+    return { x0: x0 - 0.5, y0: y0 - 2.5, x1: x1 + 1, y1: y1 + 0.5 };
+  }
+
+  private frame(e: Entity, part = ""): Frame | undefined {
+    const dir = ONE_WAY.has(e.name) ? 0 : e.dir;
+    return this.sprites?.frames[`${e.name}/${dir}${part ? `/${part}` : ""}`];
+  }
+
+  /** A wire end: the entity's terminal for that colour, in tiles. */
+  private terminal(e: Entity, side: string, colour: string): Point {
+    const c = this.sprites?.connections[e.name];
+    const p = c?.[side]?.[ONE_WAY.has(e.name) ? 0 : e.dir]?.[colour] ?? c?.[""]?.[ONE_WAY.has(e.name) ? 0 : e.dir]?.[colour];
+    const [dx, dy] = p ?? FALLBACK[e.name] ?? [0, 0];
+    return [e.x + dx, e.y + dy];
   }
 
   draw() {
@@ -62,37 +111,63 @@ export class CircuitView {
     const es = this.data?.entities ?? [];
     if (!es.length) return;
     const b = this.bounds(es);
-    const pad = 16;
-    const scale = Math.min((w - 2 * pad) / (b.x1 - b.x0), (h - 2 * pad) / (b.y1 - b.y0), 48);
+    const pad = 12;
+    const scale = Math.min((w - 2 * pad) / (b.x1 - b.x0), (h - 2 * pad) / (b.y1 - b.y0), 64);
     const ox = (w - (b.x1 - b.x0) * scale) / 2 - b.x0 * scale;
     const oy = (h - (b.y1 - b.y0) * scale) / 2 - b.y0 * scale;
     this.view = { scale, ox, oy };
     const X = (x: number) => ox + x * scale, Y = (y: number) => oy + y * scale;
-    // Tile grid.
-    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    // Ground and tile grid.
+    ctx.fillStyle = "#3a3631";
+    ctx.fillRect(X(b.x0), Y(b.y0), (b.x1 - b.x0) * scale, (b.y1 - b.y0) * scale);
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
     ctx.lineWidth = 1;
-    for (let x = Math.floor(b.x0); x <= b.x1; x++) {
+    for (let x = Math.ceil(b.x0); x <= b.x1; x++) {
       ctx.beginPath(); ctx.moveTo(X(x), Y(b.y0)); ctx.lineTo(X(x), Y(b.y1)); ctx.stroke();
     }
-    for (let y = Math.floor(b.y0); y <= b.y1; y++) {
+    for (let y = Math.ceil(b.y0); y <= b.y1; y++) {
       ctx.beginPath(); ctx.moveTo(X(b.x0), Y(y)); ctx.lineTo(X(b.x1), Y(y)); ctx.stroke();
     }
-    // Entities.
-    for (const e of es) {
-      ctx.fillStyle = COLOURS[e.name] ?? "#888";
-      const inset = Math.min(2, scale * 0.08);
-      ctx.fillRect(X(e.x - e.w / 2) + inset, Y(e.y - e.h / 2) + inset, e.w * scale - 2 * inset, e.h * scale - 2 * inset);
+    const blit = (e: Entity, f: Frame) => {
+      const img = this.sprites!.images.get(f.file)!;
+      ctx.drawImage(img, f.x, f.y, f.w, f.h, X(e.x + f.dx), Y(e.y + f.dy), f.dw * scale, f.dh * scale);
+    };
+    // Back to front, as the game draws them.
+    const order = [...es].sort((a, c) => a.y + a.h / 2 - (c.y + c.h / 2) || a.x - c.x);
+    if (this.sprites) {
+      ctx.imageSmoothingQuality = "high";
+      ctx.globalAlpha = 0.5;
+      for (const e of order) {
+        const f = this.frame(e, "shadow");
+        if (f) blit(e, f);
+      }
+      ctx.globalAlpha = 1;
     }
-    // Wires on top, slightly apart so red and green between the same pair both show.
-    ctx.lineWidth = Math.max(1, scale * 0.06);
+    for (const e of order) {
+      const f = this.frame(e);
+      if (!f) {
+        ctx.fillStyle = "#777";
+        const inset = Math.min(2, scale * 0.08);
+        ctx.fillRect(X(e.x - e.w / 2) + inset, Y(e.y - e.h / 2) + inset, e.w * scale - 2 * inset, e.h * scale - 2 * inset);
+        continue;
+      }
+      blit(e, f);
+      const sym = e.symbol && this.frame(e, e.symbol);
+      if (sym) blit(e, sym);
+    }
+    // Wires on top, sagging a little like the game's.
+    ctx.lineWidth = Math.max(1, scale * 0.045);
+    ctx.lineCap = "round";
     for (const wire of this.data!.wires) {
       const a = es[wire.a], c = es[wire.b];
       if (!a || !c) continue;
-      const d = (wire.colour === "red" ? -1 : 1) * scale * 0.12;
-      ctx.strokeStyle = wire.colour === "red" ? "rgba(235,70,60,0.85)" : "rgba(70,200,90,0.85)";
+      const [x1, y1] = this.terminal(a, wire.as, wire.colour);
+      const [x2, y2] = this.terminal(c, wire.bs, wire.colour);
+      const sag = Math.min(0.6, Math.hypot(x2 - x1, y2 - y1) * 0.06);
+      ctx.strokeStyle = wire.colour === "red" ? "rgba(220,50,40,0.95)" : "rgba(60,190,70,0.95)";
       ctx.beginPath();
-      ctx.moveTo(X(a.x) + d, Y(a.y) + d);
-      ctx.lineTo(X(c.x) + d, Y(c.y) + d);
+      ctx.moveTo(X(x1), Y(y1));
+      ctx.quadraticCurveTo(X((x1 + x2) / 2), Y((y1 + y2) / 2 + 2 * sag), X(x2), Y(y2));
       ctx.stroke();
     }
   }
@@ -114,6 +189,4 @@ export class CircuitView {
   }
 }
 
-export const legend = Object.entries(LABELS)
-  .map(([k, v]) => `<span><i style="background:${COLOURS[k]}"></i>${v}</span>`)
-  .join("");
+export const legend = "Hover an entity to see what it is and what made it. Graphics © Wube Software.";
